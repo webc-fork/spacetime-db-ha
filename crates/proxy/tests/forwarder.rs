@@ -21,8 +21,8 @@ use futures::{FutureExt, select};
 use spacetime_db_ha::{
     raft::{CommittedWrite, forwarder},
     transport::{
-        CrossfireChannel, close_session, decode_query_payload, open_server_session, reply_bitcode,
-        watch,
+        CrossfireChannel, KEY_STDB_CONNECT, STDB_C2S_PREFIX, close_session, decode_query_payload,
+        open_server_session, prefix_u64_key, reply_bitcode, watch,
     },
     websocket::handler::{Message, StdbConnectRequest, StdbConnectResponse},
 };
@@ -49,7 +49,7 @@ async fn spawn_mock_stdb() -> (String, AsyncRx<List<(usize, Vec<u8>)>>, watch::S
 
     spawn(async move {
         let connect_qabl = session
-            .declare_queryable("stdb/connect")
+            .declare_queryable(KEY_STDB_CONNECT)
             .with(CrossfireChannel::new())
             .await
             .unwrap();
@@ -63,7 +63,7 @@ async fn spawn_mock_stdb() -> (String, AsyncRx<List<(usize, Vec<u8>)>>, watch::S
                     };
                     let conn_idx = next_conn.fetch_add(1, Ordering::Relaxed);
                     let conn_id = (conn_idx + 1) as u64;
-                    let c2s_key = format!("stdb/c2s/{conn_id}");
+                    let c2s_key = prefix_u64_key(STDB_C2S_PREFIX, conn_id);
                     let c2s_qabl = session
                         .declare_queryable(&c2s_key)
                         .with(CrossfireChannel::new())

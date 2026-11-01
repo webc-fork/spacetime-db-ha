@@ -21,7 +21,8 @@ use spacetime_db_ha::{
     config::NodeConfig,
     raft::{RaftPool, state_machine::StateMachineStore},
     transport::{
-        CrossfireChannel, decode_query_payload, open_server_session, reply_bitcode, watch,
+        CrossfireChannel, KEY_STDB_CONNECT, decode_query_payload, open_server_session,
+        reply_bitcode, watch,
     },
     websocket::handler::{Message, StdbConnectRequest, StdbConnectResponse},
 };
@@ -75,7 +76,7 @@ async fn wait_for_leader(pool: &RaftPool) {
 
 async fn write(pool: &RaftPool, payload: &'static [u8]) -> u64 {
     let log_id = pool
-        .propose_write(0, Bytes::from_static(payload), DB_PATH.to_owned())
+        .propose_write(0, Bytes::from_static(payload), DB_PATH)
         .await
         .unwrap();
     pool.wait_applied(0, log_id.index).await.unwrap();
@@ -193,7 +194,7 @@ fn crash_before_delivery_replays_undelivered_entries_on_restart() {
 
             spawn(async move {
                 let connect_qabl = session
-                    .declare_queryable("stdb/connect")
+                    .declare_queryable(KEY_STDB_CONNECT)
                     .with(CrossfireChannel::new())
                     .await
                     .unwrap();

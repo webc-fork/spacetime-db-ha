@@ -30,8 +30,10 @@ use spacetime_db_ha::{
     config::NodeConfig,
     raft::RaftPool,
     transport::{
-        CrossfireChannel, ZenohClientPool, close_session, decode_query_payload,
-        open_server_session, reply_bitcode, watch,
+        CrossfireChannel, KEY_CLUSTER_INIT, KEY_CLUSTER_SHARDS, KEY_SHARDS_CREATE,
+        KEY_SHARDS_REMOVE, KEY_SHARDS_ROUTE_ADD, KEY_STDB_CONNECT, STDB_C2S_PREFIX,
+        STDB_S2C_PREFIX, ZenohClientPool, close_session, decode_query_payload, open_server_session,
+        prefix_u64_key, reply_bitcode, watch,
     },
     websocket::{
         Proxy,
@@ -65,7 +67,7 @@ async fn spawn_mock_stdb() -> (String, AsyncRx<List<Bytes>>, watch::Sender<bool>
 
     spawn(async move {
         let connect_qabl = session
-            .declare_queryable("stdb/connect")
+            .declare_queryable(KEY_STDB_CONNECT)
             .with(CrossfireChannel::new())
             .await
             .unwrap();
@@ -81,8 +83,8 @@ async fn spawn_mock_stdb() -> (String, AsyncRx<List<Bytes>>, watch::Sender<bool>
                     let conn_id = next_conn;
                     next_conn += 1;
 
-                    let c2s_key = format!("stdb/c2s/{conn_id}");
-                    let s2c_key = format!("stdb/s2c/{}", req.stream_id);
+                    let c2s_key = prefix_u64_key(STDB_C2S_PREFIX, conn_id);
+                    let s2c_key = prefix_u64_key(STDB_S2C_PREFIX, req.stream_id);
                     let c2s_qabl = session
                         .declare_queryable(&c2s_key)
                         .with(CrossfireChannel::new())
@@ -304,7 +306,10 @@ async fn three_node_cluster_replicates_writes_and_manages_shards_over_zenoh_quic
             BTreeMap::from([(1, raft1.clone()), (2, raft2.clone()), (3, raft3.clone())]);
 
         let zclient = ZenohClientPool::new();
-        let _: String = zclient.rpc(&raft1, "cluster/init", &members).await.unwrap();
+        let _: String = zclient
+            .rpc(&raft1, KEY_CLUSTER_INIT, &members)
+            .await
+            .unwrap();
 
         let leader = wait_for_leader(&pool1, 0).await;
         assert_eq!(wait_for_leader(&pool2, 0).await, leader);
@@ -341,7 +346,7 @@ async fn three_node_cluster_replicates_writes_and_manages_shards_over_zenoh_quic
         let _: String = zclient
             .rpc(
                 &raft1,
-                "cluster/shards/create",
+                KEY_SHARDS_CREATE,
                 &CreateShardRequest { shard_id: 2 },
             )
             .await
@@ -351,7 +356,7 @@ async fn three_node_cluster_replicates_writes_and_manages_shards_over_zenoh_quic
         let _: String = zclient
             .rpc(
                 &raft1,
-                "cluster/shards/route/add",
+                KEY_SHARDS_ROUTE_ADD,
                 &AddRouteRequest {
                     module_name: "combat".to_owned(),
                     shard_id: 2,
@@ -361,21 +366,21 @@ async fn three_node_cluster_replicates_writes_and_manages_shards_over_zenoh_quic
             .unwrap();
 
         let list_before: ShardListResponse =
-            zclient.rpc(&raft1, "cluster/shards", &()).await.unwrap();
+            zclient.rpc(&raft1, KEY_CLUSTER_SHARDS, &()).await.unwrap();
         assert!(list_before.shards.contains(&2));
         assert_eq!(list_before.routes.get("combat"), Some(&2));
 
         let _: String = zclient
             .rpc(
                 &raft1,
-                "cluster/shards/remove",
+                KEY_SHARDS_REMOVE,
                 &RemoveShardRequest { shard_id: 2 },
             )
             .await
             .unwrap();
 
         let list_after: ShardListResponse =
-            zclient.rpc(&raft1, "cluster/shards", &()).await.unwrap();
+            zclient.rpc(&raft1, KEY_CLUSTER_SHARDS, &()).await.unwrap();
         assert!(!list_after.shards.contains(&2));
         assert!(!list_after.routes.contains_key("combat"));
 

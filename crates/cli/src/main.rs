@@ -1,36 +1,27 @@
 #![recursion_limit = "256"]
 
 use std::{
-    collections::BTreeMap, io::ErrorKind, path::Path, process::Command as ProcessCommand, result,
+    collections::BTreeMap, io::ErrorKind, path::Path, process::Command as ProcessCommand,
     time::Duration,
 };
 
-use anyhow::{Context, Result, anyhow};
-use bitcode::{Decode, DecodeOwned, Encode};
+use anyhow::{Context, Result};
 use clap_args::{
     arg,
     clap::{Command, value_parser},
 };
-use crossfire::mpsc::bounded_blocking_async;
-use gxhash::HashMap;
-use rimalloc::Rimalloc;
-use zenoh::{
-    Wait,
-    bytes::ZBytes,
-    config::Config,
-    handlers::{Callback, IntoHandler},
-    query::Reply,
+use spacetime_db_ha::{
+    api::{
+        AddNodeRequest, AddRouteRequest, ClusterStatus, CreateShardRequest, RemoveNodeRequest,
+        RemoveRouteRequest, RemoveShardRequest, ShardListResponse, ShardStatusResponse,
+    },
+    transport::{
+        KEY_CLUSTER_ADD_NODE, KEY_CLUSTER_INIT, KEY_CLUSTER_REMOVE_NODE, KEY_CLUSTER_SHARDS,
+        KEY_CLUSTER_SHARDS_PREFIX, KEY_CLUSTER_STATUS, KEY_SHARDS_CREATE, KEY_SHARDS_REMOVE,
+        KEY_SHARDS_ROUTE_ADD, KEY_SHARDS_ROUTE_REMOVE, LOOPBACK_IPV4_PREFIX, SUFFIX_STATUS,
+        mid_u64_key, normalize_addr, oneshot_rpc,
+    },
 };
-
-#[global_allocator]
-static ALLOC: Rimalloc = Rimalloc;
-
-type RpcEnvelope<T> = result::Result<T, String>;
-
-/// 未指定 IPv4 监听地址前缀。
-const UNSPECIFIED_IPV4_PREFIX: &str = "0.0.0.0:";
-/// 本地回环 IPv4 地址前缀。
-const LOOPBACK_IPV4_PREFIX: &str = "127.0.0.1:";
 
 /// 默认集群节点 Raft 地址（编译期组合）。
 const DEFAULT_CLUSTER_ADDR: &str = const_str::concat!(LOOPBACK_IPV4_PREFIX, "4001");
@@ -38,38 +29,6 @@ const DEFAULT_CLUSTER_ADDR: &str = const_str::concat!(LOOPBACK_IPV4_PREFIX, "400
 const DEFAULT_STDB_SERVER_1: &str = const_str::concat!(LOOPBACK_IPV4_PREFIX, "5001");
 const DEFAULT_STDB_SERVER_2: &str = const_str::concat!(LOOPBACK_IPV4_PREFIX, "5002");
 const DEFAULT_STDB_SERVER_3: &str = const_str::concat!(LOOPBACK_IPV4_PREFIX, "5003");
-
-/// Zenoh 明文 QUIC 协议前缀与后缀。
-const QUIC_SCHEME_PREFIX: &str = "udp/";
-const QUIC_REL_SUFFIX: &str = "#rel=1";
-
-/// Zenoh 配置常量。
-const ZENOH_MODE_KEY: &str = "mode";
-const ZENOH_MODE_CLIENT: &str = "\"client\"";
-const ZENOH_MULTICAST_KEY: &str = "scouting/multicast/enabled";
-const ZENOH_GOSSIP_KEY: &str = "scouting/gossip/enabled";
-const ZENOH_LISTEN_KEY: &str = "listen/endpoints";
-const ZENOH_CONNECT_KEY: &str = "connect/endpoints";
-const ZENOH_FALSE: &str = "false";
-const ZENOH_EMPTY_ARRAY: &str = "[]";
-const JSON_ARRAY_PREFIX: &str = "[\"";
-const JSON_ARRAY_SUFFIX: &str = "\"]";
-
-/// 集群管理 Zenoh 键表达式（编译期基于 `const_str::concat!` 组合）。
-const CLUSTER_PREFIX: &str = "cluster/";
-const SHARDS_PREFIX: &str = const_str::concat!(CLUSTER_PREFIX, "shards/");
-const SHARDS_ROUTE_PREFIX: &str = const_str::concat!(SHARDS_PREFIX, "route/");
-const SUFFIX_STATUS: &str = "/status";
-
-const KEY_CLUSTER_STATUS: &str = const_str::concat!(CLUSTER_PREFIX, "status");
-const KEY_CLUSTER_INIT: &str = const_str::concat!(CLUSTER_PREFIX, "init");
-const KEY_CLUSTER_ADD_NODE: &str = const_str::concat!(CLUSTER_PREFIX, "add-node");
-const KEY_CLUSTER_REMOVE_NODE: &str = const_str::concat!(CLUSTER_PREFIX, "remove-node");
-const KEY_CLUSTER_SHARDS: &str = const_str::concat!(CLUSTER_PREFIX, "shards");
-const KEY_SHARDS_CREATE: &str = const_str::concat!(SHARDS_PREFIX, "create");
-const KEY_SHARDS_REMOVE: &str = const_str::concat!(SHARDS_PREFIX, "remove");
-const KEY_SHARDS_ROUTE_ADD: &str = const_str::concat!(SHARDS_ROUTE_PREFIX, "add");
-const KEY_SHARDS_ROUTE_REMOVE: &str = const_str::concat!(SHARDS_ROUTE_PREFIX, "remove");
 
 /// 子命令名称与公共参数常量。
 const CMD_STATUS: &str = "status";
@@ -95,171 +54,6 @@ const ARG_SHARD_ID: &str = "shard-id";
 
 /// 单次 Zenoh RPC 查询超时。
 const RPC_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// 单次 RPC 查询的回复通道容量。
-const RPC_REPLY_CAPACITY: usize = 4;
-
-/// 需要剥离的协议前缀列表。
-const URL_PREFIXES: [&str; 7] = [
-    "http://", "https://", "ws://", "wss://", "quic/", "udp/", "tcp/",
-];
-
-#[derive(Debug, Clone, Encode, Decode)]
-struct ClusterStatus {
-    node_id: u64,
-    state: String,
-    current_leader: Option<u64>,
-    current_term: u64,
-    last_applied: Option<String>,
-    membership: String,
-    active_shards: Vec<u64>,
-}
-
-#[derive(Debug, Clone, Encode, Decode)]
-struct AddNodeRequest {
-    node_id: u64,
-    addr: String,
-}
-
-#[derive(Debug, Clone, Encode, Decode)]
-struct RemoveNodeRequest {
-    node_id: u64,
-}
-
-#[derive(Debug, Clone, Encode, Decode)]
-struct CreateShardRequest {
-    shard_id: u64,
-}
-
-#[derive(Debug, Clone, Encode, Decode)]
-struct RemoveShardRequest {
-    shard_id: u64,
-}
-
-#[derive(Debug, Clone, Encode, Decode)]
-struct AddRouteRequest {
-    module_name: String,
-    shard_id: u64,
-}
-
-#[derive(Debug, Clone, Encode, Decode)]
-struct RemoveRouteRequest {
-    module_name: String,
-}
-
-#[derive(Debug, Clone, Encode, Decode)]
-struct ShardListResponse {
-    shards: Vec<u64>,
-    routes: HashMap<String, u64>,
-}
-
-#[derive(Debug, Clone, Encode, Decode)]
-struct ShardStatusResponse {
-    shard_id: u64,
-    state: String,
-    current_leader: Option<u64>,
-    current_term: u64,
-    last_applied: Option<String>,
-    membership: String,
-}
-
-/// 零分配剥离 URL 协议前缀，返回 `host:port` 切片。
-fn strip_addr_parts(addr: &str) -> &str {
-    let mut s = addr.trim();
-    for prefix in URL_PREFIXES {
-        if let Some(rest) = s.strip_prefix(prefix) {
-            s = rest;
-            break;
-        }
-    }
-    if let Some((host_port, _)) = s.split_once('#') {
-        s = host_port;
-    }
-    if let Some((host_port, _)) = s.split_once('/') {
-        s = host_port;
-    }
-    s
-}
-
-/// 剥离 URL 协议前缀，规范化为 `host:port`（单次预分配，无 `format!` 开销）。
-fn normalize_addr(addr: &str) -> String {
-    let s = strip_addr_parts(addr);
-    if let Some(port) = s.strip_prefix(UNSPECIFIED_IPV4_PREFIX) {
-        let mut out = String::with_capacity(LOOPBACK_IPV4_PREFIX.len() + port.len());
-        out.push_str(LOOPBACK_IPV4_PREFIX);
-        out.push_str(port);
-        return out;
-    }
-    s.to_owned()
-}
-
-/// 通过 Zenoh 明文 QUIC (`udp/<addr>#rel=1`) 发送 `bitcode` RPC 请求。
-async fn zenoh_rpc<Req, Resp>(target_addr: &str, key_expr: &str, req: &Req) -> Result<Resp>
-where
-    Req: Encode,
-    Resp: DecodeOwned,
-{
-    let host_port = normalize_addr(target_addr);
-    let mut locator =
-        String::with_capacity(QUIC_SCHEME_PREFIX.len() + host_port.len() + QUIC_REL_SUFFIX.len());
-    locator.push_str(QUIC_SCHEME_PREFIX);
-    locator.push_str(&host_port);
-    locator.push_str(QUIC_REL_SUFFIX);
-
-    let mut connect_json =
-        String::with_capacity(JSON_ARRAY_PREFIX.len() + locator.len() + JSON_ARRAY_SUFFIX.len());
-    connect_json.push_str(JSON_ARRAY_PREFIX);
-    connect_json.push_str(&locator);
-    connect_json.push_str(JSON_ARRAY_SUFFIX);
-
-    let mut cfg = Config::default();
-    cfg.insert_json5(ZENOH_MODE_KEY, ZENOH_MODE_CLIENT)
-        .map_err(|e| anyhow!("zenoh mode config: {e}"))?;
-    cfg.insert_json5(ZENOH_MULTICAST_KEY, ZENOH_FALSE)
-        .map_err(|e| anyhow!("zenoh multicast config: {e}"))?;
-    cfg.insert_json5(ZENOH_GOSSIP_KEY, ZENOH_FALSE)
-        .map_err(|e| anyhow!("zenoh gossip config: {e}"))?;
-    cfg.insert_json5(ZENOH_LISTEN_KEY, ZENOH_EMPTY_ARRAY)
-        .map_err(|e| anyhow!("zenoh listen config: {e}"))?;
-    cfg.insert_json5(ZENOH_CONNECT_KEY, &connect_json)
-        .map_err(|e| anyhow!("zenoh connect config: {e}"))?;
-
-    let session = zenoh::open(cfg)
-        .await
-        .map_err(|e| anyhow!("Failed to connect to {locator}: {e}"))?;
-
-    let payload = bitcode::encode(req);
-    let (reply_tx, reply_rx) = bounded_blocking_async::<Reply>(RPC_REPLY_CAPACITY);
-    let replies = session
-        .get(key_expr)
-        .payload(ZBytes::from(payload))
-        .timeout(RPC_TIMEOUT)
-        .with(
-            (
-                Callback::from(move |r: Reply| {
-                    let _ = reply_tx.send(r);
-                }),
-                reply_rx,
-            )
-                .into_handler(),
-        )
-        .await
-        .map_err(|e| anyhow!("Zenoh query {key_expr} failed: {e}"))?;
-
-    let reply = replies
-        .recv()
-        .await
-        .map_err(|_| anyhow!("No reply received from {locator} on {key_expr}"))?;
-    let sample = reply
-        .into_result()
-        .map_err(|e| anyhow!("Zenoh query error on {key_expr}: {e}"))?;
-    let bytes = sample.payload().to_bytes();
-    let _ = session.close().wait();
-
-    let envelope: RpcEnvelope<Resp> =
-        bitcode::decode(&bytes).context("Failed to decode bitcode response")?;
-    envelope.map_err(|msg| anyhow!("{msg}"))
-}
 
 /// 构建 `sdha` 子命令树（配合 `clap_args::parse!` 自动处理 `-h`/`--help`/`-v`/`--version`/`--vv`）。
 fn build_cli(cmd: Command) -> Command {
@@ -390,7 +184,8 @@ async fn main() -> Result<()> {
             let addr = sub
                 .get_one::<String>(ARG_ADDR)
                 .map_or(DEFAULT_CLUSTER_ADDR, String::as_str);
-            let status: ClusterStatus = zenoh_rpc(addr, KEY_CLUSTER_STATUS, &()).await?;
+            let status: ClusterStatus =
+                oneshot_rpc(addr, KEY_CLUSTER_STATUS, &(), RPC_TIMEOUT).await?;
 
             println!("Cluster Status:");
             println!("  Node ID:    {}", status.node_id);
@@ -403,23 +198,22 @@ async fn main() -> Result<()> {
         }
 
         Some((CMD_INIT, sub)) => {
-            let nodes: Vec<&String> = sub
+            let nodes = sub
                 .get_many::<String>(ARG_NODES)
-                .context("No nodes specified")?
-                .collect();
+                .context("No nodes specified")?;
             let mut members: BTreeMap<u64, String> = BTreeMap::new();
             let mut first_addr: Option<String> = None;
 
             for node_spec in nodes {
-                let (id_str, addr) = node_spec.split_once('=').context(format!(
-                    "Invalid node format '{node_spec}', expected 'id=host:port'"
-                ))?;
+                let (id_str, addr) = node_spec.split_once('=').with_context(|| {
+                    format!("Invalid node format '{node_spec}', expected 'id=host:port'")
+                })?;
 
                 let id: u64 = id_str
                     .parse()
-                    .context(format!("Invalid node ID '{id_str}'"))?;
+                    .with_context(|| format!("Invalid node ID '{id_str}'"))?;
 
-                let clean_addr = normalize_addr(addr);
+                let clean_addr = normalize_addr(addr, true);
                 if first_addr.is_none() {
                     first_addr = Some(clean_addr.clone());
                 }
@@ -433,7 +227,7 @@ async fn main() -> Result<()> {
                 println!("  Node {id}: {addr}");
             }
 
-            let _: String = zenoh_rpc(&target, KEY_CLUSTER_INIT, &members).await?;
+            let _: String = oneshot_rpc(&target, KEY_CLUSTER_INIT, &members, RPC_TIMEOUT).await?;
             println!("Cluster initialized successfully!");
         }
 
@@ -449,9 +243,9 @@ async fn main() -> Result<()> {
             println!("Adding node {node_id} ({addr}) via {cluster}...");
             let req = AddNodeRequest {
                 node_id,
-                addr: normalize_addr(addr),
+                addr: normalize_addr(addr, true),
             };
-            let _: String = zenoh_rpc(cluster, KEY_CLUSTER_ADD_NODE, &req).await?;
+            let _: String = oneshot_rpc(cluster, KEY_CLUSTER_ADD_NODE, &req, RPC_TIMEOUT).await?;
             println!("Node {node_id} added successfully!");
         }
 
@@ -462,14 +256,12 @@ async fn main() -> Result<()> {
             let db_name = sub.get_one::<String>(ARG_NAME).cloned().unwrap_or_else(|| {
                 Path::new(module)
                     .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
+                    .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "my_module".to_owned())
             });
-            let servers: Vec<&String> = sub
+            let servers = sub
                 .get_many::<String>(ARG_SERVERS)
-                .into_iter()
-                .flatten()
-                .collect();
+                .context("missing --servers")?;
 
             println!(
                 "Deploying module '{}' from {} to {} node(s)...",
@@ -479,7 +271,7 @@ async fn main() -> Result<()> {
             );
 
             let mut failed = 0;
-            for server in &servers {
+            for server in servers {
                 print!("  Publishing to {server}... ");
                 let result = ProcessCommand::new("spacetime")
                     .args(["publish", "--server", server, module, &db_name])
@@ -522,7 +314,8 @@ async fn main() -> Result<()> {
 
             println!("Removing node {node_id} via {cluster}...");
             let req = RemoveNodeRequest { node_id };
-            let _: String = zenoh_rpc(cluster, KEY_CLUSTER_REMOVE_NODE, &req).await?;
+            let _: String =
+                oneshot_rpc(cluster, KEY_CLUSTER_REMOVE_NODE, &req, RPC_TIMEOUT).await?;
             println!("Node {node_id} removed successfully!");
         }
 
@@ -536,7 +329,7 @@ async fn main() -> Result<()> {
 
             println!("Creating shard {shard_id} via {cluster}...");
             let req = CreateShardRequest { shard_id };
-            let _: String = zenoh_rpc(cluster, KEY_SHARDS_CREATE, &req).await?;
+            let _: String = oneshot_rpc(cluster, KEY_SHARDS_CREATE, &req, RPC_TIMEOUT).await?;
             println!("Shard {shard_id} created successfully!");
         }
 
@@ -550,7 +343,7 @@ async fn main() -> Result<()> {
 
             println!("Removing shard {shard_id} via {cluster}...");
             let req = RemoveShardRequest { shard_id };
-            let _: String = zenoh_rpc(cluster, KEY_SHARDS_REMOVE, &req).await?;
+            let _: String = oneshot_rpc(cluster, KEY_SHARDS_REMOVE, &req, RPC_TIMEOUT).await?;
             println!("Shard {shard_id} removed successfully!");
         }
 
@@ -570,7 +363,7 @@ async fn main() -> Result<()> {
                 module_name: module.clone(),
                 shard_id,
             };
-            let _: String = zenoh_rpc(cluster, KEY_SHARDS_ROUTE_ADD, &req).await?;
+            let _: String = oneshot_rpc(cluster, KEY_SHARDS_ROUTE_ADD, &req, RPC_TIMEOUT).await?;
             println!("Route {} -> shard {shard_id} added!", req.module_name);
         }
 
@@ -586,7 +379,8 @@ async fn main() -> Result<()> {
             let req = RemoveRouteRequest {
                 module_name: module.clone(),
             };
-            let _: String = zenoh_rpc(cluster, KEY_SHARDS_ROUTE_REMOVE, &req).await?;
+            let _: String =
+                oneshot_rpc(cluster, KEY_SHARDS_ROUTE_REMOVE, &req, RPC_TIMEOUT).await?;
             println!("Route for {} removed!", req.module_name);
         }
 
@@ -594,7 +388,8 @@ async fn main() -> Result<()> {
             let addr = sub
                 .get_one::<String>(ARG_ADDR)
                 .map_or(DEFAULT_CLUSTER_ADDR, String::as_str);
-            let data: ShardListResponse = zenoh_rpc(addr, KEY_CLUSTER_SHARDS, &()).await?;
+            let data: ShardListResponse =
+                oneshot_rpc(addr, KEY_CLUSTER_SHARDS, &(), RPC_TIMEOUT).await?;
 
             println!("Active Shards:");
             for shard in &data.shards {
@@ -617,8 +412,8 @@ async fn main() -> Result<()> {
             let addr = sub
                 .get_one::<String>(ARG_ADDR)
                 .map_or(DEFAULT_CLUSTER_ADDR, String::as_str);
-            let key = format!("{SHARDS_PREFIX}{shard_id}{SUFFIX_STATUS}");
-            let status: ShardStatusResponse = zenoh_rpc(addr, &key, &()).await?;
+            let key = mid_u64_key(KEY_CLUSTER_SHARDS_PREFIX, shard_id, SUFFIX_STATUS);
+            let status: ShardStatusResponse = oneshot_rpc(addr, &key, &(), RPC_TIMEOUT).await?;
 
             println!("Shard {shard_id} Status:");
             println!("  State:      {}", status.state);

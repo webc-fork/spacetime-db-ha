@@ -400,9 +400,7 @@ async fn handle_client_message(
                     shard_id,
                     "Write -> Raft consensus"
                 );
-                let log_id = pool
-                    .propose_write(shard_id, data.clone(), db_path.to_owned())
-                    .await?;
+                let log_id = pool.propose_write(shard_id, data.clone(), db_path).await?;
                 pool.wait_applied(shard_id, log_id.index).await?;
 
                 // 修复 P0-1：等待前置日志索引投递完毕，保证同节点跨连接写的上游投递顺序严格等于 Raft 日志顺序

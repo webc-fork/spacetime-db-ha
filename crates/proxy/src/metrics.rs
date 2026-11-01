@@ -17,9 +17,6 @@ const BUCKET_COUNT: usize = 9;
 /// 每秒纳秒数（浮点转换因子）。
 const NANOS_PER_SEC: f64 = 1_000_000_000.0;
 
-/// JSON 指标导出预分配容量（字节）。
-const METRICS_BUF_CAPACITY: usize = 512;
-
 /// 写操作延迟直方图桶上界（毫秒）。
 const LATENCY_BUCKETS_MS: [u64; BUCKET_COUNT] = [1, 5, 10, 25, 50, 100, 250, 500, 1_000];
 
@@ -88,13 +85,12 @@ const JSON_P7: &str = const_str::concat!(
     JSON_KEY_END,
     JSON_FIRST_KEY_START,
     "buckets",
-    JSON_KEY_END,
-    "{"
+    JSON_KEY_END
 );
 
 /// 编译期静态直方图分桶 JSON 键名片段。
 const JSON_BUCKET_PREFIXES: [&str; BUCKET_COUNT] = [
-    const_str::concat!("\"", "0.001", JSON_KEY_END),
+    const_str::concat!(JSON_FIRST_KEY_START, "0.001", JSON_KEY_END),
     const_str::concat!(JSON_NEXT_KEY_START, "0.005", JSON_KEY_END),
     const_str::concat!(JSON_NEXT_KEY_START, "0.01", JSON_KEY_END),
     const_str::concat!(JSON_NEXT_KEY_START, "0.025", JSON_KEY_END),
@@ -116,6 +112,32 @@ const JSON_ENTRIES_APPLIED: &str = const_str::concat!(
     JSON_KEY_END
 );
 const JSON_SUFFIX: &str = "}";
+
+/// 编译期计算全部静态 JSON 键名片段的总字节长度。
+const JSON_STATIC_LEN: usize = {
+    let mut len = JSON_P0.len()
+        + JSON_P1.len()
+        + JSON_P2.len()
+        + JSON_P3.len()
+        + JSON_P4.len()
+        + JSON_P5.len()
+        + JSON_P6.len()
+        + JSON_P7.len()
+        + JSON_BUCKET_INF.len()
+        + JSON_SUM.len()
+        + JSON_COUNT.len()
+        + JSON_ENTRIES_APPLIED.len()
+        + JSON_SUFFIX.len();
+    let mut i = 0;
+    while i < BUCKET_COUNT {
+        len += JSON_BUCKET_PREFIXES[i].len();
+        i += 1;
+    }
+    len
+};
+
+/// JSON 指标导出预分配容量（编译期由静态键长 + 20 个数值的最大字符长度向上取整至 2 的幂计算）。
+const METRICS_BUF_CAPACITY: usize = (JSON_STATIC_LEN + 20 * 20).next_power_of_two();
 
 /// 无锁整型 Gauge 指标。
 pub struct IntGauge {
@@ -174,6 +196,10 @@ impl IntCounter {
         self.val.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn inc_by(&self, v: u64) {
+        self.val.fetch_add(v, Ordering::Relaxed);
+    }
+
     pub fn get(&self) -> u64 {
         self.val.load(Ordering::Relaxed)
     }
@@ -212,12 +238,6 @@ impl Histogram {
     /// 记录一次 `Duration` 耗时（热路径纯整数运算，单桶原子更新）。
     pub fn observe_duration(&self, elapsed: Duration) {
         self.observe_nanos(elapsed.as_nanos() as u64);
-    }
-
-    /// 记录一次观测值（秒）。
-    pub fn observe(&self, secs: f64) {
-        let nanos = (secs.max(0.0) * NANOS_PER_SEC) as u64;
-        self.observe_nanos(nanos);
     }
 
     fn observe_nanos(&self, nanos: u64) {

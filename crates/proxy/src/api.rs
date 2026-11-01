@@ -38,7 +38,8 @@ use crate::{
         SUB_ADD_NODE, SUB_HEALTH, SUB_INIT, SUB_LEADER, SUB_REMOVE_NODE, SUB_SHARDS,
         SUB_SHARDS_CREATE, SUB_SHARDS_PREFIX, SUB_SHARDS_REMOVE, SUB_SHARDS_ROUTE,
         SUB_SHARDS_ROUTE_ADD, SUB_SHARDS_ROUTE_REMOVE, SUB_STATUS, SUB_WRITE, SUFFIX_STATUS,
-        SUFFIX_WRITE, close_session, decode_query_payload, reply_bitcode, watch::Receiver,
+        SUFFIX_WRITE, close_session, decode_query_payload, mid_u64_key, reply_bitcode,
+        watch::Receiver,
     },
 };
 
@@ -110,7 +111,19 @@ const REQ_GET_HEALTH: &[u8] = const_str::concat_bytes!(REQ_GET_PREFIX, KEY_CLUST
 /// 取指定分片的 Raft 实例。
 fn get_shard_raft(pool: &RaftPool, shard_id: ShardId) -> Result<ShardRaft, String> {
     pool.get_raft(shard_id)
-        .ok_or_else(|| format!("shard {shard_id} not found"))
+        .ok_or_else(|| mid_u64_key("shard ", shard_id, " not found"))
+}
+
+/// 将 `ServerState` 映射为编译期静态字符串字面量，消除 `format!("{:?}", ...)` 运行时格式化开销。
+#[inline]
+const fn server_state_str(state: ServerState) -> &'static str {
+    match state {
+        ServerState::Learner => "Learner",
+        ServerState::Follower => "Follower",
+        ServerState::Candidate => "Candidate",
+        ServerState::Leader => "Leader",
+        ServerState::Shutdown => "Shutdown",
+    }
 }
 
 /// 取分片 0 的 Raft 实例。
@@ -365,7 +378,7 @@ async fn dispatch_cluster_query(pool: &RaftPool, query: Query) {
                 pool.add_node_all_shards(req.node_id, req.addr)
                     .await
                     .map_err(err_str)?;
-                Ok(format!("Node {} added to all shards", req.node_id))
+                Ok(mid_u64_key("Node ", req.node_id, " added to all shards"))
             }
             .await;
             reply_bitcode(&query, res).await;
@@ -376,7 +389,11 @@ async fn dispatch_cluster_query(pool: &RaftPool, query: Query) {
                 pool.remove_node_all_shards(req.node_id)
                     .await
                     .map_err(err_str)?;
-                Ok(format!("Node {} removed from all shards", req.node_id))
+                Ok(mid_u64_key(
+                    "Node ",
+                    req.node_id,
+                    " removed from all shards",
+                ))
             }
             .await;
             reply_bitcode(&query, res).await;
@@ -415,7 +432,7 @@ async fn dispatch_cluster_query(pool: &RaftPool, query: Query) {
                     },
                 )
                 .await?;
-                Ok(format!("Shard {} created", req.shard_id))
+                Ok(mid_u64_key("Shard ", req.shard_id, " created"))
             }
             .await;
             reply_bitcode(&query, res).await;
@@ -433,7 +450,7 @@ async fn dispatch_cluster_query(pool: &RaftPool, query: Query) {
                     },
                 )
                 .await?;
-                Ok(format!("Shard {} removed", req.shard_id))
+                Ok(mid_u64_key("Shard ", req.shard_id, " removed"))
             }
             .await;
             reply_bitcode(&query, res).await;
@@ -442,7 +459,7 @@ async fn dispatch_cluster_query(pool: &RaftPool, query: Query) {
             let res = async {
                 let req: AddRouteRequest = decode_req(&query)?;
                 if !pool.has_shard(req.shard_id) {
-                    return Err(format!("shard {} does not exist", req.shard_id));
+                    return Err(mid_u64_key("shard ", req.shard_id, " does not exist"));
                 }
                 let msg = format!("Route {} -> shard {} added", req.module_name, req.shard_id);
                 propose_config(
@@ -523,7 +540,7 @@ pub fn handle_cluster_status(pool: &RaftPool) -> Result<ClusterStatus, String> {
 
     Ok(ClusterStatus {
         node_id: pool.node_config.node_id,
-        state: format!("{:?}", status.state),
+        state: server_state_str(status.state).to_owned(),
         current_leader: status.current_leader,
         current_term: leader_term(&status.vote),
         last_applied: status.last_applied.map(|id| id.to_string()),
@@ -591,7 +608,7 @@ pub fn handle_shard_status(
 
     Ok(ShardStatusResponse {
         shard_id,
-        state: format!("{:?}", status.state),
+        state: server_state_str(status.state).to_owned(),
         current_leader: status.current_leader,
         current_term: leader_term(&status.vote),
         last_applied: status.last_applied.map(|id| id.to_string()),
@@ -603,7 +620,7 @@ pub fn handle_shard_status(
 async fn propose_config(pool: &RaftPool, cmd: ShardConfigCommand) -> Result<(), String> {
     let raw_message = encode_shard_config(&cmd);
     let log_id = pool
-        .propose_write(DEFAULT_SHARD, raw_message.into(), String::new())
+        .propose_write(DEFAULT_SHARD, raw_message.into(), "")
         .await
         .map_err(err_str)?;
     pool.wait_applied(DEFAULT_SHARD, log_id.index)
@@ -659,7 +676,7 @@ pub async fn serve_metrics_tcp(
                 let Ok((mut stream, _)) = accepted else { continue };
                 let pool = Rc::clone(&pool);
                 spawn(async move {
-                    let BufResult(Ok(n), buf) = stream.read(Vec::with_capacity(METRICS_REQ_BUF_SIZE)).await else {
+                    let BufResult(Ok(n), buf) = stream.read([0u8; METRICS_REQ_BUF_SIZE]).await else {
                         return;
                     };
                     let head = &buf[..n];

@@ -460,7 +460,7 @@ impl RaftPool {
         &self,
         shard_id: ShardId,
         raw_message: Bytes,
-        db_path: String,
+        db_path: &str,
     ) -> Result<RaftLogId> {
         let _timer = metrics::WRITE_LATENCY.start_timer();
         metrics::WRITES_TOTAL.inc();
@@ -471,7 +471,7 @@ impl RaftPool {
         let origin_node_id = self.node_config.node_id;
         let request = ReducerCallRequest {
             raw_message: raw_message.clone(),
-            db_path: db_path.clone(),
+            db_path: db_path.to_owned(),
             origin_node_id,
         };
 
@@ -486,7 +486,7 @@ impl RaftPool {
                     bail!("shard {shard_id} has no leader yet");
                 };
                 info!(leader_addr = %leader_addr, shard_id, "Forwarding write to leader over Zenoh");
-                self.forward_write(shard_id, &leader_addr, raw_message, db_path)
+                self.forward_write(shard_id, &leader_addr, raw_message, db_path.to_owned())
                     .await
             }
             Err(e) => Err(e.into()),

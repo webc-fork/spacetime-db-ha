@@ -13,7 +13,6 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 compio = { version = "0.19", features = ["macros"] }
-rimalloc = { git = "https://github.com/moggedhedien/rimalloc.git", version = "0.1.0" }
 const-str = "1.1.0"
 clap_args = { version = "0.1.9", features = ["macro"] }
 spacetime-db-ha = { version = "0.1.0", path = "../proxy" }

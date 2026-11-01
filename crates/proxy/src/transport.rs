@@ -85,12 +85,18 @@ pub const SUB_SHARDS_ROUTE_REMOVE: &str = const_str::concat!(SUB_SHARDS_ROUTE, "
 pub const SUFFIX_WRITE: &str = const_str::concat!(KEY_SEP, SUB_WRITE);
 pub const SUFFIX_STATUS: &str = const_str::concat!(KEY_SEP, SUB_STATUS);
 
+pub const KEY_CLUSTER_STATUS: &str = const_str::concat!(CLUSTER_PREFIX, SUB_STATUS);
 pub const KEY_CLUSTER_INIT: &str = const_str::concat!(CLUSTER_PREFIX, SUB_INIT);
+pub const KEY_CLUSTER_ADD_NODE: &str = const_str::concat!(CLUSTER_PREFIX, SUB_ADD_NODE);
+pub const KEY_CLUSTER_REMOVE_NODE: &str = const_str::concat!(CLUSTER_PREFIX, SUB_REMOVE_NODE);
 pub const KEY_CLUSTER_HEALTH: &str = const_str::concat!(CLUSTER_PREFIX, SUB_HEALTH);
 pub const KEY_CLUSTER_SHARDS: &str = const_str::concat!(CLUSTER_PREFIX, SUB_SHARDS);
+pub const KEY_CLUSTER_SHARDS_PREFIX: &str = const_str::concat!(CLUSTER_PREFIX, SUB_SHARDS_PREFIX);
 pub const KEY_SHARDS_CREATE: &str = const_str::concat!(CLUSTER_PREFIX, SUB_SHARDS_CREATE);
 pub const KEY_SHARDS_REMOVE: &str = const_str::concat!(CLUSTER_PREFIX, SUB_SHARDS_REMOVE);
 pub const KEY_SHARDS_ROUTE_ADD: &str = const_str::concat!(CLUSTER_PREFIX, SUB_SHARDS_ROUTE_ADD);
+pub const KEY_SHARDS_ROUTE_REMOVE: &str =
+    const_str::concat!(CLUSTER_PREFIX, SUB_SHARDS_ROUTE_REMOVE);
 
 /// 指标查询键表达式。
 pub const KEY_METRICS: &str = "metrics";
@@ -367,6 +373,23 @@ pub async fn open_client_session(target_addr: &str) -> Result<Session> {
 /// 在非 Tokio 运行时（如 `compio`）上安全关闭 Zenoh 会话（委托给 Zenoh 内部 `ZRuntime::Net`）。
 pub fn close_session(session: &Session) {
     let _ = session.close().wait();
+}
+
+/// 建立短连接客户端会话，发送单次 `bitcode` RPC 请求后安全关闭会话（供 CLI 等单次命令调用）。
+pub async fn oneshot_rpc<Req, Resp>(
+    target_addr: &str,
+    key_expr: &str,
+    req: &Req,
+    timeout: Duration,
+) -> Result<Resp>
+where
+    Req: Encode,
+    Resp: DecodeOwned,
+{
+    let session = open_client_session(target_addr).await?;
+    let res = rpc_once(&session, key_expr, req, timeout).await;
+    close_session(&session);
+    res
 }
 
 /// 序列化响应并回复 Zenoh 查询。

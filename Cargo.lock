@@ -3289,7 +3289,6 @@ dependencies = [
  "clap_args",
  "compio",
  "const-str",
- "rimalloc",
  "spacetime-db-ha",
 ]
 

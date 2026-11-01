@@ -308,78 +308,80 @@ impl StateMachineStore {
         let mut pending_commands = Vec::new();
         let mut pending_writes = Vec::new();
         let mut non_write_indices = Vec::new();
-        let mut last_index = None;
+        let mut last_log_id = None;
+        let mut last_membership = None;
+        let mut app_entries = 0u64;
         let mut count = 0usize;
 
         for entry in entries {
             let log_id = entry.log_id;
-            let is_application = matches!(&entry.payload, EntryPayload::Normal(_));
+            last_log_id = Some(log_id);
+            count += 1;
 
             // 先分类，反序列化与分支判断都不持锁
             // 仅当分片 0 且 db_path 为空且首字节为 SHARD_CONFIG_TAG 时，才按分片配置命令解析（修复 P2-14）
-            let (membership, command, write) = match entry.payload {
-                EntryPayload::Membership(membership) => (
-                    Some(RaftStoredMembership::new(Some(log_id), membership)),
-                    None,
-                    None,
-                ),
+            match entry.payload {
+                EntryPayload::Membership(membership) => {
+                    last_membership = Some(RaftStoredMembership::new(Some(log_id), membership));
+                    non_write_indices.push(log_id.index);
+                }
                 EntryPayload::Normal(request) => {
+                    app_entries += 1;
                     if self.shard_id == DEFAULT_SHARD
                         && request.db_path.is_empty()
                         && request.raw_message.first() == Some(&SHARD_CONFIG_TAG)
                     {
                         match router::decode_shard_config(&request.raw_message) {
-                            Some(command) => (None, Some(command), None),
+                            Some(command) => {
+                                pending_commands.push(command);
+                            }
                             None => {
                                 warn!(
                                     log_index = log_id.index,
                                     "Dropping malformed shard config entry"
                                 );
-                                (None, None, None)
                             }
                         }
+                        non_write_indices.push(log_id.index);
                     } else {
-                        (None, None, Some((log_id.index, request)))
+                        pending_writes.push(CommittedWrite {
+                            log_index: log_id.index,
+                            origin_node_id: request.origin_node_id,
+                            db_path: request.db_path,
+                            raw_message: request.raw_message,
+                        });
                     }
                 }
-                EntryPayload::Blank => (None, None, None),
-            };
+                EntryPayload::Blank => {
+                    non_write_indices.push(log_id.index);
+                }
+            }
+        }
 
-            {
-                let mut inner = self.inner.lock();
+        // 单次加锁合并更新整批日志的 last_applied、last_membership、配置命令并直接生成快照数据，避免逐条加锁与二次加锁
+        let snapshot_data = {
+            let mut inner = self.inner.lock();
+            if let Some(log_id) = last_log_id {
                 inner.last_applied = Some(log_id);
-                if let Some(membership) = membership {
-                    inner.last_membership = membership;
-                }
-                if let Some(command) = &command {
-                    inner.apply_command(command);
-                }
             }
-
-            if let Some(command) = command {
-                pending_commands.push(command);
-                non_write_indices.push(log_id.index);
-            } else if let Some((idx, request)) = write {
-                pending_writes.push(CommittedWrite {
-                    log_index: idx,
-                    origin_node_id: request.origin_node_id,
-                    db_path: request.db_path,
-                    raw_message: request.raw_message,
-                });
-            } else {
-                non_write_indices.push(log_id.index);
+            if let Some(membership) = last_membership {
+                inner.last_membership = membership;
             }
-
-            if is_application {
-                metrics::ENTRIES_APPLIED.inc();
+            for command in &pending_commands {
+                inner.apply_command(command);
             }
+            inner.snapshot_data()
+        };
 
-            last_index = Some(log_id.index);
-            count += 1;
+        if app_entries > 0 {
+            metrics::ENTRIES_APPLIED.inc_by(app_entries);
         }
 
         // 先落盘再投递（修复 P0-2：保证持久化先于外部副作用）
-        self.persist().map_err(storage_io_err)?;
+        let bytes = bitcode::encode(&snapshot_data);
+        self.state_ks
+            .insert(META_KEY, bytes)
+            .map_err(storage_io_err)?;
 
         if let Some(tx) = &shard_config_tx {
             for command in pending_commands {
@@ -414,8 +416,8 @@ impl StateMachineStore {
             self.mark_delivered(last_write.log_index);
         }
 
-        if let Some(index) = last_index {
-            self.applied.send_replace(index);
+        if let Some(log_id) = last_log_id {
+            self.applied.send_replace(log_id.index);
         }
 
         for _ in 0..count {
@@ -441,8 +443,9 @@ impl RaftStateMachine<C> for StateMachineStore {
     where
         Strm: Stream<Item = Result<EntryResponder<C>, io::Error>> + Unpin + OptionalSend,
     {
-        let mut batch_entries = Vec::new();
-        let mut responders = Vec::new();
+        let cap = entries.size_hint().0;
+        let mut batch_entries = Vec::with_capacity(cap);
+        let mut responders = Vec::with_capacity(cap);
         while let Some(item) = entries.next().await {
             let (entry, responder) = item?;
             batch_entries.push(entry);
@@ -470,6 +473,11 @@ impl RaftStateMachine<C> for StateMachineStore {
         let bytes = snapshot.into_inner();
         let data: SnapshotData = bitcode::decode(&bytes).map_err(storage_io_err)?;
 
+        let shard_config_tx = self.shard_config_tx.lock().clone();
+        let replay = shard_config_tx
+            .as_ref()
+            .map(|_| (data.active_shards.clone(), data.shard_routes.clone()));
+
         {
             let mut inner = self.inner.lock();
             inner.last_applied = meta.last_log_id;
@@ -478,9 +486,7 @@ impl RaftStateMachine<C> for StateMachineStore {
             inner.active_shards = data.active_shards;
         }
 
-        let shard_config_tx = self.shard_config_tx.lock().clone();
-        if let Some(tx) = shard_config_tx {
-            let (active_shards, shard_routes) = self.persisted_topology();
+        if let (Some(tx), Some((active_shards, shard_routes))) = (shard_config_tx, replay) {
             for shard_id in active_shards {
                 let _ = tx.send(ShardConfigCommand::CreateShard { shard_id }).await;
             }
