@@ -57,6 +57,12 @@ pub fn decode_shard_config(data: &[u8]) -> Option<ShardConfigCommand> {
     bitcode::decode(payload).ok()
 }
 
+/// 判断一条普通 Raft 日志条目是否为分片 0 的分片配置命令条目（一处定义，供状态机与崩溃重放共用）。
+#[inline]
+pub fn is_shard_config_entry(shard_id: ShardId, db_path: &str, raw_message: &[u8]) -> bool {
+    shard_id == DEFAULT_SHARD && db_path.is_empty() && raw_message.first() == Some(&SHARD_CONFIG_TAG)
+}
+
 /// 从请求路径中提取模块名，形如 `/database/subscribe/MODULE` 或 `/v1/database/MODULE/...`。
 pub fn extract_module_name(path: &str) -> Option<&str> {
     let mut parts = path.trim_start_matches('/').splitn(3, '/');

@@ -33,7 +33,7 @@ use crate::{
             ReducerCallResponse, TypeConfig,
         },
     },
-    router::{self, DEFAULT_SHARD, SHARD_CONFIG_TAG, ShardConfigCommand, ShardId},
+    router::{self, ShardConfigCommand, ShardId, is_shard_config_entry},
     transport::watch,
 };
 
@@ -87,22 +87,25 @@ struct SnapshotData {
 ///
 /// reducer 调用被 Raft 提交后，这里先持久化水位，再把写请求交给本地转发器。
 /// 同时持久化 `last_delivered` 水位，崩溃重启后自动重放 `(last_delivered, last_applied]`。
+/// 内部通过单层 `Arc<StateMachineShared>` 聚合全部共享状态，使 `Clone` 仅需单次原子引用计数递增。
 #[derive(Clone)]
 pub struct StateMachineStore {
+    shared: Arc<StateMachineShared>,
+}
+
+struct StateMachineShared {
     shard_id: ShardId,
-    inner: Arc<Mutex<StateMachineInner>>,
+    inner: Mutex<StateMachineInner>,
     /// 把已提交的写投递给转发任务。
-    forwarder: Arc<Mutex<Option<WriteSender>>>,
+    forwarder: Mutex<Option<WriteSender>>,
     /// 分片配置命令通道，仅分片 0 使用。
-    shard_config_tx: Arc<Mutex<Option<ConfigSender>>>,
-    /// 缓存最近一次快照，供新节点快速拉取。
-    cached_snapshot: Arc<Mutex<Option<RaftSnapshot>>>,
+    shard_config_tx: Mutex<Option<ConfigSender>>,
     /// 状态机元数据 Keyspace（与 `PersistentLogStore` 共享同一个 `fjall::Database`）。
     state_ks: Keyspace,
     /// 已应用到本节点的最新日志 index，供写入方等待「写已落地」。
-    applied: Arc<watch::Sender<u64>>,
+    applied: watch::Sender<u64>,
     /// 已投递到上游 SpacetimeDB 的最新日志 index（用于保序与崩溃重放）。
-    delivered: Arc<watch::Sender<u64>>,
+    delivered: watch::Sender<u64>,
 }
 
 struct StateMachineInner {
@@ -110,6 +113,8 @@ struct StateMachineInner {
     last_membership: RaftStoredMembership,
     shard_routes: HashMap<String, ShardId>,
     active_shards: Vec<ShardId>,
+    /// 缓存最近一次快照；当状态推进时自动失效，避免返回陈旧快照。
+    cached_snapshot: Option<RaftSnapshot>,
 }
 
 impl StateMachineInner {
@@ -179,19 +184,21 @@ impl StateMachineStore {
         );
 
         Ok(Self {
-            shard_id,
-            inner: Arc::new(Mutex::new(StateMachineInner {
-                last_applied,
-                last_membership,
-                shard_routes: meta.shard_routes,
-                active_shards: meta.active_shards,
-            })),
-            forwarder: Arc::new(Mutex::new(None)),
-            shard_config_tx: Arc::new(Mutex::new(None)),
-            cached_snapshot: Arc::new(Mutex::new(None)),
-            state_ks,
-            applied: Arc::new(watch::channel(applied).0),
-            delivered: Arc::new(watch::channel(delivered).0),
+            shared: Arc::new(StateMachineShared {
+                shard_id,
+                inner: Mutex::new(StateMachineInner {
+                    last_applied,
+                    last_membership,
+                    shard_routes: meta.shard_routes,
+                    active_shards: meta.active_shards,
+                    cached_snapshot: None,
+                }),
+                forwarder: Mutex::new(None),
+                shard_config_tx: Mutex::new(None),
+                state_ks,
+                applied: watch::channel(applied).0,
+                delivered: watch::channel(delivered).0,
+            }),
         })
     }
 
@@ -201,9 +208,10 @@ impl StateMachineStore {
             return Ok(());
         };
         let needs_align = {
-            let mut inner = self.inner.lock();
+            let mut inner = self.shared.inner.lock();
             if inner.last_applied.map_or(0, |id| id.index) < purged.index {
                 inner.last_applied = Some(purged);
+                inner.cached_snapshot = None;
                 true
             } else {
                 false
@@ -211,7 +219,7 @@ impl StateMachineStore {
         };
         if needs_align {
             self.persist()?;
-            self.applied.send_replace(purged.index);
+            self.shared.applied.send_replace(purged.index);
             self.mark_delivered(purged.index);
         }
         Ok(())
@@ -219,38 +227,38 @@ impl StateMachineStore {
 
     /// 设置已提交写的投递通道。
     pub fn set_forwarder(&self, tx: WriteSender) {
-        *self.forwarder.lock() = Some(tx);
+        *self.shared.forwarder.lock() = Some(tx);
     }
 
     /// 设置分片配置命令通道，仅分片 0 的状态机需要。
     pub fn set_shard_config_tx(&self, tx: ConfigSender) {
-        *self.shard_config_tx.lock() = Some(tx);
+        *self.shared.shard_config_tx.lock() = Some(tx);
     }
 
     /// 订阅「已应用的日志 index」，用于等待某条写真正落地。
     pub fn applied_rx(&self) -> watch::Receiver<u64> {
-        self.applied.subscribe()
+        self.shared.applied.subscribe()
     }
 
     /// 当前已应用的最大日志 index。
     pub fn last_applied_index(&self) -> u64 {
-        *self.applied.borrow()
+        *self.shared.applied.borrow()
     }
 
     /// 当前已投递到上游的最大日志 index。
     pub fn last_delivered_index(&self) -> u64 {
-        *self.delivered.borrow()
+        *self.shared.delivered.borrow()
     }
 
     /// 订阅「已投递到上游的日志 index」，用于跨连接全局保序（修复 P0-1）。
     pub fn delivered_rx(&self) -> watch::Receiver<u64> {
-        self.delivered.subscribe()
+        self.shared.delivered.subscribe()
     }
 
     /// 推进并持久化 `last_delivered` 水位（修复 P0-2）。
     pub fn mark_delivered(&self, index: u64) {
         let mut updated = false;
-        self.delivered.send_if_modified(|cur| {
+        self.shared.delivered.send_if_modified(|cur| {
             if index > *cur {
                 *cur = index;
                 updated = true;
@@ -261,21 +269,21 @@ impl StateMachineStore {
         });
         if updated {
             let bytes = bitcode::encode(&index);
-            let _ = self.state_ks.insert(META_DELIVERED, bytes);
+            let _ = self.shared.state_ks.insert(META_DELIVERED, bytes);
         }
     }
 
     /// 读取已持久化的分片配置（激活分片列表与路由表）。
     pub fn persisted_topology(&self) -> (Vec<ShardId>, HashMap<String, ShardId>) {
-        let inner = self.inner.lock();
+        let inner = self.shared.inner.lock();
         (inner.active_shards.clone(), inner.shard_routes.clone())
     }
 
     /// 把当前记账状态落盘。先取快照再写盘，避免持锁做 IO。
     fn persist(&self) -> Result<(), StoreError> {
-        let data = self.inner.lock().snapshot_data();
+        let data = self.shared.inner.lock().snapshot_data();
         let bytes = bitcode::encode(&data);
-        self.state_ks.insert(META_KEY, bytes)?;
+        self.shared.state_ks.insert(META_KEY, bytes)?;
         Ok(())
     }
 
@@ -303,8 +311,9 @@ impl StateMachineStore {
         I: IntoIterator<Item = RaftEntry>,
         F: FnMut(ReducerCallResponse),
     {
-        let forwarder = self.forwarder.lock().clone();
-        let shard_config_tx = self.shard_config_tx.lock().clone();
+        let forwarder = self.shared.forwarder.lock().clone();
+        let shard_config_tx = self.shared.shard_config_tx.lock().clone();
+        let shard_id = self.shared.shard_id;
         let mut pending_commands = Vec::new();
         let mut pending_writes = Vec::new();
         let mut non_write_indices = Vec::new();
@@ -327,10 +336,7 @@ impl StateMachineStore {
                 }
                 EntryPayload::Normal(request) => {
                     app_entries += 1;
-                    if self.shard_id == DEFAULT_SHARD
-                        && request.db_path.is_empty()
-                        && request.raw_message.first() == Some(&SHARD_CONFIG_TAG)
-                    {
+                    if is_shard_config_entry(shard_id, &request.db_path, &request.raw_message) {
                         match router::decode_shard_config(&request.raw_message) {
                             Some(command) => {
                                 pending_commands.push(command);
@@ -360,9 +366,10 @@ impl StateMachineStore {
 
         // 单次加锁合并更新整批日志的 last_applied、last_membership、配置命令并直接生成快照数据，避免逐条加锁与二次加锁
         let snapshot_data = {
-            let mut inner = self.inner.lock();
+            let mut inner = self.shared.inner.lock();
             if let Some(log_id) = last_log_id {
                 inner.last_applied = Some(log_id);
+                inner.cached_snapshot = None;
             }
             if let Some(membership) = last_membership {
                 inner.last_membership = membership;
@@ -379,7 +386,8 @@ impl StateMachineStore {
 
         // 先落盘再投递（修复 P0-2：保证持久化先于外部副作用）
         let bytes = bitcode::encode(&snapshot_data);
-        self.state_ks
+        self.shared
+            .state_ks
             .insert(META_KEY, bytes)
             .map_err(storage_io_err)?;
 
@@ -417,7 +425,7 @@ impl StateMachineStore {
         }
 
         if let Some(log_id) = last_log_id {
-            self.applied.send_replace(log_id.index);
+            self.shared.applied.send_replace(log_id.index);
         }
 
         for _ in 0..count {
@@ -435,7 +443,7 @@ impl RaftStateMachine<C> for StateMachineStore {
     async fn applied_state(
         &mut self,
     ) -> Result<(Option<RaftLogId>, RaftStoredMembership), io::Error> {
-        let inner = self.inner.lock();
+        let inner = self.shared.inner.lock();
         Ok((inner.last_applied, inner.last_membership.clone()))
     }
 
@@ -473,17 +481,21 @@ impl RaftStateMachine<C> for StateMachineStore {
         let bytes = snapshot.into_inner();
         let data: SnapshotData = bitcode::decode(&bytes).map_err(storage_io_err)?;
 
-        let shard_config_tx = self.shard_config_tx.lock().clone();
+        let shard_config_tx = self.shared.shard_config_tx.lock().clone();
         let replay = shard_config_tx
             .as_ref()
             .map(|_| (data.active_shards.clone(), data.shard_routes.clone()));
 
         {
-            let mut inner = self.inner.lock();
+            let mut inner = self.shared.inner.lock();
             inner.last_applied = meta.last_log_id;
             inner.last_membership = meta.last_membership.clone();
             inner.shard_routes = data.shard_routes;
             inner.active_shards = data.active_shards;
+            inner.cached_snapshot = Some(Snapshot {
+                meta: meta.clone(),
+                snapshot: Cursor::new(bytes),
+            });
         }
 
         if let (Some(tx), Some((active_shards, shard_routes))) = (shard_config_tx, replay) {
@@ -502,28 +514,25 @@ impl RaftStateMachine<C> for StateMachineStore {
 
         self.persist().map_err(storage_io_err)?;
         if let Some(log_id) = meta.last_log_id {
-            self.applied.send_replace(log_id.index);
+            self.shared.applied.send_replace(log_id.index);
             self.mark_delivered(log_id.index);
         }
-
-        *self.cached_snapshot.lock() = Some(Snapshot {
-            meta: meta.clone(),
-            snapshot: Cursor::new(bytes),
-        });
 
         Ok(())
     }
 
     async fn get_current_snapshot(&mut self) -> Result<Option<RaftSnapshot>, io::Error> {
-        if let Some(snapshot) = self.cached_snapshot.lock().as_ref() {
-            return Ok(Some(Snapshot {
-                meta: snapshot.meta.clone(),
-                snapshot: Cursor::new(snapshot.snapshot.get_ref().clone()),
-            }));
-        }
-
-        if self.inner.lock().last_applied.is_none() {
-            return Ok(None);
+        {
+            let inner = self.shared.inner.lock();
+            if let Some(snapshot) = inner.cached_snapshot.as_ref() {
+                return Ok(Some(Snapshot {
+                    meta: snapshot.meta.clone(),
+                    snapshot: Cursor::new(snapshot.snapshot.get_ref().clone()),
+                }));
+            }
+            if inner.last_applied.is_none() {
+                return Ok(None);
+            }
         }
         Ok(Some(self.build_snapshot().await?))
     }
@@ -533,17 +542,13 @@ impl RaftSnapshotBuilder<C> for StateMachineStore {
     type SnapshotData = Cursor<Vec<u8>>;
 
     async fn build_snapshot(&mut self) -> Result<RaftSnapshot, io::Error> {
-        let (encoded, meta) = {
-            let inner = self.inner.lock();
-            let encoded = bitcode::encode(&inner.snapshot_data());
-            let meta = SnapshotMeta {
-                last_log_id: inner.last_applied,
-                last_membership: inner.last_membership.clone(),
-            };
-            (encoded, meta)
+        let mut inner = self.shared.inner.lock();
+        let encoded = bitcode::encode(&inner.snapshot_data());
+        let meta = SnapshotMeta {
+            last_log_id: inner.last_applied,
+            last_membership: inner.last_membership.clone(),
         };
-
-        *self.cached_snapshot.lock() = Some(Snapshot {
+        inner.cached_snapshot = Some(Snapshot {
             meta: meta.clone(),
             snapshot: Cursor::new(encoded.clone()),
         });
