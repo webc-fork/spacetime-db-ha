@@ -18,7 +18,11 @@ use zenoh::{Session, bytes::ZBytes, pubsub::Subscriber, sample::Sample};
 use crate::{
     config::NodeConfig,
     metrics,
-    raft::{RaftPool, codec::impl_bitcode_via, forwarder::next_stream_id},
+    raft::{
+        RaftPool,
+        codec::{WireBytes, impl_bitcode_via},
+        forwarder::next_stream_id,
+    },
     router::{DEFAULT_SHARD, ShardId, extract_module_name},
     transport::{
         CrossfireChannel, CrossfireHandler, KEY_STDB_CONNECT, STDB_C2S_PREFIX, STDB_S2C_PREFIX,
@@ -60,53 +64,43 @@ pub enum Message {
     Close(Option<CloseFrame>),
 }
 
-/// `Message` 的零拷贝借用编码视图（消除编码时 `b.to_vec()` 与 `s.clone()` 临时堆分配）。
-#[derive(Encode)]
-pub enum WireMessageRef<'a> {
-    Binary(&'a [u8]),
-    Text(&'a str),
-    Ping(&'a [u8]),
-    Pong(&'a [u8]),
-    Close(&'a Option<CloseFrame>),
+/// `Message` 的 `bitcode` 原生线格式表示（使用 `WireBytes` 引用计数零拷贝编码，消除 `.to_vec()` 堆分配）。
+#[derive(Encode, Decode)]
+pub enum WireMessage {
+    Binary(WireBytes),
+    Text(String),
+    Ping(WireBytes),
+    Pong(WireBytes),
+    Close(Option<CloseFrame>),
 }
 
-impl<'a> From<&'a Message> for WireMessageRef<'a> {
+impl From<&Message> for WireMessage {
     #[inline(always)]
-    fn from(msg: &'a Message) -> Self {
+    fn from(msg: &Message) -> Self {
         match msg {
-            Message::Binary(b) => Self::Binary(b),
-            Message::Text(s) => Self::Text(s),
-            Message::Ping(b) => Self::Ping(b),
-            Message::Pong(b) => Self::Pong(b),
-            Message::Close(c) => Self::Close(c),
+            Message::Binary(b) => Self::Binary(WireBytes(b.clone())),
+            Message::Text(s) => Self::Text(s.clone()),
+            Message::Ping(b) => Self::Ping(WireBytes(b.clone())),
+            Message::Pong(b) => Self::Pong(WireBytes(b.clone())),
+            Message::Close(c) => Self::Close(c.clone()),
         }
     }
-}
-
-/// `Message` 的 `bitcode` 原生解码表示。
-#[derive(Decode)]
-pub enum WireMessage {
-    Binary(Vec<u8>),
-    Text(String),
-    Ping(Vec<u8>),
-    Pong(Vec<u8>),
-    Close(Option<CloseFrame>),
 }
 
 impl From<WireMessage> for Message {
     #[inline(always)]
     fn from(w: WireMessage) -> Self {
         match w {
-            WireMessage::Binary(b) => Self::Binary(Bytes::from(b)),
+            WireMessage::Binary(b) => Self::Binary(b.0),
             WireMessage::Text(s) => Self::Text(s),
-            WireMessage::Ping(b) => Self::Ping(Bytes::from(b)),
-            WireMessage::Pong(b) => Self::Pong(Bytes::from(b)),
+            WireMessage::Ping(b) => Self::Ping(b.0),
+            WireMessage::Pong(b) => Self::Pong(b.0),
             WireMessage::Close(c) => Self::Close(c),
         }
     }
 }
 
-impl_bitcode_via!(Message, WireMessageRef, WireMessage);
+impl_bitcode_via!(Message, WireMessage);
 
 /// Zenoh 会话握手请求。
 #[derive(Debug, Clone, Encode, Decode)]

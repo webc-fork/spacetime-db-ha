@@ -29,16 +29,26 @@ use crate::raft::types::{
 type C = TypeConfig;
 type Payload = EntryPayload<ReducerCallRequest, u64, BasicNode>;
 
-/// 将本地类型委托给 `bitcode` 编码器 `E` 的通用零拷贝包装器。
-pub struct WireEncoder<E>(pub(crate) E);
+/// 将本地类型 `T` 委托给派生了 `#[derive(Encode, Decode)]` 的线格式 `W` 的通用编码器。
+pub struct WireEncoder<W: Encode>(W::Encoder);
 
-impl<E: Default> Default for WireEncoder<E> {
+impl<W: Encode> Default for WireEncoder<W> {
     fn default() -> Self {
-        Self(E::default())
+        Self(Default::default())
     }
 }
 
-impl<E: Buffer> Buffer for WireEncoder<E> {
+impl<T, W> Encoder<T> for WireEncoder<W>
+where
+    W: Encode + for<'a> From<&'a T>,
+{
+    #[inline(always)]
+    fn encode(&mut self, t: &T) {
+        self.0.encode(&W::from(t));
+    }
+}
+
+impl<W: Encode> Buffer for WireEncoder<W> {
     #[inline(always)]
     fn collect_into(&mut self, out: &mut Vec<u8>) {
         self.0.collect_into(out);
@@ -77,65 +87,95 @@ where
 }
 
 /// 为包含外部非 `bitcode` 字段（如 `bytes::Bytes` 或 `openraft::LogId`）的本 crate 类型实现原生 `Encode` / `Decode`。
-/// 支持值类型直接转换，或通过借用视图 `$wire_ref<'a>` 零拷贝编码 + 拥有所有权类型 `$wire_owned` 解码。
 macro_rules! impl_bitcode_via {
     ($target:ty, $wire:ty) => {
         impl bitcode::Encode for $target {
-            type Encoder = $crate::raft::codec::WireEncoder<<$wire as bitcode::Encode>::Encoder>;
-        }
-
-        impl bitcode::__private::Encoder<$target>
-            for $crate::raft::codec::WireEncoder<<$wire as bitcode::Encode>::Encoder>
-        {
-            #[inline(always)]
-            fn encode(&mut self, t: &$target) {
-                self.0.encode(&<$wire>::from(t));
-            }
+            type Encoder = $crate::raft::codec::WireEncoder<$wire>;
         }
 
         impl<'a> bitcode::Decode<'a> for $target {
             type Decoder = $crate::raft::codec::WireDecoder<'a, $wire>;
         }
     };
-    ($target:ty, $wire_ref:ident, $wire_owned:ty) => {
-        impl bitcode::Encode for $target {
-            type Encoder =
-                $crate::raft::codec::WireEncoder<<$wire_ref<'static> as bitcode::Encode>::Encoder>;
-        }
-
-        impl bitcode::__private::Encoder<$target>
-            for $crate::raft::codec::WireEncoder<<$wire_ref<'static> as bitcode::Encode>::Encoder>
-        {
-            #[inline(always)]
-            fn encode(&mut self, t: &$target) {
-                self.0.encode(&$wire_ref::from(t));
-            }
-        }
-
-        impl<'a> bitcode::Decode<'a> for $target {
-            type Decoder = $crate::raft::codec::WireDecoder<'a, $wire_owned>;
-        }
-    };
 }
 
 pub(crate) use impl_bitcode_via;
 
-/// `ReducerCallRequest` 的零拷贝借用编码视图（消除编码时 `raw_message.to_vec()` 与 `db_path.clone()` 临时堆分配）。
-#[derive(Encode)]
-pub struct WireReducerCallRequestRef<'a> {
-    pub raw_message: &'a [u8],
-    pub db_path: &'a str,
-    pub origin_node_id: u64,
+/// `bytes::Bytes` 的零拷贝 `bitcode` 包装器：
+/// - 克隆仅递增 `Bytes` 引用计数（O(1) 零堆分配）；
+/// - 编码直接委托给 `<[u8] as Encode>::Encoder` 写入切片（消除 `.to_vec()` 临时堆分配）；
+/// - 解码将 `Vec<u8>` 零拷贝移交为 `Bytes`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct WireBytes(pub Bytes);
+
+#[derive(Default)]
+pub struct WireBytesEncoder(<[u8] as Encode>::Encoder);
+
+impl Encoder<WireBytes> for WireBytesEncoder {
+    #[inline(always)]
+    fn encode(&mut self, t: &WireBytes) {
+        Encoder::<[u8]>::encode(&mut self.0, &t.0);
+    }
 }
 
-impl<'a> From<&'a ReducerCallRequest> for WireReducerCallRequestRef<'a> {
+impl Buffer for WireBytesEncoder {
     #[inline(always)]
-    fn from(req: &'a ReducerCallRequest) -> Self {
-        Self {
-            raw_message: &req.raw_message,
-            db_path: &req.db_path,
-            origin_node_id: req.origin_node_id,
-        }
+    fn collect_into(&mut self, out: &mut Vec<u8>) {
+        self.0.collect_into(out);
+    }
+
+    #[inline(always)]
+    fn reserve(&mut self, additional: NonZeroUsize) {
+        self.0.reserve(additional);
+    }
+}
+
+impl Encode for WireBytes {
+    type Encoder = WireBytesEncoder;
+}
+
+impl From<Vec<u8>> for WireBytes {
+    #[inline(always)]
+    fn from(v: Vec<u8>) -> Self {
+        Self(Bytes::from(v))
+    }
+}
+
+impl<'a> Decode<'a> for WireBytes {
+    type Decoder = WireDecoder<'a, Vec<u8>>;
+}
+
+/// `ReducerCallRequest` 的零拷贝直接编码器（直接按 `&[u8]` 与 `&str` 写入 `bitcode` 缓冲区，零 `.to_vec()`、零 `.clone()`）。
+#[derive(Default)]
+pub struct ReducerCallRequestEncoder {
+    raw_message: <[u8] as Encode>::Encoder,
+    db_path: <str as Encode>::Encoder,
+    origin_node_id: <u64 as Encode>::Encoder,
+}
+
+impl Encoder<ReducerCallRequest> for ReducerCallRequestEncoder {
+    #[inline(always)]
+    fn encode(&mut self, t: &ReducerCallRequest) {
+        Encoder::<[u8]>::encode(&mut self.raw_message, &t.raw_message);
+        Encoder::<str>::encode(&mut self.db_path, &t.db_path);
+        self.origin_node_id.encode(&t.origin_node_id);
+    }
+}
+
+impl Buffer for ReducerCallRequestEncoder {
+    #[inline(always)]
+    fn collect_into(&mut self, out: &mut Vec<u8>) {
+        self.raw_message.collect_into(out);
+        self.db_path.collect_into(out);
+        self.origin_node_id.collect_into(out);
+    }
+
+    #[inline(always)]
+    fn reserve(&mut self, additional: NonZeroUsize) {
+        self.raw_message.reserve(additional);
+        self.db_path.reserve(additional);
+        self.origin_node_id.reserve(additional);
     }
 }
 
@@ -158,11 +198,13 @@ impl From<WireReducerCallRequest> for ReducerCallRequest {
     }
 }
 
-impl_bitcode_via!(
-    ReducerCallRequest,
-    WireReducerCallRequestRef,
-    WireReducerCallRequest
-);
+impl Encode for ReducerCallRequest {
+    type Encoder = ReducerCallRequestEncoder;
+}
+
+impl<'a> Decode<'a> for ReducerCallRequest {
+    type Decoder = WireDecoder<'a, WireReducerCallRequest>;
+}
 
 /// `RaftLogId` 的 `bitcode` 原生编码表示。
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Encode, Decode)]
