@@ -1,6 +1,7 @@
+use std::io::Cursor;
+
 use openraft::BasicNode;
 use serde::{Deserialize, Serialize};
-use std::io::Cursor;
 
 /// A reducer call to be replicated through Raft.
 /// We treat the WebSocket message as an opaque blob — no BSATN deserialization needed.

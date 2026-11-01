@@ -1,8 +1,10 @@
+use std::{collections::BTreeMap, io::ErrorKind, path::Path, process::Command};
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use openraft::BasicNode;
+use reqwest::Client;
 use serde_json::Value;
-use std::collections::BTreeMap;
 
 #[derive(Parser)]
 #[command(name = "rtdb", about = "RaftTimeDB cluster management CLI")]
@@ -122,7 +124,7 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let client = reqwest::Client::new();
+    let client = Client::new();
 
     match cli.command {
         Commands::Status { addr } => {
@@ -157,9 +159,10 @@ async fn main() -> Result<()> {
             let mut first_addr: Option<String> = None;
 
             for node_spec in &nodes {
-                let (id_str, addr) = node_spec
-                    .split_once('=')
-                    .context(format!("Invalid node format '{}', expected 'id=host:port'", node_spec))?;
+                let (id_str, addr) = node_spec.split_once('=').context(format!(
+                    "Invalid node format '{}', expected 'id=host:port'",
+                    node_spec
+                ))?;
 
                 let id: u64 = id_str
                     .parse()
@@ -169,7 +172,12 @@ async fn main() -> Result<()> {
                     first_addr = Some(format!("http://{}", addr));
                 }
 
-                members.insert(id, BasicNode { addr: addr.to_string() });
+                members.insert(
+                    id,
+                    BasicNode {
+                        addr: addr.to_string(),
+                    },
+                );
             }
 
             let target = first_addr.context("No nodes specified")?;
@@ -227,7 +235,7 @@ async fn main() -> Result<()> {
             servers,
         } => {
             let db_name = name.unwrap_or_else(|| {
-                std::path::Path::new(&module)
+                Path::new(&module)
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| "my_module".to_string())
@@ -243,7 +251,7 @@ async fn main() -> Result<()> {
             let mut failed = 0;
             for server in &servers {
                 print!("  Publishing to {}... ", server);
-                let result = std::process::Command::new("spacetime")
+                let result = Command::new("spacetime")
                     .args(["publish", "--server", server, &module, &db_name])
                     .output();
 
@@ -257,7 +265,7 @@ async fn main() -> Result<()> {
                         failed += 1;
                     }
                     Err(e) => {
-                        if e.kind() == std::io::ErrorKind::NotFound {
+                        if e.kind() == ErrorKind::NotFound {
                             anyhow::bail!(
                                 "spacetime CLI not found. Install it: https://spacetimedb.com/install"
                             );
@@ -377,10 +385,7 @@ async fn main() -> Result<()> {
                 .await
                 .context("Failed to connect to node")?;
 
-            let data: Value = resp
-                .json()
-                .await
-                .context("Failed to parse response")?;
+            let data: Value = resp.json().await.context("Failed to parse response")?;
 
             println!("Active Shards:");
             if let Some(shards) = data["shards"].as_array() {

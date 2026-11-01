@@ -1,15 +1,18 @@
-use crate::metrics;
-use crate::raft::RaftPool;
-use crate::router;
+use std::sync::{Arc, Mutex as StdMutex};
+
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
-use std::sync::{Arc, Mutex as StdMutex};
-use tokio::net::TcpStream;
-use tokio::sync::Mutex;
-use tokio_tungstenite::tungstenite::http;
-use tokio_tungstenite::tungstenite::protocol::CloseFrame;
-use tokio_tungstenite::tungstenite::Message;
+use tokio::{
+    net::TcpStream,
+    sync::{Mutex, watch::Receiver},
+};
+use tokio_tungstenite::tungstenite::{
+    Message, http,
+    protocol::{CloseFrame, frame::coding::CloseCode},
+};
 use tracing::{debug, info, warn};
+
+use crate::{metrics, raft::RaftPool, router};
 
 /// SpacetimeDB v2 WebSocket protocol BSATN tag bytes.
 /// These are the first byte of the binary message, indicating the ClientMessage variant.
@@ -74,7 +77,7 @@ pub fn is_known_tag(tag: u8) -> bool {
 async fn leader_close_frame(pool: &RaftPool, shard_id: u64) -> Option<CloseFrame> {
     let (leader_id, leader_addr) = pool.current_leader(shard_id).await?;
     Some(CloseFrame {
-        code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Away,
+        code: CloseCode::Away,
         reason: format!("leader={}:{}", leader_id, leader_addr).into(),
     })
 }
@@ -93,7 +96,7 @@ pub async fn handle_client(
     stream: TcpStream,
     pool: Arc<RaftPool>,
     stdb_url: &str,
-    shutdown: tokio::sync::watch::Receiver<bool>,
+    shutdown: Receiver<bool>,
 ) -> Result<()> {
     metrics::CONNECTIONS_ACTIVE.inc();
 
@@ -107,7 +110,7 @@ async fn handle_client_inner(
     stream: TcpStream,
     pool: Arc<RaftPool>,
     stdb_url: &str,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    mut shutdown: Receiver<bool>,
 ) -> Result<()> {
     // Extract the request URI path during the WebSocket handshake.
     // SpacetimeDB requires a path like /database/subscribe/MODULE_NAME.
@@ -116,15 +119,19 @@ async fn handle_client_inner(
 
     let client_ws = tokio_tungstenite::accept_hdr_async(
         stream,
-        move |req: &http::Request<()>, resp: http::Response<()>|
-            -> Result<http::Response<()>, http::Response<Option<String>>> {
-            let uri_path = req.uri().path_and_query()
+        move |req: &http::Request<()>,
+              resp: http::Response<()>|
+              -> Result<http::Response<()>, http::Response<Option<String>>> {
+            let uri_path = req
+                .uri()
+                .path_and_query()
                 .map(|pq| pq.as_str().to_string())
                 .unwrap_or_else(|| "/".to_string());
             *path_for_cb.lock().unwrap() = uri_path;
             Ok(resp)
         },
-    ).await?;
+    )
+    .await?;
 
     let request_path = path_holder.lock().unwrap().clone();
     let upstream_url = format!("{}{}", stdb_url, request_path);
@@ -166,13 +173,18 @@ async fn handle_client_inner(
             match kind {
                 MessageKind::Write => {
                     if let Message::Binary(data) = &msg {
-                        debug!(tag = data[0], len = data.len(), shard_id, "Write -> Raft consensus");
+                        debug!(
+                            tag = data[0],
+                            len = data.len(),
+                            shard_id,
+                            "Write -> Raft consensus"
+                        );
                     }
-                    if let Message::Binary(data) = &msg {
-                        if let Err(e) = pool_clone.propose_write(shard_id, data.to_vec()).await {
-                            warn!(error = %e, "Raft propose failed");
-                            continue;
-                        }
+                    if let Message::Binary(data) = &msg
+                        && let Err(e) = pool_clone.propose_write(shard_id, data.to_vec()).await
+                    {
+                        warn!(error = %e, "Raft propose failed");
+                        continue;
                     }
                     if let Err(e) = upstream_tx_clone.lock().await.send(msg).await {
                         warn!(error = %e, "Upstream send failed");
@@ -238,8 +250,9 @@ async fn handle_client_inner(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tokio_tungstenite::tungstenite::Message;
+
+    use super::*;
 
     // -- Tag classification tests --
 

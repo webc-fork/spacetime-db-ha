@@ -1,8 +1,15 @@
+use std::{
+    collections::BTreeMap,
+    ops::RangeBounds,
+    sync::{Arc, Mutex},
+};
+
+use openraft::{
+    Entry, LogId, LogState, RaftLogId, RaftLogReader, StorageError, Vote,
+    storage::{LogFlushed, RaftLogStorage},
+};
+
 use crate::raft::types::TypeConfig;
-use openraft::storage::{LogFlushed, RaftLogStorage};
-use openraft::{Entry, LogId, LogState, RaftLogId, RaftLogReader, StorageError, Vote};
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
 
 type C = TypeConfig;
 
@@ -27,7 +34,7 @@ impl LogStore {
 }
 
 impl RaftLogReader<C> for LogStore {
-    async fn try_get_log_entries<RB: std::ops::RangeBounds<u64> + Clone + Send>(
+    async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Send>(
         &mut self,
         range: RB,
     ) -> Result<Vec<Entry<C>>, StorageError<u64>> {
@@ -55,13 +62,13 @@ impl RaftLogStorage<C> for LogStore {
 
     async fn save_vote(&mut self, vote: &Vote<u64>) -> Result<(), StorageError<u64>> {
         let mut inner = self.inner.lock().unwrap();
-        inner.vote = Some(vote.clone());
+        inner.vote = Some(*vote);
         Ok(())
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<u64>>, StorageError<u64>> {
         let inner = self.inner.lock().unwrap();
-        Ok(inner.vote.clone())
+        Ok(inner.vote)
     }
 
     async fn append<I>(
@@ -93,11 +100,7 @@ impl RaftLogStorage<C> for LogStore {
 
     async fn purge(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
         let mut inner = self.inner.lock().unwrap();
-        let to_remove: Vec<_> = inner
-            .log
-            .range(..=log_id.index)
-            .map(|(k, _)| *k)
-            .collect();
+        let to_remove: Vec<_> = inner.log.range(..=log_id.index).map(|(k, _)| *k).collect();
         for key in to_remove {
             inner.log.remove(&key);
         }

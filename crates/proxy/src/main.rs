@@ -1,7 +1,20 @@
+use std::{sync::Arc, time::Duration};
+
 use anyhow::Result;
+use axum::body::Body;
 use clap::Parser;
-use std::sync::Arc;
+use hyper::{Request, body::Incoming, service::service_fn};
+use hyper_util::server::conn::auto::Builder;
+use rustls::ServerConfig;
+use tokio::{
+    net::TcpListener,
+    sync::watch::{Receiver, channel},
+    time,
+    time::sleep,
+};
+use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
+use tracing_subscriber::EnvFilter;
 
 mod api;
 mod config;
@@ -11,7 +24,10 @@ mod router;
 mod websocket;
 
 #[derive(Parser)]
-#[command(name = "rafttimedb", about = "Distributed clustering layer for SpacetimeDB")]
+#[command(
+    name = "rafttimedb",
+    about = "Distributed clustering layer for SpacetimeDB"
+)]
 struct Cli {
     /// Node ID (unique within the cluster)
     #[arg(long, env = "RTDB_NODE_ID")]
@@ -54,8 +70,7 @@ struct Cli {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "rafttimedb=info".into()),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| "rafttimedb=info".into()),
         )
         .init();
 
@@ -89,7 +104,7 @@ async fn main() -> Result<()> {
     };
 
     // Shutdown coordination: send `true` to signal all tasks to stop
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, shutdown_rx) = channel(false);
 
     // Initialize the RaftPool (creates shard 0, spawns forwarder + config listener)
     let pool = raft::RaftPool::new(&config, shutdown_rx.clone()).await?;
@@ -98,7 +113,7 @@ async fn main() -> Result<()> {
     let pool_for_metrics = pool.clone();
     let mut metrics_shutdown = shutdown_rx.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut interval = time::interval(Duration::from_secs(1));
         loop {
             tokio::select! {
                 _ = interval.tick() => {
@@ -122,15 +137,13 @@ async fn main() -> Result<()> {
     };
 
     // Start the HTTP management API server on the raft address
-    let app_state = Arc::new(api::AppState {
-        pool: pool.clone(),
-    });
+    let app_state = Arc::new(api::AppState { pool: pool.clone() });
     let http_router = api::router(app_state);
-    let http_listener = tokio::net::TcpListener::bind(&cli.raft_addr).await?;
+    let http_listener = TcpListener::bind(&cli.raft_addr).await?;
 
     if let Some(ref tls) = tls_config {
         info!(addr = %cli.raft_addr, "HTTPS management API listening (TLS enabled)");
-        let acceptor = tokio_rustls::TlsAcceptor::from(tls.clone());
+        let acceptor = TlsAcceptor::from(tls.clone());
         let router = http_router.clone();
         let http_shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
@@ -140,8 +153,8 @@ async fn main() -> Result<()> {
         info!(addr = %cli.raft_addr, "HTTP management API listening");
         let mut http_shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
-            let graceful = axum::serve(http_listener, http_router)
-                .with_graceful_shutdown(async move {
+            let graceful =
+                axum::serve(http_listener, http_router).with_graceful_shutdown(async move {
                     let _ = http_shutdown.changed().await;
                 });
             if let Err(e) = graceful.await {
@@ -165,7 +178,7 @@ async fn main() -> Result<()> {
             let _ = shutdown_tx.send(true);
 
             // Give connections time to drain
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            sleep(Duration::from_secs(5)).await;
             info!("Shutdown complete");
         }
     }
@@ -177,9 +190,8 @@ async fn main() -> Result<()> {
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
-        let mut sigterm = tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::terminate(),
-        ).expect("failed to install SIGTERM handler");
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler");
 
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {},
@@ -197,20 +209,19 @@ async fn shutdown_signal() {
 
 /// Build a rustls ServerConfig from PEM cert and key files.
 fn build_tls_config(cert_path: &str, key_path: &str) -> Result<Arc<rustls::ServerConfig>> {
+    use std::{fs::File, io::BufReader};
+
     use rustls_pemfile::{certs, private_key};
-    use std::fs::File;
-    use std::io::BufReader;
 
     let cert_file = File::open(cert_path)?;
     let key_file = File::open(key_path)?;
 
-    let certs: Vec<_> = certs(&mut BufReader::new(cert_file))
-        .collect::<Result<Vec<_>, _>>()?;
+    let certs: Vec<_> = certs(&mut BufReader::new(cert_file)).collect::<Result<Vec<_>, _>>()?;
 
     let key = private_key(&mut BufReader::new(key_file))?
         .ok_or_else(|| anyhow::anyhow!("No private key found in {}", key_path))?;
 
-    let config = rustls::ServerConfig::builder()
+    let config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)?;
 
@@ -219,10 +230,10 @@ fn build_tls_config(cert_path: &str, key_path: &str) -> Result<Arc<rustls::Serve
 
 /// Serve an axum router over TLS using tokio-rustls.
 async fn serve_tls(
-    listener: tokio::net::TcpListener,
+    listener: TcpListener,
     acceptor: tokio_rustls::TlsAcceptor,
     app: axum::Router,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    mut shutdown: Receiver<bool>,
 ) {
     use hyper_util::rt::{TokioExecutor, TokioIo};
     use tower::ServiceExt;
@@ -251,16 +262,16 @@ async fn serve_tls(
                     };
 
                     let io = TokioIo::new(tls_stream);
-                    let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                    let service = service_fn(move |req: hyper::Request<Incoming>| {
                         let app = app.clone();
                         async move {
                             let (parts, body) = req.into_parts();
-                            let req = hyper::Request::from_parts(parts, axum::body::Body::new(body));
+                            let req = Request::from_parts(parts, Body::new(body));
                             app.oneshot(req).await
                         }
                     });
 
-                    if let Err(e) = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                    if let Err(e) = Builder::new(TokioExecutor::new())
                         .serve_connection(io, service)
                         .await
                     {

@@ -9,9 +9,16 @@
 //! Tests that require a running SpacetimeDB are gated behind the `integration` feature
 //! or use mock WebSocket servers.
 
-use futures_util::{SinkExt, StreamExt};
 use std::net::SocketAddr;
-use tokio::net::TcpListener;
+
+use futures_util::{
+    SinkExt, StreamExt,
+    stream::{SplitSink, SplitStream},
+};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::mpsc::{UnboundedReceiver, unbounded_channel},
+};
 use tokio_tungstenite::tungstenite::Message;
 
 /// Helper: start a mock WebSocket server that echoes everything back.
@@ -40,10 +47,10 @@ async fn start_echo_ws_server() -> SocketAddr {
 
 /// Helper: start a mock WebSocket server that records received messages.
 /// Returns the address and a receiver for the messages.
-async fn start_recording_ws_server() -> (SocketAddr, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) {
+async fn start_recording_ws_server() -> (SocketAddr, UnboundedReceiver<Vec<u8>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, rx) = unbounded_channel();
 
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
@@ -75,17 +82,11 @@ async fn start_recording_ws_server() -> (SocketAddr, tokio::sync::mpsc::Unbounde
 async fn connect_client(
     addr: SocketAddr,
 ) -> (
-    futures_util::stream::SplitSink<
-        tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
+    SplitSink<
+        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
         Message,
     >,
-    futures_util::stream::SplitStream<
-        tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-    >,
+    SplitStream<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>>,
 ) {
     let url = format!("ws://127.0.0.1:{}", addr.port());
     let (ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();

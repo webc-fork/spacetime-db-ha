@@ -1,12 +1,9 @@
-use prometheus::{Histogram, IntCounter, IntGauge, TextEncoder};
 use std::sync::LazyLock;
 
+use prometheus::{Histogram, IntCounter, IntGauge, TextEncoder};
+
 pub static RAFT_TERM: LazyLock<IntGauge> = LazyLock::new(|| {
-    prometheus::register_int_gauge!(
-        "rafttimedb_raft_term",
-        "Current Raft term"
-    )
-    .unwrap()
+    prometheus::register_int_gauge!("rafttimedb_raft_term", "Current Raft term").unwrap()
 });
 
 pub static RAFT_IS_LEADER: LazyLock<IntGauge> = LazyLock::new(|| {

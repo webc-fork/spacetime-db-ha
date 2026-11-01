@@ -3,8 +3,9 @@
 // In Phase 1 (single shard), all requests go to shard 0.
 // In Phase 2 (multi-shard), each module can be routed to its own Raft group.
 
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
 
 /// Shard identifier.
 pub type ShardId = u64;
@@ -17,9 +18,16 @@ pub const SHARD_CONFIG_TAG: u8 = 0xFF;
 /// When committed, all nodes materialize the change (create shards, update routes).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ShardConfigCommand {
-    CreateShard { shard_id: ShardId },
-    AddRoute { module_name: String, shard_id: ShardId },
-    RemoveRoute { module_name: String },
+    CreateShard {
+        shard_id: ShardId,
+    },
+    AddRoute {
+        module_name: String,
+        shard_id: ShardId,
+    },
+    RemoveRoute {
+        module_name: String,
+    },
 }
 
 /// Encode a shard config command as a Raft entry payload.
@@ -191,10 +199,7 @@ mod tests {
 
     #[test]
     fn test_extract_module_name_no_leading_slash() {
-        assert_eq!(
-            extract_module_name("database/subscribe/mydb"),
-            Some("mydb")
-        );
+        assert_eq!(extract_module_name("database/subscribe/mydb"), Some("mydb"));
     }
 
     #[test]

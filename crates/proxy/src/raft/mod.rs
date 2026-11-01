@@ -1,23 +1,33 @@
+use std::{fs::read, path::Path, time::Duration};
+
+use openraft::error::{ClientWriteError, RaftError};
+use reqwest::Client;
+use tokio::time::sleep;
 mod log_store;
 mod network;
 pub mod persistent_log_store;
 pub mod state_machine;
 pub mod types;
 
-pub use types::*;
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    sync::Arc,
+};
 
-use crate::config::NodeConfig;
-use crate::metrics;
-use crate::router::{ShardConfigCommand, ShardId, ShardRouter};
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use openraft::{BasicNode, Config, Raft};
 use state_machine::StateMachineStore;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::Arc;
-use tokio::sync::{mpsc, watch, RwLock};
+use tokio::sync::{RwLock, mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
+pub use types::*;
+
+use crate::{
+    config::NodeConfig,
+    metrics,
+    router::{ShardConfigCommand, ShardId, ShardRouter},
+};
 
 /// Parse peer strings in the format "id=host:port" into a BTreeMap.
 /// Example: ["2=node-2:4001", "3=node-3:4001"] -> {2: BasicNode{addr: "node-2:4001"}, ...}
@@ -26,7 +36,12 @@ pub fn parse_peers(peers: &[String]) -> BTreeMap<u64, BasicNode> {
     for peer in peers {
         if let Some((id_str, addr)) = peer.split_once('=') {
             if let Ok(id) = id_str.parse::<u64>() {
-                map.insert(id, BasicNode { addr: addr.to_string() });
+                map.insert(
+                    id,
+                    BasicNode {
+                        addr: addr.to_string(),
+                    },
+                );
             } else {
                 warn!(peer = %peer, "Failed to parse peer node ID");
             }
@@ -62,17 +77,16 @@ pub struct RaftPool {
 impl RaftPool {
     /// Create a new RaftPool with shard 0 initialized.
     /// Returns an Arc since background tasks reference the pool.
-    pub async fn new(
-        config: &NodeConfig,
-        shutdown_rx: watch::Receiver<bool>,
-    ) -> Result<Arc<Self>> {
+    pub async fn new(config: &NodeConfig, shutdown_rx: watch::Receiver<bool>) -> Result<Arc<Self>> {
         let peers = parse_peers(&config.peers);
         let node_config = Arc::new(config.clone());
 
         // Create shard 0's state machine with shard config callback
         let (shard_config_tx, shard_config_rx) = mpsc::unbounded_channel();
         let shard_state = Self::create_shard_state(config, 0).await?;
-        shard_state.state_machine.set_shard_config_tx(shard_config_tx);
+        shard_state
+            .state_machine
+            .set_shard_config_tx(shard_config_tx);
 
         // Set up forwarder for shard 0
         let (forwarder_tx, forwarder_rx) = mpsc::unbounded_channel::<(u64, Vec<u8>)>();
@@ -137,22 +151,17 @@ impl RaftPool {
 
         // Load CA cert for peer verification if configured
         let ca_cert_pem = if let Some(ref ca_path) = config.tls_ca_cert {
-            Some(std::fs::read(ca_path)?)
+            Some(read(ca_path)?)
         } else {
             None
         };
 
-        let network_factory = network::NetworkFactory::new(
-            config.tls_enabled(),
-            ca_cert_pem.as_deref(),
-            shard_id,
-        );
+        let network_factory =
+            network::NetworkFactory::new(config.tls_enabled(), ca_cert_pem.as_deref(), shard_id);
 
         // Per-shard persistent log store
-        let persistent_store = persistent_log_store::PersistentLogStore::new(
-            std::path::Path::new(&config.data_dir),
-            shard_id,
-        )?;
+        let persistent_store =
+            persistent_log_store::PersistentLogStore::new(Path::new(&config.data_dir), shard_id)?;
 
         let raft = Raft::new(
             config.node_id,
@@ -245,7 +254,7 @@ impl RaftPool {
                     }
                     Err(e) => {
                         warn!(error = %e, url = %full_url, "Forwarder: SpacetimeDB connect failed, retrying in 1s");
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        sleep(Duration::from_secs(1)).await;
                     }
                 }
             }
@@ -280,15 +289,18 @@ impl RaftPool {
 
                         // If we're the shard 0 leader, initialize the new shard
                         // with the same membership as shard 0
-                        if let Some(raft0) = self.get_raft(0).await {
-                            if raft0.ensure_linearizable().await.is_ok() {
-                                let members = self.get_current_members(0).await;
-                                if let Some(new_raft) = self.get_raft(shard_id).await {
-                                    if let Err(e) = new_raft.initialize(members).await {
-                                        warn!(shard_id, error = %e, "Failed to initialize new shard");
-                                    } else {
-                                        info!(shard_id, "New shard initialized with existing membership");
-                                    }
+                        if let Some(raft0) = self.get_raft(0).await
+                            && raft0.ensure_linearizable().await.is_ok()
+                        {
+                            let members = self.get_current_members(0).await;
+                            if let Some(new_raft) = self.get_raft(shard_id).await {
+                                if let Err(e) = new_raft.initialize(members).await {
+                                    warn!(shard_id, error = %e, "Failed to initialize new shard");
+                                } else {
+                                    info!(
+                                        shard_id,
+                                        "New shard initialized with existing membership"
+                                    );
                                 }
                             }
                         }
@@ -298,7 +310,10 @@ impl RaftPool {
                     }
                 }
             }
-            ShardConfigCommand::AddRoute { module_name, shard_id } => {
+            ShardConfigCommand::AddRoute {
+                module_name,
+                shard_id,
+            } => {
                 info!(module = %module_name, shard_id, "Adding route");
                 self.router.write().await.add_route(module_name, shard_id);
             }
@@ -314,18 +329,18 @@ impl RaftPool {
         let shards = self.shards.read().await;
         if let Some(shard) = shards.get(&shard_id) {
             let metrics = shard.raft.metrics().borrow().clone();
-            let voter_ids: BTreeSet<u64> = metrics
-                .membership_config
-                .membership()
-                .voter_ids()
-                .collect();
+            let voter_ids: BTreeSet<u64> =
+                metrics.membership_config.membership().voter_ids().collect();
 
             let mut members = BTreeMap::new();
             for id in voter_ids {
                 if id == self.node_config.node_id {
-                    members.insert(id, BasicNode {
-                        addr: self.node_config.raft_addr.clone(),
-                    });
+                    members.insert(
+                        id,
+                        BasicNode {
+                            addr: self.node_config.raft_addr.clone(),
+                        },
+                    );
                 } else if let Some(node) = self.peers.get(&id) {
                     members.insert(id, node.clone());
                 }
@@ -342,12 +357,20 @@ impl RaftPool {
 
     /// Get the Raft instance for a specific shard.
     pub async fn get_raft(&self, shard_id: ShardId) -> Option<Raft<TypeConfig>> {
-        self.shards.read().await.get(&shard_id).map(|s| s.raft.clone())
+        self.shards
+            .read()
+            .await
+            .get(&shard_id)
+            .map(|s| s.raft.clone())
     }
 
     /// Get the state machine for a specific shard.
     pub async fn get_state_machine(&self, shard_id: ShardId) -> Option<StateMachineStore> {
-        self.shards.read().await.get(&shard_id).map(|s| s.state_machine.clone())
+        self.shards
+            .read()
+            .await
+            .get(&shard_id)
+            .map(|s| s.state_machine.clone())
     }
 
     /// Route a module name to a shard ID.
@@ -369,7 +392,9 @@ impl RaftPool {
         let timer = metrics::WRITE_LATENCY.start_timer();
         metrics::WRITES_TOTAL.inc();
 
-        let raft = self.get_raft(shard_id).await
+        let raft = self
+            .get_raft(shard_id)
+            .await
             .ok_or_else(|| anyhow::anyhow!("shard {} not found", shard_id))?;
 
         let request = ReducerCallRequest {
@@ -381,41 +406,35 @@ impl RaftPool {
             Ok(_) => Ok(()),
             Err(err) => {
                 // Check for ForwardToLeader — this node isn't the leader for this shard
-                if let openraft::error::RaftError::APIError(
-                    openraft::error::ClientWriteError::ForwardToLeader(forward),
-                ) = &err
+                if let RaftError::APIError(ClientWriteError::ForwardToLeader(forward)) = &err
+                    && let Some(leader_node) = &forward.leader_node
                 {
-                    if let Some(leader_node) = &forward.leader_node {
-                        let scheme = self.node_config.http_scheme();
-                        let url = format!(
-                            "{}://{}/cluster/{}/write",
-                            scheme, leader_node.addr, shard_id
-                        );
-                        info!(leader_addr = %leader_node.addr, shard_id, "Forwarding write to leader");
+                    let scheme = self.node_config.http_scheme();
+                    let url = format!(
+                        "{}://{}/cluster/{}/write",
+                        scheme, leader_node.addr, shard_id
+                    );
+                    info!(leader_addr = %leader_node.addr, shard_id, "Forwarding write to leader");
 
-                        // Preserve origin_node_id so the forwarder on this node
-                        // knows to skip (handler already forwards to local SpacetimeDB)
-                        let forward_request = ReducerCallRequest {
-                            raw_message: data,
-                            origin_node_id: self.node_config.node_id,
-                        };
+                    // Preserve origin_node_id so the forwarder on this node
+                    // knows to skip (handler already forwards to local SpacetimeDB)
+                    let forward_request = ReducerCallRequest {
+                        raw_message: data,
+                        origin_node_id: self.node_config.node_id,
+                    };
 
-                        let client = reqwest::Client::new();
-                        let resp = client
-                            .post(&url)
-                            .json(&forward_request)
-                            .send()
-                            .await
-                            .map_err(|e| anyhow::anyhow!("Leader forward failed: {}", e))?;
+                    let client = Client::new();
+                    let resp = client
+                        .post(&url)
+                        .json(&forward_request)
+                        .send()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Leader forward failed: {}", e))?;
 
-                        if resp.status().is_success() {
-                            return Ok(());
-                        }
-                        return Err(anyhow::anyhow!(
-                            "Leader forward returned {}",
-                            resp.status()
-                        ));
+                    if resp.status().is_success() {
+                        return Ok(());
                     }
+                    return Err(anyhow::anyhow!("Leader forward returned {}", resp.status()));
                 }
                 Err(err.into())
             }
@@ -474,14 +493,12 @@ impl RaftPool {
     }
 
     /// Add a node to all active Raft shard groups.
-    pub async fn add_node_all_shards(
-        &self,
-        node_id: u64,
-        addr: String,
-    ) -> Result<(), String> {
+    pub async fn add_node_all_shards(&self, node_id: u64, addr: String) -> Result<(), String> {
         let shard_ids = self.list_shards().await;
         for shard_id in shard_ids {
-            let raft = self.get_raft(shard_id).await
+            let raft = self
+                .get_raft(shard_id)
+                .await
                 .ok_or_else(|| format!("shard {} not found", shard_id))?;
 
             let node = BasicNode { addr: addr.clone() };
@@ -490,11 +507,8 @@ impl RaftPool {
                 .map_err(|e| format!("add_learner on shard {}: {}", shard_id, e))?;
 
             let metrics = raft.metrics().borrow().clone();
-            let mut voter_ids: BTreeSet<u64> = metrics
-                .membership_config
-                .membership()
-                .voter_ids()
-                .collect();
+            let mut voter_ids: BTreeSet<u64> =
+                metrics.membership_config.membership().voter_ids().collect();
             voter_ids.insert(node_id);
 
             raft.change_membership(voter_ids, false)
@@ -507,13 +521,12 @@ impl RaftPool {
     }
 
     /// Remove a node from all active Raft shard groups.
-    pub async fn remove_node_all_shards(
-        &self,
-        node_id: u64,
-    ) -> Result<(), String> {
+    pub async fn remove_node_all_shards(&self, node_id: u64) -> Result<(), String> {
         let shard_ids = self.list_shards().await;
         for shard_id in shard_ids {
-            let raft = self.get_raft(shard_id).await
+            let raft = self
+                .get_raft(shard_id)
+                .await
                 .ok_or_else(|| format!("shard {} not found", shard_id))?;
 
             let metrics = raft.metrics().borrow().clone();
@@ -540,10 +553,7 @@ mod tests {
 
     #[test]
     fn test_parse_peers_valid() {
-        let peers = vec![
-            "2=node-2:4001".to_string(),
-            "3=node-3:4001".to_string(),
-        ];
+        let peers = vec!["2=node-2:4001".to_string(), "3=node-3:4001".to_string()];
         let map = parse_peers(&peers);
         assert_eq!(map.len(), 2);
         assert_eq!(map[&2].addr, "node-2:4001");

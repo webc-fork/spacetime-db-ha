@@ -17,21 +17,17 @@ tokio-tungstenite.workspace = true
 openraft.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-bincode.workspace = true
-bytes.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
-thiserror.workspace = true
 clap.workspace = true
-toml.workspace = true
 
 # HTTP client for SpacetimeDB HTTP API
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 
 # HTTP server for Raft RPCs and management API
 axum.workspace = true
-redb = "3.1.0"
+redb = "4.4.0"
 
 # TLS for inter-node and client communication
 tokio-rustls = "0.26"
@@ -44,7 +40,7 @@ hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1"] }
 tower = { version = "0.5", features = ["util"] }
 
 # Prometheus metrics
-prometheus = "0.13"
+prometheus = "0.14"
 
 [dev-dependencies]
-tempfile = "3.26.0"
+tempfile = "3.27.0"

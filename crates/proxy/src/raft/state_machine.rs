@@ -1,15 +1,22 @@
-use crate::metrics;
-use crate::raft::types::{ReducerCallResponse, TypeConfig};
-use crate::router::{self, ShardConfigCommand, ShardId, SHARD_CONFIG_TAG};
-use openraft::entry::EntryPayload;
-use openraft::storage::RaftStateMachine;
-use openraft::{BasicNode, Entry, ErrorSubject, ErrorVerb, LogId, RaftLogId, RaftSnapshotBuilder, Snapshot, SnapshotMeta, StorageError, StoredMembership};
+use std::{
+    collections::HashMap,
+    io::{Cursor, Error},
+    sync::{Arc, Mutex},
+};
+
+use openraft::{
+    BasicNode, Entry, ErrorSubject, ErrorVerb, LogId, RaftLogId, RaftSnapshotBuilder, Snapshot,
+    SnapshotMeta, StorageError, StoredMembership, entry::EntryPayload, storage::RaftStateMachine,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::io::Cursor;
-use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tracing::debug;
+
+use crate::{
+    metrics,
+    raft::types::{ReducerCallResponse, TypeConfig},
+    router::{self, SHARD_CONFIG_TAG, ShardConfigCommand, ShardId},
+};
 
 type C = TypeConfig;
 
@@ -108,18 +115,12 @@ impl RaftStateMachine<C> for StateMachineStore {
 
     async fn applied_state(
         &mut self,
-    ) -> Result<
-        (Option<LogId<u64>>, StoredMembership<u64, BasicNode>),
-        StorageError<u64>,
-    > {
+    ) -> Result<(Option<LogId<u64>>, StoredMembership<u64, BasicNode>), StorageError<u64>> {
         let inner = self.inner.lock().unwrap();
         Ok((inner.last_applied, inner.last_membership.clone()))
     }
 
-    async fn apply<I>(
-        &mut self,
-        entries: I,
-    ) -> Result<Vec<ReducerCallResponse>, StorageError<u64>>
+    async fn apply<I>(&mut self, entries: I) -> Result<Vec<ReducerCallResponse>, StorageError<u64>>
     where
         I: IntoIterator<Item = Entry<C>> + Send,
         I::IntoIter: Send,
@@ -136,8 +137,7 @@ impl RaftStateMachine<C> for StateMachineStore {
                 inner.last_applied = Some(log_id);
 
                 if let EntryPayload::Membership(ref membership) = entry.payload {
-                    inner.last_membership =
-                        StoredMembership::new(Some(log_id), membership.clone());
+                    inner.last_membership = StoredMembership::new(Some(log_id), membership.clone());
                 }
             }
 
@@ -156,7 +156,10 @@ impl RaftStateMachine<C> for StateMachineStore {
                                         inner.active_shards.push(*shard_id);
                                     }
                                 }
-                                ShardConfigCommand::AddRoute { module_name, shard_id } => {
+                                ShardConfigCommand::AddRoute {
+                                    module_name,
+                                    shard_id,
+                                } => {
                                     inner.shard_routes.insert(module_name.clone(), *shard_id);
                                 }
                                 ShardConfigCommand::RemoveRoute { module_name } => {
@@ -213,12 +216,13 @@ impl RaftStateMachine<C> for StateMachineStore {
         meta: &SnapshotMeta<u64, BasicNode>,
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<u64>> {
-        let data: SnapshotData = serde_json::from_slice(snapshot.get_ref())
-            .map_err(|e| StorageError::from_io_error(
+        let data: SnapshotData = serde_json::from_slice(snapshot.get_ref()).map_err(|e| {
+            StorageError::from_io_error(
                 ErrorSubject::StateMachine,
                 ErrorVerb::Read,
-                std::io::Error::new(std::io::ErrorKind::Other, e),
-            ))?;
+                Error::other(e),
+            )
+        })?;
 
         {
             let mut inner = self.inner.lock().unwrap();
@@ -254,7 +258,8 @@ impl RaftStateMachine<C> for StateMachineStore {
             applied_count: inner.applied_count,
             shard_routes: inner.shard_routes.clone(),
             active_shards: inner.active_shards.clone(),
-        }).unwrap_or_default();
+        })
+        .unwrap_or_default();
         drop(inner);
 
         *self.cached_snapshot.lock().unwrap() = Some(Snapshot {
@@ -265,9 +270,7 @@ impl RaftStateMachine<C> for StateMachineStore {
         Ok(())
     }
 
-    async fn get_current_snapshot(
-        &mut self,
-    ) -> Result<Option<Snapshot<C>>, StorageError<u64>> {
+    async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot<C>>, StorageError<u64>> {
         // Return cached snapshot if available
         let cached = self.cached_snapshot.lock().unwrap();
         if let Some(ref snap) = *cached {
@@ -282,9 +285,7 @@ impl RaftStateMachine<C> for StateMachineStore {
 }
 
 impl RaftSnapshotBuilder<C> for StateMachineStore {
-    async fn build_snapshot(
-        &mut self,
-    ) -> Result<Snapshot<C>, StorageError<u64>> {
+    async fn build_snapshot(&mut self) -> Result<Snapshot<C>, StorageError<u64>> {
         let inner = self.inner.lock().unwrap();
 
         let data = SnapshotData {
@@ -295,12 +296,13 @@ impl RaftSnapshotBuilder<C> for StateMachineStore {
             active_shards: inner.active_shards.clone(),
         };
 
-        let json = serde_json::to_vec(&data)
-            .map_err(|e| StorageError::from_io_error(
+        let json = serde_json::to_vec(&data).map_err(|e| {
+            StorageError::from_io_error(
                 ErrorSubject::StateMachine,
                 ErrorVerb::Read,
-                std::io::Error::new(std::io::ErrorKind::Other, e),
-            ))?;
+                Error::other(e),
+            )
+        })?;
 
         let snapshot_id = inner
             .last_applied

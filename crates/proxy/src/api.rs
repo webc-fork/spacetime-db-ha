@@ -1,22 +1,33 @@
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
-use axum::routing::{delete, get, post};
-use axum::{Json, Router};
-use openraft::error::InstallSnapshotError;
-use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    VoteRequest, VoteResponse,
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
 };
-use openraft::{BasicNode, Raft};
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::sync::Arc;
 
-use crate::metrics;
-use crate::raft::types::{ReducerCallRequest, TypeConfig};
-use crate::raft::RaftPool;
-use crate::router::{self, ShardId};
+use axum::{
+    Json, Router,
+    extract::{Path, State},
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{delete, get, post},
+};
+use openraft::{
+    BasicNode, Raft,
+    error::{InstallSnapshotError, RaftError},
+    raft::{
+        AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
+        InstallSnapshotResponse, VoteRequest, VoteResponse,
+    },
+};
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    metrics,
+    raft::{
+        RaftPool,
+        types::{ReducerCallRequest, TypeConfig},
+    },
+    router::{self, ShardId},
+};
 
 /// Shared application state for the HTTP management API.
 pub struct AppState {
@@ -64,9 +75,12 @@ async fn get_shard_raft(
     pool: &RaftPool,
     shard_id: ShardId,
 ) -> Result<Raft<TypeConfig>, (StatusCode, String)> {
-    pool.get_raft(shard_id)
-        .await
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("shard {} not found", shard_id)))
+    pool.get_raft(shard_id).await.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("shard {} not found", shard_id),
+        )
+    })
 }
 
 // ============================================================================
@@ -77,7 +91,7 @@ async fn raft_shard_append(
     State(state): State<Arc<AppState>>,
     Path(shard_id): Path<u64>,
     Json(req): Json<AppendEntriesRequest<TypeConfig>>,
-) -> Result<Json<Result<AppendEntriesResponse<u64>, openraft::error::RaftError<u64>>>, (StatusCode, String)> {
+) -> Result<Json<Result<AppendEntriesResponse<u64>, RaftError<u64>>>, (StatusCode, String)> {
     let raft = get_shard_raft(&state.pool, shard_id).await?;
     Ok(Json(raft.append_entries(req).await))
 }
@@ -86,7 +100,7 @@ async fn raft_shard_vote(
     State(state): State<Arc<AppState>>,
     Path(shard_id): Path<u64>,
     Json(req): Json<VoteRequest<u64>>,
-) -> Result<Json<Result<VoteResponse<u64>, openraft::error::RaftError<u64>>>, (StatusCode, String)> {
+) -> Result<Json<Result<VoteResponse<u64>, RaftError<u64>>>, (StatusCode, String)> {
     let raft = get_shard_raft(&state.pool, shard_id).await?;
     Ok(Json(raft.vote(req).await))
 }
@@ -95,7 +109,10 @@ async fn raft_shard_snapshot(
     State(state): State<Arc<AppState>>,
     Path(shard_id): Path<u64>,
     Json(req): Json<InstallSnapshotRequest<TypeConfig>>,
-) -> Result<Json<Result<InstallSnapshotResponse<u64>, openraft::error::RaftError<u64, InstallSnapshotError>>>, (StatusCode, String)> {
+) -> Result<
+    Json<Result<InstallSnapshotResponse<u64>, RaftError<u64, InstallSnapshotError>>>,
+    (StatusCode, String),
+> {
     let raft = get_shard_raft(&state.pool, shard_id).await?;
     Ok(Json(raft.install_snapshot(req).await))
 }
@@ -107,7 +124,7 @@ async fn raft_shard_snapshot(
 async fn raft_append(
     State(state): State<Arc<AppState>>,
     Json(req): Json<AppendEntriesRequest<TypeConfig>>,
-) -> Json<Result<AppendEntriesResponse<u64>, openraft::error::RaftError<u64>>> {
+) -> Json<Result<AppendEntriesResponse<u64>, RaftError<u64>>> {
     let raft = state.pool.get_raft(0).await.expect("shard 0 must exist");
     Json(raft.append_entries(req).await)
 }
@@ -115,7 +132,7 @@ async fn raft_append(
 async fn raft_vote(
     State(state): State<Arc<AppState>>,
     Json(req): Json<VoteRequest<u64>>,
-) -> Json<Result<VoteResponse<u64>, openraft::error::RaftError<u64>>> {
+) -> Json<Result<VoteResponse<u64>, RaftError<u64>>> {
     let raft = state.pool.get_raft(0).await.expect("shard 0 must exist");
     Json(raft.vote(req).await)
 }
@@ -123,8 +140,7 @@ async fn raft_vote(
 async fn raft_snapshot(
     State(state): State<Arc<AppState>>,
     Json(req): Json<InstallSnapshotRequest<TypeConfig>>,
-) -> Json<Result<InstallSnapshotResponse<u64>, openraft::error::RaftError<u64, InstallSnapshotError>>>
-{
+) -> Json<Result<InstallSnapshotResponse<u64>, RaftError<u64, InstallSnapshotError>>> {
     let raft = state.pool.get_raft(0).await.expect("shard 0 must exist");
     Json(raft.install_snapshot(req).await)
 }
@@ -293,7 +309,10 @@ async fn cluster_health(
     if metrics.current_leader.is_some() {
         Ok((StatusCode::OK, "healthy".to_string()))
     } else {
-        Err((StatusCode::SERVICE_UNAVAILABLE, "no leader elected".to_string()))
+        Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no leader elected".to_string(),
+        ))
     }
 }
 
@@ -324,7 +343,9 @@ async fn shard_create(
         return Err((StatusCode::BAD_REQUEST, "shard 0 always exists".to_string()));
     }
 
-    let cmd = router::ShardConfigCommand::CreateShard { shard_id: req.shard_id };
+    let cmd = router::ShardConfigCommand::CreateShard {
+        shard_id: req.shard_id,
+    };
     let data = router::encode_shard_config(&cmd);
 
     let raft = state.pool.get_raft(0).await.expect("shard 0 must exist");
@@ -404,7 +425,7 @@ async fn shard_remove_route(
 #[derive(Serialize)]
 struct ShardListResponse {
     shards: Vec<ShardId>,
-    routes: std::collections::HashMap<String, ShardId>,
+    routes: HashMap<String, ShardId>,
 }
 
 /// List all active shards and routes.

@@ -1,13 +1,13 @@
 mod handler;
 mod upstream;
 
-use crate::config::NodeConfig;
-use crate::raft::RaftPool;
-use anyhow::Result;
 use std::sync::Arc;
-use tokio::net::TcpListener;
-use tokio::sync::watch;
+
+use anyhow::Result;
+use tokio::{net::TcpListener, sync::watch};
 use tracing::{error, info};
+
+use crate::{config::NodeConfig, raft::RaftPool};
 
 /// The WebSocket proxy that sits between clients and SpacetimeDB.
 ///

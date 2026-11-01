@@ -1,11 +1,15 @@
-use crate::raft::types::TypeConfig;
-use openraft::error::{InstallSnapshotError, RPCError, RaftError, RemoteError, Unreachable};
-use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
-use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    VoteRequest, VoteResponse,
+use openraft::{
+    BasicNode,
+    error::{InstallSnapshotError, RPCError, RaftError, RemoteError, Unreachable},
+    network::{RPCOption, RaftNetwork, RaftNetworkFactory},
+    raft::{
+        AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
+        InstallSnapshotResponse, VoteRequest, VoteResponse,
+    },
 };
-use openraft::BasicNode;
+use reqwest::{Certificate, Client};
+
+use crate::raft::types::TypeConfig;
 
 type C = TypeConfig;
 
@@ -20,16 +24,16 @@ pub struct NetworkFactory {
 
 impl NetworkFactory {
     pub fn new(use_tls: bool, ca_cert_pem: Option<&[u8]>, shard_id: u64) -> Self {
-        let mut builder = reqwest::Client::builder();
+        let mut builder = Client::builder();
 
-        if let Some(ca_pem) = ca_cert_pem {
-            if let Ok(cert) = reqwest::Certificate::from_pem(ca_pem) {
-                builder = builder.add_root_certificate(cert);
-            }
+        if let Some(ca_pem) = ca_cert_pem
+            && let Ok(cert) = Certificate::from_pem(ca_pem)
+        {
+            builder = builder.add_root_certificate(cert);
         }
 
         Self {
-            client: builder.build().unwrap_or_else(|_| reqwest::Client::new()),
+            client: builder.build().unwrap_or_else(|_| Client::new()),
             use_tls,
             shard_id,
         }

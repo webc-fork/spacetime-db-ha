@@ -1,10 +1,20 @@
-use crate::raft::types::TypeConfig;
-use openraft::storage::{LogFlushed, RaftLogStorage};
-use openraft::{Entry, LogId, LogState, RaftLogId, RaftLogReader, StorageError, Vote};
+use std::{
+    fs::{create_dir_all, rename},
+    io::Error,
+    ops::RangeBounds,
+    path::Path,
+    sync::Arc,
+};
+
+use openraft::{
+    Entry, ErrorSubject, ErrorVerb, LogId, LogState, RaftLogId, RaftLogReader, StorageError, Vote,
+    storage::{LogFlushed, RaftLogStorage},
+};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
-use std::path::Path;
-use std::sync::Arc;
+use serde::de::DeserializeOwned;
 use tracing::debug;
+
+use crate::raft::types::TypeConfig;
 
 type C = TypeConfig;
 
@@ -38,20 +48,12 @@ impl PersistentLogStore {
         if shard_id == 0 {
             let old_path = data_dir.join("raft-log.redb");
             if old_path.exists() && !shard_dir.join("raft-log.redb").exists() {
-                std::fs::create_dir_all(&shard_dir).map_err(|e| {
-                    StorageError::from_io_error(
-                        openraft::ErrorSubject::Logs,
-                        openraft::ErrorVerb::Write,
-                        e,
-                    )
+                create_dir_all(&shard_dir).map_err(|e| {
+                    StorageError::from_io_error(ErrorSubject::Logs, ErrorVerb::Write, e)
                 })?;
                 let new_path = shard_dir.join("raft-log.redb");
-                std::fs::rename(&old_path, &new_path).map_err(|e| {
-                    StorageError::from_io_error(
-                        openraft::ErrorSubject::Logs,
-                        openraft::ErrorVerb::Write,
-                        e,
-                    )
+                rename(&old_path, &new_path).map_err(|e| {
+                    StorageError::from_io_error(ErrorSubject::Logs, ErrorVerb::Write, e)
                 })?;
                 tracing::info!(
                     old = %old_path.display(),
@@ -61,39 +63,22 @@ impl PersistentLogStore {
             }
         }
 
-        std::fs::create_dir_all(&shard_dir).map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Logs,
-                openraft::ErrorVerb::Write,
-                e,
-            )
-        })?;
+        create_dir_all(&shard_dir)
+            .map_err(|e| StorageError::from_io_error(ErrorSubject::Logs, ErrorVerb::Write, e))?;
 
         let db_path = shard_dir.join("raft-log.redb");
         let db = Database::create(&db_path).map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Logs,
-                openraft::ErrorVerb::Write,
-                std::io::Error::new(std::io::ErrorKind::Other, e),
-            )
+            StorageError::from_io_error(ErrorSubject::Logs, ErrorVerb::Write, Error::other(e))
         })?;
 
         // Ensure tables exist
         let write_txn = db.begin_write().map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Logs,
-                openraft::ErrorVerb::Write,
-                std::io::Error::new(std::io::ErrorKind::Other, e),
-            )
+            StorageError::from_io_error(ErrorSubject::Logs, ErrorVerb::Write, Error::other(e))
         })?;
         let _ = write_txn.open_table(LOG_TABLE);
         let _ = write_txn.open_table(META_TABLE);
         write_txn.commit().map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Logs,
-                openraft::ErrorVerb::Write,
-                std::io::Error::new(std::io::ErrorKind::Other, e),
-            )
+            StorageError::from_io_error(ErrorSubject::Logs, ErrorVerb::Write, Error::other(e))
         })?;
 
         debug!(path = %db_path.display(), shard_id, "Persistent log store opened");
@@ -101,41 +86,30 @@ impl PersistentLogStore {
         Ok(Self { db: Arc::new(db) })
     }
 
-    fn read_meta<T: serde::de::DeserializeOwned>(
-        &self,
-        key: &str,
-    ) -> Result<Option<T>, StorageError<u64>> {
+    fn read_meta<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, StorageError<u64>> {
         let read_txn = self.db.begin_read().map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Logs,
-                openraft::ErrorVerb::Read,
-                std::io::Error::new(std::io::ErrorKind::Other, e),
-            )
+            StorageError::from_io_error(ErrorSubject::Logs, ErrorVerb::Read, Error::other(e))
         })?;
         let table = read_txn.open_table(META_TABLE).map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Logs,
-                openraft::ErrorVerb::Read,
-                std::io::Error::new(std::io::ErrorKind::Other, e),
-            )
+            StorageError::from_io_error(ErrorSubject::Logs, ErrorVerb::Read, Error::other(e))
         })?;
         match table.get(key) {
             Ok(Some(value)) => {
                 let bytes: &[u8] = value.value();
                 let val: T = serde_json::from_slice(bytes).map_err(|e| {
                     StorageError::from_io_error(
-                        openraft::ErrorSubject::Logs,
-                        openraft::ErrorVerb::Read,
-                        std::io::Error::new(std::io::ErrorKind::Other, e),
+                        ErrorSubject::Logs,
+                        ErrorVerb::Read,
+                        Error::other(e),
                     )
                 })?;
                 Ok(Some(val))
             }
             Ok(None) => Ok(None),
             Err(e) => Err(StorageError::from_io_error(
-                openraft::ErrorSubject::Logs,
-                openraft::ErrorVerb::Read,
-                std::io::Error::new(std::io::ErrorKind::Other, e),
+                ErrorSubject::Logs,
+                ErrorVerb::Read,
+                Error::other(e),
             )),
         }
     }
@@ -146,89 +120,49 @@ impl PersistentLogStore {
         value: &T,
     ) -> Result<(), StorageError<u64>> {
         let json = serde_json::to_vec(value).map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Logs,
-                openraft::ErrorVerb::Write,
-                std::io::Error::new(std::io::ErrorKind::Other, e),
-            )
+            StorageError::from_io_error(ErrorSubject::Logs, ErrorVerb::Write, Error::other(e))
         })?;
         let write_txn = self.db.begin_write().map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Logs,
-                openraft::ErrorVerb::Write,
-                std::io::Error::new(std::io::ErrorKind::Other, e),
-            )
+            StorageError::from_io_error(ErrorSubject::Logs, ErrorVerb::Write, Error::other(e))
         })?;
         {
             let mut table = write_txn.open_table(META_TABLE).map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Logs,
-                    openraft::ErrorVerb::Write,
-                    std::io::Error::new(std::io::ErrorKind::Other, e),
-                )
+                StorageError::from_io_error(ErrorSubject::Logs, ErrorVerb::Write, Error::other(e))
             })?;
             table.insert(key, json.as_slice()).map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Logs,
-                    openraft::ErrorVerb::Write,
-                    std::io::Error::new(std::io::ErrorKind::Other, e),
-                )
+                StorageError::from_io_error(ErrorSubject::Logs, ErrorVerb::Write, Error::other(e))
             })?;
         }
         write_txn.commit().map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Logs,
-                openraft::ErrorVerb::Write,
-                std::io::Error::new(std::io::ErrorKind::Other, e),
-            )
+            StorageError::from_io_error(ErrorSubject::Logs, ErrorVerb::Write, Error::other(e))
         })?;
         Ok(())
     }
 }
 
 impl RaftLogReader<C> for PersistentLogStore {
-    async fn try_get_log_entries<RB: std::ops::RangeBounds<u64> + Clone + Send>(
+    async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Send>(
         &mut self,
         range: RB,
     ) -> Result<Vec<Entry<C>>, StorageError<u64>> {
         let read_txn = self.db.begin_read().map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Logs,
-                openraft::ErrorVerb::Read,
-                std::io::Error::new(std::io::ErrorKind::Other, e),
-            )
+            StorageError::from_io_error(ErrorSubject::Logs, ErrorVerb::Read, Error::other(e))
         })?;
         let table = read_txn.open_table(LOG_TABLE).map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Logs,
-                openraft::ErrorVerb::Read,
-                std::io::Error::new(std::io::ErrorKind::Other, e),
-            )
+            StorageError::from_io_error(ErrorSubject::Logs, ErrorVerb::Read, Error::other(e))
         })?;
 
         let mut entries = Vec::new();
         let iter = table.range::<u64>(range).map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Logs,
-                openraft::ErrorVerb::Read,
-                std::io::Error::new(std::io::ErrorKind::Other, e),
-            )
+            StorageError::from_io_error(ErrorSubject::Logs, ErrorVerb::Read, Error::other(e))
         })?;
         for item in iter {
             let (_key, value) = item.map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Logs,
-                    openraft::ErrorVerb::Read,
-                    std::io::Error::new(std::io::ErrorKind::Other, e),
-                )
+                StorageError::from_io_error(ErrorSubject::Logs, ErrorVerb::Read, Error::other(e))
             })?;
             let bytes: &[u8] = value.value();
             let entry: Entry<C> = serde_json::from_slice(bytes).map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Logs,
-                    openraft::ErrorVerb::Read,
-                    std::io::Error::new(std::io::ErrorKind::Other, e),
-                )
+                StorageError::from_io_error(ErrorSubject::Logs, ErrorVerb::Read, Error::other(e))
             })?;
             entries.push(entry);
         }
@@ -243,39 +177,30 @@ impl RaftLogStorage<C> for PersistentLogStore {
         let last_purged: Option<LogId<u64>> = self.read_meta(META_LAST_PURGED)?;
 
         let read_txn = self.db.begin_read().map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Logs,
-                openraft::ErrorVerb::Read,
-                std::io::Error::new(std::io::ErrorKind::Other, e),
-            )
+            StorageError::from_io_error(ErrorSubject::Logs, ErrorVerb::Read, Error::other(e))
         })?;
         let table = read_txn.open_table(LOG_TABLE).map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Logs,
-                openraft::ErrorVerb::Read,
-                std::io::Error::new(std::io::ErrorKind::Other, e),
-            )
+            StorageError::from_io_error(ErrorSubject::Logs, ErrorVerb::Read, Error::other(e))
         })?;
 
         let last_log_id = match table.last() {
             Ok(Some((_key, value))) => {
                 let bytes: &[u8] = value.value();
-                let entry: Entry<C> =
-                    serde_json::from_slice(bytes).map_err(|e| {
-                        StorageError::from_io_error(
-                            openraft::ErrorSubject::Logs,
-                            openraft::ErrorVerb::Read,
-                            std::io::Error::new(std::io::ErrorKind::Other, e),
-                        )
-                    })?;
+                let entry: Entry<C> = serde_json::from_slice(bytes).map_err(|e| {
+                    StorageError::from_io_error(
+                        ErrorSubject::Logs,
+                        ErrorVerb::Read,
+                        Error::other(e),
+                    )
+                })?;
                 Some(*entry.get_log_id())
             }
             Ok(None) => None,
             Err(e) => {
                 return Err(StorageError::from_io_error(
-                    openraft::ErrorSubject::Logs,
-                    openraft::ErrorVerb::Read,
-                    std::io::Error::new(std::io::ErrorKind::Other, e),
+                    ErrorSubject::Logs,
+                    ErrorVerb::Read,
+                    Error::other(e),
                 ));
             }
         };
@@ -308,44 +233,32 @@ impl RaftLogStorage<C> for PersistentLogStore {
         I::IntoIter: Send,
     {
         let write_txn = self.db.begin_write().map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Logs,
-                openraft::ErrorVerb::Write,
-                std::io::Error::new(std::io::ErrorKind::Other, e),
-            )
+            StorageError::from_io_error(ErrorSubject::Logs, ErrorVerb::Write, Error::other(e))
         })?;
         {
             let mut table = write_txn.open_table(LOG_TABLE).map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Logs,
-                    openraft::ErrorVerb::Write,
-                    std::io::Error::new(std::io::ErrorKind::Other, e),
-                )
+                StorageError::from_io_error(ErrorSubject::Logs, ErrorVerb::Write, Error::other(e))
             })?;
             for entry in entries {
                 let idx = entry.get_log_id().index;
                 let json = serde_json::to_vec(&entry).map_err(|e| {
                     StorageError::from_io_error(
-                        openraft::ErrorSubject::Logs,
-                        openraft::ErrorVerb::Write,
-                        std::io::Error::new(std::io::ErrorKind::Other, e),
+                        ErrorSubject::Logs,
+                        ErrorVerb::Write,
+                        Error::other(e),
                     )
                 })?;
                 table.insert(idx, json.as_slice()).map_err(|e| {
                     StorageError::from_io_error(
-                        openraft::ErrorSubject::Logs,
-                        openraft::ErrorVerb::Write,
-                        std::io::Error::new(std::io::ErrorKind::Other, e),
+                        ErrorSubject::Logs,
+                        ErrorVerb::Write,
+                        Error::other(e),
                     )
                 })?;
             }
         }
         write_txn.commit().map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Logs,
-                openraft::ErrorVerb::Write,
-                std::io::Error::new(std::io::ErrorKind::Other, e),
-            )
+            StorageError::from_io_error(ErrorSubject::Logs, ErrorVerb::Write, Error::other(e))
         })?;
 
         callback.log_io_completed(Ok(()));
@@ -354,28 +267,20 @@ impl RaftLogStorage<C> for PersistentLogStore {
 
     async fn truncate(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
         let write_txn = self.db.begin_write().map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Logs,
-                openraft::ErrorVerb::Write,
-                std::io::Error::new(std::io::ErrorKind::Other, e),
-            )
+            StorageError::from_io_error(ErrorSubject::Logs, ErrorVerb::Write, Error::other(e))
         })?;
         {
             let mut table = write_txn.open_table(LOG_TABLE).map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Logs,
-                    openraft::ErrorVerb::Write,
-                    std::io::Error::new(std::io::ErrorKind::Other, e),
-                )
+                StorageError::from_io_error(ErrorSubject::Logs, ErrorVerb::Write, Error::other(e))
             })?;
             // Collect keys to remove (from log_id.index to end)
             let keys: Vec<u64> = table
                 .range(log_id.index..)
                 .map_err(|e| {
                     StorageError::from_io_error(
-                        openraft::ErrorSubject::Logs,
-                        openraft::ErrorVerb::Read,
-                        std::io::Error::new(std::io::ErrorKind::Other, e),
+                        ErrorSubject::Logs,
+                        ErrorVerb::Read,
+                        Error::other(e),
                     )
                 })?
                 .filter_map(|item| item.ok().map(|(k, _)| k.value()))
@@ -385,38 +290,26 @@ impl RaftLogStorage<C> for PersistentLogStore {
             }
         }
         write_txn.commit().map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Logs,
-                openraft::ErrorVerb::Write,
-                std::io::Error::new(std::io::ErrorKind::Other, e),
-            )
+            StorageError::from_io_error(ErrorSubject::Logs, ErrorVerb::Write, Error::other(e))
         })?;
         Ok(())
     }
 
     async fn purge(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
         let write_txn = self.db.begin_write().map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Logs,
-                openraft::ErrorVerb::Write,
-                std::io::Error::new(std::io::ErrorKind::Other, e),
-            )
+            StorageError::from_io_error(ErrorSubject::Logs, ErrorVerb::Write, Error::other(e))
         })?;
         {
             let mut table = write_txn.open_table(LOG_TABLE).map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Logs,
-                    openraft::ErrorVerb::Write,
-                    std::io::Error::new(std::io::ErrorKind::Other, e),
-                )
+                StorageError::from_io_error(ErrorSubject::Logs, ErrorVerb::Write, Error::other(e))
             })?;
             let keys: Vec<u64> = table
                 .range(..=log_id.index)
                 .map_err(|e| {
                     StorageError::from_io_error(
-                        openraft::ErrorSubject::Logs,
-                        openraft::ErrorVerb::Read,
-                        std::io::Error::new(std::io::ErrorKind::Other, e),
+                        ErrorSubject::Logs,
+                        ErrorVerb::Read,
+                        Error::other(e),
                     )
                 })?
                 .filter_map(|item| item.ok().map(|(k, _)| k.value()))
@@ -427,33 +320,22 @@ impl RaftLogStorage<C> for PersistentLogStore {
 
             // Store last_purged in meta table within the same transaction
             let mut meta = write_txn.open_table(META_TABLE).map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Logs,
-                    openraft::ErrorVerb::Write,
-                    std::io::Error::new(std::io::ErrorKind::Other, e),
-                )
+                StorageError::from_io_error(ErrorSubject::Logs, ErrorVerb::Write, Error::other(e))
             })?;
             let json = serde_json::to_vec(&log_id).map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Logs,
-                    openraft::ErrorVerb::Write,
-                    std::io::Error::new(std::io::ErrorKind::Other, e),
-                )
+                StorageError::from_io_error(ErrorSubject::Logs, ErrorVerb::Write, Error::other(e))
             })?;
-            meta.insert(META_LAST_PURGED, json.as_slice()).map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Logs,
-                    openraft::ErrorVerb::Write,
-                    std::io::Error::new(std::io::ErrorKind::Other, e),
-                )
-            })?;
+            meta.insert(META_LAST_PURGED, json.as_slice())
+                .map_err(|e| {
+                    StorageError::from_io_error(
+                        ErrorSubject::Logs,
+                        ErrorVerb::Write,
+                        Error::other(e),
+                    )
+                })?;
         }
         write_txn.commit().map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Logs,
-                openraft::ErrorVerb::Write,
-                std::io::Error::new(std::io::ErrorKind::Other, e),
-            )
+            StorageError::from_io_error(ErrorSubject::Logs, ErrorVerb::Write, Error::other(e))
         })?;
         Ok(())
     }
@@ -461,10 +343,10 @@ impl RaftLogStorage<C> for PersistentLogStore {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use openraft::entry::EntryPayload;
-    use openraft::CommittedLeaderId;
+    use openraft::{CommittedLeaderId, entry::EntryPayload};
     use tempfile::TempDir;
+
+    use super::*;
 
     fn make_entry(term: u64, index: u64) -> Entry<C> {
         Entry {
