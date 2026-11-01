@@ -63,12 +63,21 @@ fn build_node_config(matches: &ArgMatches) -> Result<NodeConfig> {
         .parse()
         .with_context(|| format!("invalid node_id '{node_id_raw}'"))?;
 
-    let listen_addr = arg_or_env(matches, ARG_LISTEN_ADDR, ENV_LISTEN_ADDR, DEFAULT_LISTEN_ADDR);
+    let listen_addr = arg_or_env(
+        matches,
+        ARG_LISTEN_ADDR,
+        ENV_LISTEN_ADDR,
+        DEFAULT_LISTEN_ADDR,
+    );
     let raft_addr = arg_or_env(matches, ARG_RAFT_ADDR, ENV_RAFT_ADDR, DEFAULT_RAFT_ADDR);
     let raft_advertise_addr = matches
         .get_one::<String>(ARG_RAFT_ADVERTISE_ADDR)
         .cloned()
-        .or_else(|| env::var(ENV_RAFT_ADVERTISE_ADDR).ok().filter(|v| !v.is_empty()));
+        .or_else(|| {
+            env::var(ENV_RAFT_ADVERTISE_ADDR)
+                .ok()
+                .filter(|v| !v.is_empty())
+        });
     let stdb_url = arg_or_env(matches, ARG_STDB_URL, ENV_STDB_URL, DEFAULT_STDB_URL);
     let data_dir = arg_or_env(matches, ARG_DATA_DIR, ENV_DATA_DIR, DEFAULT_DATA_DIR);
 

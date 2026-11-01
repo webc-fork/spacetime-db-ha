@@ -282,10 +282,7 @@ fn build_cli(cmd: Command) -> Command {
         .subcommand(
             Command::new(CMD_ADD_NODE)
                 .about("Add a new node to the cluster")
-                .arg(
-                    arg!(--"node-id" <NODE_ID> "Node ID to add")
-                        .value_parser(value_parser!(u64)),
-                )
+                .arg(arg!(--"node-id" <NODE_ID> "Node ID to add").value_parser(value_parser!(u64)))
                 .arg(arg!(--addr <ADDR> "Raft address of the new node (host:port)"))
                 .arg(
                     arg!(--cluster [CLUSTER] "Existing cluster node address")
@@ -310,12 +307,11 @@ fn build_cli(cmd: Command) -> Command {
                 .arg(arg!(--module <MODULE> "Path to SpacetimeDB module directory"))
                 .arg(arg!(--name [NAME] "Database name (defaults to module directory name)"))
                 .arg(
-                    arg!(--servers [SERVERS] ... "SpacetimeDB server addresses")
-                        .default_values([
-                            DEFAULT_STDB_SERVER_1,
-                            DEFAULT_STDB_SERVER_2,
-                            DEFAULT_STDB_SERVER_3,
-                        ]),
+                    arg!(--servers [SERVERS] ... "SpacetimeDB server addresses").default_values([
+                        DEFAULT_STDB_SERVER_1,
+                        DEFAULT_STDB_SERVER_2,
+                        DEFAULT_STDB_SERVER_3,
+                    ]),
                 ),
         )
         .subcommand(
@@ -375,10 +371,7 @@ fn build_cli(cmd: Command) -> Command {
         .subcommand(
             Command::new(CMD_SHARD_STATUS)
                 .about("Show status of a specific shard")
-                .arg(
-                    arg!(--"shard-id" <SHARD_ID> "Shard ID")
-                        .value_parser(value_parser!(u64)),
-                )
+                .arg(arg!(--"shard-id" <SHARD_ID> "Shard ID").value_parser(value_parser!(u64)))
                 .arg(
                     arg!(--addr [ADDR] "Cluster node Raft address")
                         .default_value(DEFAULT_CLUSTER_ADDR),
@@ -445,7 +438,9 @@ async fn main() -> Result<()> {
         }
 
         Some((CMD_ADD_NODE, sub)) => {
-            let node_id = *sub.get_one::<u64>(ARG_NODE_ID).context("missing --node-id")?;
+            let node_id = *sub
+                .get_one::<u64>(ARG_NODE_ID)
+                .context("missing --node-id")?;
             let addr = sub.get_one::<String>(ARG_ADDR).context("missing --addr")?;
             let cluster = sub
                 .get_one::<String>(ARG_CLUSTER)
@@ -461,7 +456,9 @@ async fn main() -> Result<()> {
         }
 
         Some((CMD_DEPLOY, sub)) => {
-            let module = sub.get_one::<String>(ARG_MODULE).context("missing --module")?;
+            let module = sub
+                .get_one::<String>(ARG_MODULE)
+                .context("missing --module")?;
             let db_name = sub.get_one::<String>(ARG_NAME).cloned().unwrap_or_else(|| {
                 Path::new(module)
                     .file_name()
@@ -516,7 +513,9 @@ async fn main() -> Result<()> {
         }
 
         Some((CMD_REMOVE_NODE, sub)) => {
-            let node_id = *sub.get_one::<u64>(ARG_NODE_ID).context("missing --node-id")?;
+            let node_id = *sub
+                .get_one::<u64>(ARG_NODE_ID)
+                .context("missing --node-id")?;
             let cluster = sub
                 .get_one::<String>(ARG_CLUSTER)
                 .map_or(DEFAULT_CLUSTER_ADDR, String::as_str);
@@ -528,7 +527,9 @@ async fn main() -> Result<()> {
         }
 
         Some((CMD_CREATE_SHARD, sub)) => {
-            let shard_id = *sub.get_one::<u64>(ARG_SHARD_ID).context("missing --shard-id")?;
+            let shard_id = *sub
+                .get_one::<u64>(ARG_SHARD_ID)
+                .context("missing --shard-id")?;
             let cluster = sub
                 .get_one::<String>(ARG_CLUSTER)
                 .map_or(DEFAULT_CLUSTER_ADDR, String::as_str);
@@ -540,7 +541,9 @@ async fn main() -> Result<()> {
         }
 
         Some((CMD_REMOVE_SHARD, sub)) => {
-            let shard_id = *sub.get_one::<u64>(ARG_SHARD_ID).context("missing --shard-id")?;
+            let shard_id = *sub
+                .get_one::<u64>(ARG_SHARD_ID)
+                .context("missing --shard-id")?;
             let cluster = sub
                 .get_one::<String>(ARG_CLUSTER)
                 .map_or(DEFAULT_CLUSTER_ADDR, String::as_str);
@@ -552,8 +555,12 @@ async fn main() -> Result<()> {
         }
 
         Some((CMD_ADD_ROUTE, sub)) => {
-            let module = sub.get_one::<String>(ARG_MODULE).context("missing --module")?;
-            let shard_id = *sub.get_one::<u64>(ARG_SHARD_ID).context("missing --shard-id")?;
+            let module = sub
+                .get_one::<String>(ARG_MODULE)
+                .context("missing --module")?;
+            let shard_id = *sub
+                .get_one::<u64>(ARG_SHARD_ID)
+                .context("missing --shard-id")?;
             let cluster = sub
                 .get_one::<String>(ARG_CLUSTER)
                 .map_or(DEFAULT_CLUSTER_ADDR, String::as_str);
@@ -568,7 +575,9 @@ async fn main() -> Result<()> {
         }
 
         Some((CMD_REMOVE_ROUTE, sub)) => {
-            let module = sub.get_one::<String>(ARG_MODULE).context("missing --module")?;
+            let module = sub
+                .get_one::<String>(ARG_MODULE)
+                .context("missing --module")?;
             let cluster = sub
                 .get_one::<String>(ARG_CLUSTER)
                 .map_or(DEFAULT_CLUSTER_ADDR, String::as_str);
@@ -602,7 +611,9 @@ async fn main() -> Result<()> {
         }
 
         Some((CMD_SHARD_STATUS, sub)) => {
-            let shard_id = *sub.get_one::<u64>(ARG_SHARD_ID).context("missing --shard-id")?;
+            let shard_id = *sub
+                .get_one::<u64>(ARG_SHARD_ID)
+                .context("missing --shard-id")?;
             let addr = sub
                 .get_one::<String>(ARG_ADDR)
                 .map_or(DEFAULT_CLUSTER_ADDR, String::as_str);
