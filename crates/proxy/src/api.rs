@@ -30,7 +30,7 @@ use crate::{
         SUB_SHARDS, SUB_SHARDS_CREATE, SUB_SHARDS_PREFIX, SUB_SHARDS_REMOVE, SUB_SHARDS_ROUTE,
         SUB_SHARDS_ROUTE_ADD, SUB_SHARDS_ROUTE_REMOVE, SUB_STATUS, SUB_WRITE, SUB_WRITE_BATCH,
         SUFFIX_STATUS, SUFFIX_WRITE, SUFFIX_WRITE_BATCH, close_session, decode_req, mid_u64_key,
-        reply_bitcode, watch::Receiver,
+        normalize_addr, reply_bitcode, watch::Receiver,
     },
 };
 
@@ -280,7 +280,14 @@ async fn dispatch_cluster_query(pool: &RaftPool, query: Query) {
                 let nodes: BTreeMap<u64, String> = decode_req(&query)?;
                 let members: BTreeMap<u64, BasicNode> = nodes
                     .into_iter()
-                    .map(|(id, addr)| (id, BasicNode { addr }))
+                    .map(|(id, addr)| {
+                        (
+                            id,
+                            BasicNode {
+                                addr: normalize_addr(&addr, true),
+                            },
+                        )
+                    })
                     .collect();
                 let raft = get_default_raft(pool)?;
                 raft.initialize(members).await.map_err(err_str)?;

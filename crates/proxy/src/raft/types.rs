@@ -5,8 +5,8 @@ use bytes::Bytes;
 use openraft::{BasicNode, Entry, EntryPayload};
 use openraft_rt_compio::CompioRuntime;
 pub use openraft_zenoh::codec::{
-    CommittedLeaderId, LeaderId, RaftLogId, RaftSnapshot, RaftSnapshotMeta, RaftStoredMembership,
-    RaftVote, leader_term,
+    LeaderId, RaftLogId, RaftSnapshot, RaftSnapshotMeta, RaftStoredMembership, RaftVote,
+    leader_term,
 };
 
 /// Raft 日志条目类型。

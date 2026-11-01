@@ -50,24 +50,6 @@ pub(crate) fn next_stream_id() -> u64 {
     NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// 启动分片的写转发任务（带状态机 `last_delivered` 水位回报）。
-pub fn spawn(
-    node_id: u64,
-    stdb_url: String,
-    write_rx: WriteReceiver,
-    state_machine: Option<StateMachineStore>,
-    shutdown_rx: watch::Receiver<bool>,
-) {
-    spawn_pooled(
-        node_id,
-        stdb_url,
-        ZenohClientPool::new(),
-        write_rx,
-        state_machine,
-        shutdown_rx,
-    );
-}
-
 /// 启动复用节点级 [`ZenohClientPool`] 的分片写转发任务（全库与客户端代理共享同一底层 QUIC 会话）。
 pub fn spawn_pooled(
     node_id: u64,
@@ -95,23 +77,12 @@ pub async fn run(
     write_rx: WriteReceiver,
     shutdown_rx: watch::Receiver<bool>,
 ) {
-    run_with_state_machine(node_id, stdb_url, write_rx, None, shutdown_rx).await;
-}
-
-/// 转发循环：每条写按到达顺序推入对应数据库的有界队列，并在投递后推进 `last_delivered`。
-pub async fn run_with_state_machine(
-    node_id: u64,
-    stdb_url: String,
-    write_rx: WriteReceiver,
-    state_machine: Option<StateMachineStore>,
-    shutdown_rx: watch::Receiver<bool>,
-) {
     run_with_pool(
         node_id,
         stdb_url,
         ZenohClientPool::new(),
         write_rx,
-        state_machine,
+        None,
         shutdown_rx,
     )
     .await;
@@ -166,24 +137,8 @@ pub async fn run_with_pool(
     }
 }
 
-/// 建立某个数据库的上游投递通道，断线后自动重连。
-pub fn connect(
-    stdb_url: String,
-    db_path: String,
-    state_machine: Option<StateMachineStore>,
-    shutdown_rx: watch::Receiver<bool>,
-) -> UpstreamSender {
-    connect_pooled(
-        stdb_url,
-        db_path,
-        ZenohClientPool::new(),
-        state_machine,
-        shutdown_rx,
-    )
-}
-
 /// 建立复用 [`ZenohClientPool`] 的单库上游投递通道，断线后自动重连。
-pub fn connect_pooled(
+fn connect_pooled(
     stdb_url: String,
     db_path: String,
     zenoh_pool: ZenohClientPool,

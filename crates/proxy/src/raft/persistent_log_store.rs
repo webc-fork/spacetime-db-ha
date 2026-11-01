@@ -149,10 +149,11 @@ impl PersistentLogStore {
             let bytes = bitcode::encode(&WireEntry::from(entry));
             batch.insert(&self.log_ks, log_id.index.to_be_bytes(), bytes);
         }
+        let Some(log_id) = last_log_id else {
+            return Ok(());
+        };
         batch.commit()?;
-        if let Some(log_id) = last_log_id {
-            self.cache.lock().last_log_id = Some(log_id);
-        }
+        self.cache.lock().last_log_id = Some(log_id);
         Ok(())
     }
 

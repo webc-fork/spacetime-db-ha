@@ -73,7 +73,10 @@ pub fn extract_module_name(path: &str) -> Option<&str> {
     };
 
     // 去掉查询串与尾部斜杠
-    let name = rest.split('?').next().unwrap_or(rest).trim_end_matches('/');
+    let name = rest
+        .split_once('?')
+        .map_or(rest, |(before, _)| before)
+        .trim_end_matches('/');
     (!name.is_empty()).then_some(name)
 }
 

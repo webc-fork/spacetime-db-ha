@@ -9,19 +9,14 @@ use bitcode::{
 use bytes::Bytes;
 use openraft_zenoh::codec;
 pub use openraft_zenoh::codec::{
-    WireAppendEntriesResponse, WireBytes, WireBytesEncoder, WireDecoder, WireEncoder, WireFatal,
-    WireFullSnapshotRequest, WireLogId, WireMembership, WireSnapshotMeta, WireSnapshotResponse,
-    WireStoredMembership, WireVote, WireVoteRequest, WireVoteResponse, impl_bitcode_via,
+    WireBytes, WireDecoder, WireEncoder, WireLogId, WireStoredMembership, WireVote,
+    impl_bitcode_via,
 };
 
 use crate::raft::types::{RaftLogId, ReducerCallRequest, WriteAck};
 
 /// `RaftEntry` 的 `bitcode` 原生编码表示。
 pub type WireEntry = codec::WireEntry<ReducerCallRequest>;
-/// `EntryPayload` 的 `bitcode` 原生编码表示。
-pub type WireEntryPayload = codec::WireEntryPayload<ReducerCallRequest>;
-/// `AppendEntriesRequest<TypeConfig>` 的 `bitcode` 原生编码表示。
-pub type WireAppendEntriesRequest = codec::WireAppendEntriesRequest<ReducerCallRequest>;
 
 /// `ReducerCallRequest` 的零拷贝直接编码器（直接按 `&[u8]` 与 `&str` 写入 `bitcode` 缓冲区，零 `.to_vec()`、零 `.clone()`）。
 #[derive(Default)]

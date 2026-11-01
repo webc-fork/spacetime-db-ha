@@ -247,19 +247,10 @@ impl ZenohStdbStream {
         })
     }
 
-    /// 连接到代理或 SpacetimeDB 的指定数据库路径（使用默认超时）。
+    /// 连接到代理或 SpacetimeDB 的指定数据库路径（使用默认超时）；握手失败时自动关闭底层会话。
     pub async fn connect(addr: &str, db_path: &str) -> Result<Self> {
-        Self::connect_with_timeout(addr, db_path, STREAM_RPC_TIMEOUT).await
-    }
-
-    /// 按指定握手超时连接到代理或 SpacetimeDB 的指定数据库路径；握手失败时自动关闭底层会话。
-    pub async fn connect_with_timeout(
-        addr: &str,
-        db_path: &str,
-        timeout: Duration,
-    ) -> Result<Self> {
         let session = open_client_session(addr).await?;
-        Self::open_on_session(session, db_path, timeout, true).await
+        Self::open_on_session(session, db_path, STREAM_RPC_TIMEOUT, true).await
     }
 
     /// 复用 [`ZenohClientPool`] 中的长生命周期 QUIC 会话建立多路流（仅按 `stream_id` / `conn_id` 隔离，零重复 QUIC 建连开销）。
@@ -289,11 +280,6 @@ impl ZenohStdbStream {
     /// 向服务端发送一条帧消息。
     pub async fn send(&self, msg: Message) -> Result<()> {
         self.sender.send(msg).await
-    }
-
-    /// 接收服务端推送的下一条帧消息。
-    pub async fn recv(&self) -> Result<Option<Message>> {
-        recv_s2c_message(&self.s2c_sub).await
     }
 
     /// 关闭客户端会话。
