@@ -20,8 +20,8 @@ use crate::{
     metrics::CONNECTIONS_ACTIVE,
     raft::RaftPool,
     transport::{
-        CrossfireChannel, close_session, decode_query_payload, open_server_session, reply_bitcode,
-        watch::Receiver,
+        CrossfireChannel, KEY_STDB_CONNECT, close_session, decode_query_payload,
+        open_server_session, reply_bitcode, watch::Receiver,
     },
     websocket::handler::{StdbConnectRequest, spawn_client_session},
 };
@@ -54,10 +54,10 @@ impl Proxy {
     pub async fn serve_session(self, session: Session) -> Result<()> {
         let mut shutdown = self.shutdown.clone();
         let connect_queryable = session
-            .declare_queryable("stdb/connect")
+            .declare_queryable(KEY_STDB_CONNECT)
             .with(CrossfireChannel::new())
             .await
-            .map_err(|e| anyhow!("Failed to declare stdb/connect queryable: {e}"))?;
+            .map_err(|e| anyhow!("Failed to declare {KEY_STDB_CONNECT} queryable: {e}"))?;
 
         loop {
             select! {

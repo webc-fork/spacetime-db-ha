@@ -36,7 +36,7 @@ use crate::{
         types::{RaftLogId, ReducerCallRequest, TypeConfig, WriteAck, leader_term},
     },
     router::{DEFAULT_SHARD, SHARD_CONFIG_TAG, ShardConfigCommand, ShardId, ShardRouter},
-    transport::{ZenohClientPool, normalize_addr, watch},
+    transport::{CLUSTER_PREFIX, SUFFIX_WRITE, ZenohClientPool, mid_u64_key, normalize_addr, watch},
 };
 
 pub mod codec;
@@ -584,7 +584,7 @@ impl RaftPool {
         raw_message: Bytes,
         db_path: String,
     ) -> Result<RaftLogId> {
-        let key_expr = format!("cluster/{shard_id}/write");
+        let key_expr = mid_u64_key(CLUSTER_PREFIX, shard_id, SUFFIX_WRITE);
         let request = ReducerCallRequest {
             raw_message,
             db_path,

@@ -20,9 +20,10 @@ pub type RaftLogId = LogId<LeaderId>;
 /// Raft 选票类型。
 pub type RaftVote = Vote<LeaderId>;
 
-/// 提取选票的任期号。
-pub fn leader_term(vote: &RaftVote) -> u64 {
-    vote.leader_id().term
+/// 提取选票的任期号（编译期与运行期通用 `const fn`）。
+#[inline]
+pub const fn leader_term(vote: &RaftVote) -> u64 {
+    vote.leader_id.term
 }
 
 /// Raft 持久化成员配置类型。

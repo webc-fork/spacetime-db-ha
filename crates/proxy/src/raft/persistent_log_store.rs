@@ -14,10 +14,13 @@ use openraft::{
 };
 use tracing::{debug, info};
 
-use crate::raft::{
-    codec::{WireEntry, WireLogId, WireVote},
-    error::{StoreError, storage_io_err},
-    types::{RaftEntry, RaftLogId, RaftVote, TypeConfig},
+use crate::{
+    raft::{
+        codec::{WireEntry, WireLogId, WireVote},
+        error::{StoreError, storage_io_err},
+        types::{RaftEntry, RaftLogId, RaftVote, TypeConfig},
+    },
+    transport::prefix_u64_key,
 };
 
 type C = TypeConfig;
@@ -248,7 +251,7 @@ impl RaftLogStorage<C> for PersistentLogStore {
     }
 }
 
-/// 分片数据库目录，便于运维与测试定位。
+/// 分片数据库目录，便于运维与测试定位（使用 `prefix_u64_key` 消除 `format!` 开销）。
 pub(crate) fn shard_dir(data_dir: &Path, shard_id: u64) -> PathBuf {
-    data_dir.join(format!("{SHARD_DIR_PREFIX}{shard_id}"))
+    data_dir.join(prefix_u64_key(SHARD_DIR_PREFIX, shard_id))
 }

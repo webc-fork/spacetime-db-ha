@@ -21,7 +21,10 @@ use tracing::{info, warn};
 
 use crate::{
     raft::state_machine::{StateMachineStore, WriteReceiver},
-    transport::{CrossfireChannel, close_session, open_client_session, rpc_once, watch},
+    transport::{
+        CrossfireChannel, KEY_STDB_CONNECT, STDB_C2S_PREFIX, STDB_S2C_PREFIX, close_session,
+        open_client_session, prefix_u64_key, rpc_once, watch,
+    },
     websocket::handler::{Message, StdbConnectRequest, StdbConnectResponse},
 };
 
@@ -168,7 +171,7 @@ async fn upstream_task(
             }
         };
 
-        let s2c_key = format!("stdb/s2c/{stream_id}");
+        let s2c_key = prefix_u64_key(STDB_S2C_PREFIX, stream_id);
         let Ok(s2c_sub) = session
             .declare_subscriber(&s2c_key)
             .with(CrossfireChannel::new())
@@ -184,7 +187,7 @@ async fn upstream_task(
         };
         let conn_resp: StdbConnectResponse = match rpc_once(
             &session,
-            "stdb/connect",
+            KEY_STDB_CONNECT,
             &req,
             CONNECT_RPC_TIMEOUT,
         )
@@ -202,7 +205,7 @@ async fn upstream_task(
             }
         };
 
-        let c2s_key = format!("stdb/c2s/{}", conn_resp.conn_id);
+        let c2s_key = prefix_u64_key(STDB_C2S_PREFIX, conn_resp.conn_id);
         info!(db_path = %db_path, conn_id = conn_resp.conn_id, "Forwarder connected to SpacetimeDB over Zenoh QUIC");
 
         loop {

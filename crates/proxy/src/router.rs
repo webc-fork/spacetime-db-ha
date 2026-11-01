@@ -15,9 +15,13 @@ pub const DEFAULT_SHARD: ShardId = 0;
 /// 分片配置命令首字节标签。
 pub const SHARD_CONFIG_TAG: u8 = 0xFF;
 
-/// 分片配置命令在 Raft 条目中的 4 字节魔数前缀：`[0xFF, 'S', 'F', 'G']`。
+/// 分片配置命令魔数后缀。
+const SHARD_CONFIG_MAGIC_SUFFIX: &str = "SFG";
+
+/// 分片配置命令在 Raft 条目中的 4 字节魔数前缀：`[0xFF, 'S', 'F', 'G']`（编译期通过 `const_str::concat_bytes!` 合成）。
 /// 配合 `db_path.is_empty()` 校验，彻底消除客户端消息 `0xFF` 首字节冲突（修复 P2-14）。
-pub const SHARD_CONFIG_MAGIC: [u8; 4] = [SHARD_CONFIG_TAG, b'S', b'F', b'G'];
+pub const SHARD_CONFIG_MAGIC: [u8; 4] =
+    *const_str::concat_bytes!(SHARD_CONFIG_TAG, SHARD_CONFIG_MAGIC_SUFFIX);
 
 /// 通过分片 0 的 Raft 日志复制的分片配置命令。
 /// 提交后各节点自行落地：创建/删除分片、更新路由。

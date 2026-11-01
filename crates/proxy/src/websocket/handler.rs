@@ -21,8 +21,9 @@ use crate::{
     raft::{RaftPool, codec::impl_bitcode_via, forwarder::next_stream_id},
     router::{DEFAULT_SHARD, ShardId, extract_module_name},
     transport::{
-        CrossfireChannel, CrossfireHandler, close_session, decode_query_payload,
-        open_client_session, reply_bitcode, rpc_once, watch::Receiver,
+        CrossfireChannel, CrossfireHandler, KEY_STDB_CONNECT, STDB_C2S_PREFIX, STDB_S2C_PREFIX,
+        close_session, decode_query_payload, open_client_session, prefix_u64_key, reply_bitcode,
+        rpc_once, watch::Receiver,
     },
     websocket::ConnectionGuard,
 };
@@ -143,13 +144,26 @@ static TAG_KINDS: [MessageKind; TAG_COUNT] = {
     table
 };
 
+/// 按 BSATN 标签字节（`const fn`）分类操作类型。
+#[inline]
+pub const fn classify_tag(tag: u8) -> MessageKind {
+    TAG_KINDS[tag as usize]
+}
+
+/// 按原始二进制字节切片（`const fn`）分类操作类型。
+#[inline]
+pub const fn classify_bytes(data: &[u8]) -> MessageKind {
+    match data.first() {
+        Some(&tag) => classify_tag(tag),
+        None => MessageKind::PassThrough,
+    }
+}
+
 /// 按 BSATN 标签字节分类一条消息。
+#[inline]
 pub fn classify_message(msg: &Message) -> MessageKind {
     match msg {
-        Message::Binary(data) => match data.first() {
-            Some(&tag) => TAG_KINDS[tag as usize],
-            None => MessageKind::PassThrough,
-        },
+        Message::Binary(data) => classify_bytes(data),
         _ => MessageKind::PassThrough,
     }
 }
@@ -179,7 +193,7 @@ impl ZenohStdbStream {
     pub async fn connect(addr: &str, db_path: &str) -> Result<Self> {
         let stream_id = next_stream_id();
         let session = open_client_session(addr).await?;
-        let s2c_key = format!("stdb/s2c/{stream_id}");
+        let s2c_key = prefix_u64_key(STDB_S2C_PREFIX, stream_id);
         let s2c_sub = session
             .declare_subscriber(&s2c_key)
             .with(CrossfireChannel::new())
@@ -191,12 +205,12 @@ impl ZenohStdbStream {
             db_path: db_path.to_owned(),
         };
         let resp: StdbConnectResponse =
-            rpc_once(&session, "stdb/connect", &req, STREAM_RPC_TIMEOUT).await?;
+            rpc_once(&session, KEY_STDB_CONNECT, &req, STREAM_RPC_TIMEOUT).await?;
 
         Ok(Self {
             sender: ZenohStdbSender {
                 session,
-                c2s_key: format!("stdb/c2s/{}", resp.conn_id),
+                c2s_key: prefix_u64_key(STDB_C2S_PREFIX, resp.conn_id),
             },
             s2c_sub,
         })
@@ -279,14 +293,14 @@ pub async fn spawn_client_session(
         })?;
     let (upstream_tx, upstream_rx) = upstream.split();
 
-    let c2s_key = format!("stdb/c2s/{conn_id}");
+    let c2s_key = prefix_u64_key(STDB_C2S_PREFIX, conn_id);
     let c2s_queryable = server_session
         .declare_queryable(&c2s_key)
         .with(CrossfireChannel::new())
         .await
         .map_err(|e| anyhow!("Failed to declare c2s queryable {c2s_key}: {e}"))?;
 
-    let client_s2c_key = format!("stdb/s2c/{}", req.stream_id);
+    let client_s2c_key = prefix_u64_key(STDB_S2C_PREFIX, req.stream_id);
     info!(
         conn_id,
         path = %request_path,
