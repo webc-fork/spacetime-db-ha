@@ -153,7 +153,7 @@ impl RaftPool {
 
         let (shard_config_tx, shard_config_rx) = config_channel(CONFIG_CHANNEL_CAPACITY);
         let shard0 = Self::create_shard(
-            node_config.clone(),
+            &node_config,
             zenoh_pool.clone(),
             DEFAULT_SHARD,
             shutdown_rx.clone(),
@@ -230,7 +230,7 @@ impl RaftPool {
 
     /// 创建分片的 Raft 实例、状态机、转发通道，并重放崩溃前未完成投递的已提交写 `(last_delivered, last_applied]`。
     async fn create_shard(
-        config: Arc<NodeConfig>,
+        config: &NodeConfig,
         zenoh_pool: ZenohClientPool,
         shard_id: ShardId,
         mut global_shutdown: watch::Receiver<bool>,
@@ -264,7 +264,6 @@ impl RaftPool {
         .detach();
 
         let (write_tx, write_rx) = write_channel(FORWARDER_CHANNEL_CAPACITY);
-        state_machine.set_forwarder(write_tx.clone());
         forwarder::spawn(
             config.node_id,
             config.stdb_url.clone(),
@@ -297,6 +296,7 @@ impl RaftPool {
                 state_machine.mark_delivered(idx);
             }
         }
+        state_machine.set_forwarder(write_tx);
 
         let network = network::NetworkFactory::new(zenoh_pool, shard_id);
         let raft = Raft::new(
@@ -346,7 +346,7 @@ impl RaftPool {
 
         info!(shard_id, "Creating new shard from Raft config command");
         let shard = match Self::create_shard(
-            self.node_config.clone(),
+            &self.node_config,
             self.zenoh_pool.clone(),
             shard_id,
             self.shutdown_rx.clone(),
@@ -519,6 +519,9 @@ impl RaftPool {
             let shard = shards
                 .get(&shard_id)
                 .ok_or_else(|| anyhow!("shard {shard_id} not found"))?;
+            if shard.state_machine.last_applied_index() >= index {
+                return Ok(());
+            }
             shard.state_machine.applied_rx()
         };
 
@@ -538,6 +541,9 @@ impl RaftPool {
             let Some(shard) = shards.get(&shard_id) else {
                 return;
             };
+            if shard.state_machine.last_delivered_index() >= target_index {
+                return;
+            }
             shard.state_machine.delivered_rx()
         };
 
@@ -554,21 +560,23 @@ impl RaftPool {
 
     /// 读请求前的因果同步栅栏：等待本节点状态机追平已知最后日志索引（修复 P0-4）。
     pub async fn wait_read_ready(&self, shard_id: ShardId) {
-        let target = {
+        let (applied, target) = {
             let shards = self.shards.read();
             let Some(shard) = shards.get(&shard_id) else {
                 return;
             };
-            shard
+            let target = shard
                 .raft
                 .metrics()
                 .borrow_watched()
                 .last_log_index
-                .unwrap_or(0)
+                .unwrap_or(0);
+            if target == 0 || shard.state_machine.last_applied_index() >= target {
+                return;
+            }
+            (shard.state_machine.applied_rx(), target)
         };
-        if target > 0 {
-            let _ = timeout(READ_BARRIER_TIMEOUT, self.wait_applied(shard_id, target)).await;
-        }
+        let _ = wait_watermark(applied, target, READ_BARRIER_TIMEOUT).await;
     }
 
     /// 把写请求通过 Zenoh + `bitcode` 转发给 leader 节点，取回提交后的日志位置。

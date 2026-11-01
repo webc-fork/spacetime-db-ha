@@ -73,11 +73,10 @@ impl Proxy {
 
                     let session_clone = session.clone();
                     let pool = Rc::clone(&self.pool);
-                    let config = Arc::clone(&self.config);
                     let conn_shutdown = self.shutdown.clone();
 
                     spawn(async move {
-                        match spawn_client_session(session_clone, req, pool, config, conn_shutdown).await {
+                        match spawn_client_session(session_clone, req, pool, conn_shutdown).await {
                             Ok(resp) => reply_bitcode(&query, Ok(resp)).await,
                             Err(e) => {
                                 error!(error = %e, "Client session handshake failed");

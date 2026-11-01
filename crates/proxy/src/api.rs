@@ -51,10 +51,6 @@ fn err_str(err: impl Display) -> String {
 /// 原生 TCP `/metrics` 请求读取缓冲区大小。
 const METRICS_REQ_BUF_SIZE: usize = 1024;
 
-// ============================================================================
-// 编译期公共 HTTP 与 JSON 静态常量片段（基于 const_str 组合，消除硬编码与重复字面量）
-// ============================================================================
-
 /// HTTP 协议版本前缀。
 const HTTP_VER: &str = "HTTP/1.1 ";
 /// HTTP 行分隔符。
@@ -133,10 +129,6 @@ fn get_default_raft(pool: &RaftPool) -> Result<ShardRaft, String> {
     get_shard_raft(pool, DEFAULT_SHARD)
 }
 
-// ============================================================================
-// 公共管理协议数据结构（bitcode 序列化，供代理与 CLI 共享）
-// ============================================================================
-
 /// 集群整体状态响应。
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct ClusterStatus {
@@ -212,10 +204,6 @@ pub struct ShardStatusResponse {
     pub last_applied: Option<String>,
     pub membership: String,
 }
-
-// ============================================================================
-// Zenoh RPC 路由与分发
-// ============================================================================
 
 /// 在指定的 Zenoh 服务端会话上注册 `raft/**` 与 `cluster/**` 查询处理器并运行至收到关闭信号。
 pub async fn serve_zenoh(
@@ -620,10 +608,6 @@ async fn propose_config(pool: &RaftPool, cmd: ShardConfigCommand) -> Result<(), 
         .map_err(err_str)?;
     Ok(())
 }
-
-// ============================================================================
-// 基于 compio + askama::Template + const_str 的最小开销 HTTP JSON `/metrics` 响应器
-// ============================================================================
 
 /// 动态 HTTP 200 JSON 响应编译期模板（用于 `/metrics` 导出）。
 #[derive(Template)]

@@ -356,7 +356,7 @@ async fn main() -> Result<()> {
                 shard_id,
             };
             let _: String = oneshot_rpc(cluster, KEY_SHARDS_ROUTE_ADD, &req, RPC_TIMEOUT).await?;
-            println!("Route {} -> shard {shard_id} added!", req.module_name);
+            println!("Route {module} -> shard {shard_id} added!");
         }
 
         Some((CMD_REMOVE_ROUTE, sub)) => {
@@ -373,7 +373,7 @@ async fn main() -> Result<()> {
             };
             let _: String =
                 oneshot_rpc(cluster, KEY_SHARDS_ROUTE_REMOVE, &req, RPC_TIMEOUT).await?;
-            println!("Route for {} removed!", req.module_name);
+            println!("Route for {module} removed!");
         }
 
         Some((CMD_LIST_SHARDS, sub)) => {

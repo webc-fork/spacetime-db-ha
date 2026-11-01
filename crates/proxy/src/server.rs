@@ -58,7 +58,7 @@ pub async fn serve(config: NodeConfig) -> Result<()> {
         .detach();
     }
 
-    let proxy = Proxy::new(Arc::new(config), pool, shutdown_rx);
+    let proxy = Proxy::new(Arc::clone(&pool.node_config), pool, shutdown_rx);
 
     select! {
         result = proxy.run().fuse() => result,

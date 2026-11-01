@@ -1,9 +1,6 @@
 use std::{
     rc::Rc,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -16,7 +13,6 @@ use tracing::{debug, info, warn};
 use zenoh::{Session, bytes::ZBytes, pubsub::Subscriber, sample::Sample};
 
 use crate::{
-    config::NodeConfig,
     metrics,
     raft::{
         RaftPool,
@@ -298,7 +294,6 @@ pub async fn spawn_client_session(
     server_session: Session,
     req: StdbConnectRequest,
     pool: Rc<RaftPool>,
-    config: Arc<NodeConfig>,
     mut shutdown: Receiver<bool>,
 ) -> Result<StdbConnectResponse> {
     let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
@@ -314,13 +309,11 @@ pub async fn spawn_client_session(
     };
 
     // 先建立到上游 SpacetimeDB 的连接，确保握手返回后即可收发
-    let upstream = ZenohStdbStream::connect(&config.stdb_url, &request_path)
+    let stdb_url = &pool.node_config.stdb_url;
+    let upstream = ZenohStdbStream::connect(stdb_url, &request_path)
         .await
         .with_context(|| {
-            format!(
-                "Failed to connect upstream SpacetimeDB at {}{}",
-                config.stdb_url, request_path
-            )
+            format!("Failed to connect upstream SpacetimeDB at {stdb_url}{request_path}")
         })?;
     let (upstream_tx, upstream_rx) = upstream.split();
 
