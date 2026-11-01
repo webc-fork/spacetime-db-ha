@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::{self, Cursor},
+    io::Cursor,
     num::NonZeroUsize,
 };
 
@@ -12,8 +12,8 @@ use bitcode::{
 };
 use bytes::Bytes;
 use openraft::{
-    AppData, BasicNode, Entry, EntryPayload, ErrorSubject, ErrorVerb, LogId, Membership,
-    RaftTypeConfig, Snapshot, SnapshotMeta, StorageError, StoredMembership, Vote,
+    AppData, BasicNode, Entry, EntryPayload, LogId, Membership, RaftTypeConfig, Snapshot,
+    SnapshotMeta, StoredMembership, Vote,
     errors::{Fatal, RaftError},
     impls::leader_id_adv,
     raft::{
@@ -24,9 +24,6 @@ use openraft::{
 
 /// Raft 选主标识类型（支持同任期多选主对比）。
 pub type LeaderId = leader_id_adv::LeaderId<u64, u64>;
-
-/// Raft 已提交选主标识类型。
-pub type CommittedLeaderId = LeaderId;
 
 /// Raft 日志条目唯一标识类型。
 pub type RaftLogId = LogId<LeaderId>;
@@ -247,12 +244,6 @@ impl From<&Membership<u64, BasicNode>> for WireMembership {
     }
 }
 
-impl From<Membership<u64, BasicNode>> for WireMembership {
-    fn from(m: Membership<u64, BasicNode>) -> Self {
-        Self::from(&m)
-    }
-}
-
 impl From<WireMembership> for Membership<u64, BasicNode> {
     fn from(w: WireMembership) -> Self {
         let nodes: BTreeMap<u64, BasicNode> = w
@@ -277,12 +268,6 @@ impl From<&RaftStoredMembership> for WireStoredMembership {
             log_id: (*sm.log_id()).map(WireLogId::from),
             membership: WireMembership::from(sm.membership()),
         }
-    }
-}
-
-impl From<RaftStoredMembership> for WireStoredMembership {
-    fn from(sm: RaftStoredMembership) -> Self {
-        Self::from(&sm)
     }
 }
 
@@ -521,7 +506,7 @@ impl From<RaftSnapshotMeta> for WireSnapshotMeta {
     fn from(m: RaftSnapshotMeta) -> Self {
         Self {
             last_log_id: m.last_log_id.map(WireLogId::from),
-            last_membership: WireStoredMembership::from(m.last_membership),
+            last_membership: WireStoredMembership::from(&m.last_membership),
         }
     }
 }
@@ -589,31 +574,11 @@ impl<C: RaftTypeConfig> From<Fatal<C>> for WireFatal {
     }
 }
 
-impl<C: RaftTypeConfig> From<WireFatal> for Fatal<C> {
-    fn from(w: WireFatal) -> Self {
-        match w {
-            WireFatal::StorageError(msg) => Self::StorageError(StorageError::from_io_error(
-                ErrorSubject::Store,
-                ErrorVerb::Read,
-                io::Error::other(msg),
-            )),
-            WireFatal::Panicked => Self::Panicked,
-            WireFatal::Stopped => Self::Stopped,
-        }
-    }
-}
-
 impl<C: RaftTypeConfig> From<RaftError<C>> for WireFatal {
     fn from(err: RaftError<C>) -> Self {
         match err {
             RaftError::APIError(infallible) => match infallible {},
             RaftError::Fatal(f) => Self::from(f),
         }
-    }
-}
-
-impl<C: RaftTypeConfig> From<WireFatal> for RaftError<C> {
-    fn from(w: WireFatal) -> Self {
-        Self::Fatal(Fatal::from(w))
     }
 }

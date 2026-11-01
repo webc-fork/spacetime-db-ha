@@ -11,14 +11,7 @@
 //! 3. **天然支持 Multi-Raft**：
 //!    - 分片级预计算 `raft/{shard_id}/{append|vote|snapshot}` 键表达式，全部分片共享同一个 [`ZenohClientPool`]。
 
-use std::{
-    future::Future,
-    io::{self, Cursor},
-    marker::PhantomData,
-    pin::pin,
-    rc::Rc,
-    time::Duration,
-};
+use std::{future::Future, io::Cursor, marker::PhantomData, pin::pin, rc::Rc, time::Duration};
 
 use bitcode::{DecodeOwned, Encode};
 use futures::{FutureExt, select};
@@ -126,6 +119,12 @@ pub struct NetworkConnection<C> {
     _marker: PhantomData<fn() -> C>,
 }
 
+/// 将远端 `WireFatal` 转换为 `Unreachable<C>`（一处定义，供 append / vote / snapshot 共用）。
+#[inline]
+fn fatal_unreachable<C: RaftTypeConfig>(e: WireFatal) -> Unreachable<C> {
+    Unreachable::from_string(format!("{e:?}"))
+}
+
 impl<C: RaftTypeConfig> NetworkConnection<C> {
     /// 通过 Zenoh 发送带超时与 QoS 优先级的 `bitcode` RPC 请求并反序列化响应体。
     async fn call_rpc<P, T>(
@@ -142,10 +141,7 @@ impl<C: RaftTypeConfig> NetworkConnection<C> {
         self.pool
             .rpc_with_qos(&self.addr, key_expr, payload, timeout, priority)
             .await
-            .map_err(|e| {
-                let io_err = io::Error::other(e.to_string());
-                Unreachable::new(&io_err)
-            })
+            .map_err(|e| Unreachable::from_string(e.to_string()))
     }
 }
 
@@ -183,7 +179,7 @@ impl<C: ZenohRaftConfig> RaftNetworkV2<C> for NetworkConnection<C> {
             .await?;
         result
             .map(AppendEntriesResponse::from)
-            .map_err(|e| RPCError::Unreachable(Unreachable::from_string(format!("{e:?}"))))
+            .map_err(|e| RPCError::Unreachable(fatal_unreachable(e)))
     }
 
     async fn vote(
@@ -198,7 +194,7 @@ impl<C: ZenohRaftConfig> RaftNetworkV2<C> for NetworkConnection<C> {
             .await?;
         result
             .map(VoteResponse::from)
-            .map_err(|e| RPCError::Unreachable(Unreachable::from_string(format!("{e:?}"))))
+            .map_err(|e| RPCError::Unreachable(fatal_unreachable(e)))
     }
 
     async fn full_snapshot(
@@ -228,7 +224,7 @@ impl<C: ZenohRaftConfig> RaftNetworkV2<C> for NetworkConnection<C> {
 
         result
             .map(SnapshotResponse::from)
-            .map_err(|e| StreamingError::Unreachable(Unreachable::from_string(format!("{e:?}"))))
+            .map_err(|e| StreamingError::Unreachable(fatal_unreachable(e)))
     }
 }
 

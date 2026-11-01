@@ -7,13 +7,13 @@ pub mod network;
 pub mod transport;
 
 pub use codec::{
-    CommittedLeaderId, LeaderId, RaftLogId, RaftSnapshot, RaftSnapshotMeta, RaftStoredMembership,
-    RaftVote, WireBytes, leader_term,
+    LeaderId, RaftLogId, RaftSnapshot, RaftSnapshotMeta, RaftStoredMembership, RaftVote, WireBytes,
+    leader_term,
 };
 pub use network::{NetworkConnection, NetworkFactory, ZenohRaftConfig, dispatch_raft_query};
 pub use transport::{
     CrossfireChannel, CrossfireHandler, RpcEnvelope, ZenohClientPool, close_session,
     decode_query_payload, decode_req, mid_u64_key, normalize_addr, normalize_addr_cow, oneshot_rpc,
     open_client_session, open_server_session, prefix_u64_key, reply_bitcode, rpc_once,
-    rpc_once_with_qos, strip_addr_parts, watch,
+    strip_addr_parts, watch,
 };

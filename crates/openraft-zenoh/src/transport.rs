@@ -150,11 +150,6 @@ pub mod watch {
             Ok(())
         }
 
-        /// 只读借用当前状态。
-        pub fn borrow(&self) -> impl Deref<Target = T> + '_ {
-            self.0.borrow()
-        }
-
         /// 借用当前状态并将其标记为已读。
         pub fn borrow_and_update(&mut self) -> impl Deref<Target = T> + '_ {
             self.0.borrow_and_update()
@@ -380,23 +375,8 @@ where
     Req: Encode,
     Resp: DecodeOwned,
 {
-    rpc_once_with_qos(session, key_expr, req, timeout, Priority::InteractiveHigh).await
-}
-
-/// 在已连接的客户端会话上发起带 QoS 优先级的 `bitcode` Zenoh 查询。
-pub async fn rpc_once_with_qos<Req, Resp>(
-    session: &Session,
-    key_expr: &str,
-    req: &Req,
-    timeout: Duration,
-    priority: Priority,
-) -> Result<Resp>
-where
-    Req: Encode,
-    Resp: DecodeOwned,
-{
     let payload = bitcode::encode(req);
-    rpc_payload_once_with_qos(session, key_expr, &payload, timeout, priority).await
+    rpc_payload_once_with_qos(session, key_expr, &payload, timeout, Priority::InteractiveHigh).await
 }
 
 /// 使用已编码的 `bitcode` 字节切片在客户端会话上发起查询：
@@ -498,27 +478,11 @@ impl ZenohClientPool {
         Req: Encode,
         Resp: DecodeOwned,
     {
-        self.rpc_with_timeout(target_addr, key_expr, req, DEFAULT_RPC_TIMEOUT)
-            .await
-    }
-
-    /// 带超时配置的 `bitcode` RPC 调用（默认 `Priority::InteractiveHigh`）。
-    pub async fn rpc_with_timeout<Req, Resp>(
-        &self,
-        target_addr: &str,
-        key_expr: &str,
-        req: &Req,
-        timeout: Duration,
-    ) -> Result<Resp>
-    where
-        Req: Encode,
-        Resp: DecodeOwned,
-    {
         self.rpc_with_qos(
             target_addr,
             key_expr,
             req,
-            timeout,
+            DEFAULT_RPC_TIMEOUT,
             Priority::InteractiveHigh,
         )
         .await
