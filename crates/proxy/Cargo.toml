@@ -13,7 +13,6 @@ path = "src/main.rs"
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
-clap = { workspace = true, features = ["derive", "env"] }
 parking_lot = "0.13.0"
 thiserror.workspace = true
 zenoh = { version = "1.10.2", default-features = false, features = ["transport_udp", "transport_quic", "transport_quic_datagram"] }
@@ -31,6 +30,7 @@ futures = "0.3"
 see = "0.1"
 rimalloc = { git = "https://github.com/moggedhedien/rimalloc.git", version = "0.1.0" }
 const-str = "1.1.0"
+clap_args = { version = "0.1.9", features = ["macro"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

@@ -36,7 +36,9 @@ use crate::{
         types::{RaftLogId, ReducerCallRequest, TypeConfig, WriteAck, leader_term},
     },
     router::{DEFAULT_SHARD, SHARD_CONFIG_TAG, ShardConfigCommand, ShardId, ShardRouter},
-    transport::{CLUSTER_PREFIX, SUFFIX_WRITE, ZenohClientPool, mid_u64_key, normalize_addr, watch},
+    transport::{
+        CLUSTER_PREFIX, SUFFIX_WRITE, ZenohClientPool, mid_u64_key, normalize_addr, watch,
+    },
 };
 
 pub mod codec;

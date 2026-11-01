@@ -51,11 +51,20 @@ const JSON_NEXT_KEY_START: &str = ",\"";
 const JSON_KEY_END: &str = "\":";
 
 /// 编译期静态 JSON 键名前缀片段（零运行时转义或反射开销）。
-const JSON_P0: &str = const_str::concat!(JSON_FIRST_KEY_START, METRIC_NS, "raft_term", JSON_KEY_END);
-const JSON_P1: &str =
-    const_str::concat!(JSON_NEXT_KEY_START, METRIC_NS, "raft_is_leader", JSON_KEY_END);
-const JSON_P2: &str =
-    const_str::concat!(JSON_NEXT_KEY_START, METRIC_NS, "shards_active", JSON_KEY_END);
+const JSON_P0: &str =
+    const_str::concat!(JSON_FIRST_KEY_START, METRIC_NS, "raft_term", JSON_KEY_END);
+const JSON_P1: &str = const_str::concat!(
+    JSON_NEXT_KEY_START,
+    METRIC_NS,
+    "raft_is_leader",
+    JSON_KEY_END
+);
+const JSON_P2: &str = const_str::concat!(
+    JSON_NEXT_KEY_START,
+    METRIC_NS,
+    "shards_active",
+    JSON_KEY_END
+);
 const JSON_P3: &str = const_str::concat!(
     JSON_NEXT_KEY_START,
     METRIC_NS,

@@ -95,7 +95,8 @@ pub const KEY_CLUSTER_SHARDS_PREFIX: &str = const_str::concat!(CLUSTER_PREFIX, S
 pub const KEY_SHARDS_CREATE: &str = const_str::concat!(CLUSTER_PREFIX, SUB_SHARDS_CREATE);
 pub const KEY_SHARDS_REMOVE: &str = const_str::concat!(CLUSTER_PREFIX, SUB_SHARDS_REMOVE);
 pub const KEY_SHARDS_ROUTE_ADD: &str = const_str::concat!(CLUSTER_PREFIX, SUB_SHARDS_ROUTE_ADD);
-pub const KEY_SHARDS_ROUTE_REMOVE: &str = const_str::concat!(CLUSTER_PREFIX, SUB_SHARDS_ROUTE_REMOVE);
+pub const KEY_SHARDS_ROUTE_REMOVE: &str =
+    const_str::concat!(CLUSTER_PREFIX, SUB_SHARDS_ROUTE_REMOVE);
 
 /// 指标查询键表达式。
 pub const KEY_METRICS: &str = "metrics";
