@@ -12,7 +12,7 @@ use compio::{
     net::TcpListener,
     runtime::spawn,
 };
-use futures::{FutureExt, select};
+use futures::{FutureExt, future::try_join_all, select};
 use gxhash::HashMap;
 use openraft::{
     BasicNode, ReadPolicy, ServerState, Snapshot,
@@ -37,9 +37,9 @@ use crate::{
         RAFT_PREFIX, RAFT_QUERYABLE_ALL, RPC_APPEND, RPC_SNAPSHOT, RPC_VOTE, RpcEnvelope,
         SUB_ADD_NODE, SUB_HEALTH, SUB_INIT, SUB_LEADER, SUB_REMOVE_NODE, SUB_SHARDS,
         SUB_SHARDS_CREATE, SUB_SHARDS_PREFIX, SUB_SHARDS_REMOVE, SUB_SHARDS_ROUTE,
-        SUB_SHARDS_ROUTE_ADD, SUB_SHARDS_ROUTE_REMOVE, SUB_STATUS, SUB_WRITE, SUFFIX_STATUS,
-        SUFFIX_WRITE, close_session, decode_query_payload, mid_u64_key, reply_bitcode,
-        watch::Receiver,
+        SUB_SHARDS_ROUTE_ADD, SUB_SHARDS_ROUTE_REMOVE, SUB_STATUS, SUB_WRITE, SUB_WRITE_BATCH,
+        SUFFIX_STATUS, SUFFIX_WRITE, SUFFIX_WRITE_BATCH, close_session, decode_query_payload,
+        mid_u64_key, reply_bitcode, watch::Receiver,
     },
 };
 
@@ -402,6 +402,14 @@ async fn dispatch_cluster_query(pool: &RaftPool, query: Query) {
             .await;
             reply_bitcode(&query, res).await;
         }
+        SUB_WRITE_BATCH => {
+            let res = async {
+                let reqs: Vec<ReducerCallRequest> = decode_req(&query)?;
+                write_batch_to_shard(pool, DEFAULT_SHARD, reqs).await
+            }
+            .await;
+            reply_bitcode(&query, res).await;
+        }
         SUB_SHARDS => {
             let resp = ShardListResponse {
                 shards: pool.list_shards(),
@@ -482,7 +490,19 @@ async fn dispatch_cluster_query(pool: &RaftPool, query: Query) {
             reply_bitcode(&query, res).await;
         }
         _ => {
-            // 处理动态路径：cluster/{shard_id}/write 或 cluster/shards/{shard_id}/status
+            // 处理动态路径：cluster/{shard_id}/write、cluster/{shard_id}/write-batch 或 cluster/shards/{shard_id}/status
+            if let Some(sid_str) = rest.strip_suffix(SUFFIX_WRITE_BATCH)
+                && let Ok(shard_id) = sid_str.parse::<ShardId>()
+            {
+                let res = async {
+                    let reqs: Vec<ReducerCallRequest> = decode_req(&query)?;
+                    write_batch_to_shard(pool, shard_id, reqs).await
+                }
+                .await;
+                reply_bitcode(&query, res).await;
+                return;
+            }
+
             if let Some(sid_str) = rest.strip_suffix(SUFFIX_WRITE)
                 && let Ok(shard_id) = sid_str.parse::<ShardId>()
             {
@@ -519,6 +539,24 @@ async fn write_to_shard(
     Ok(WriteAck {
         log_id: resp.log_id,
     })
+}
+
+/// 批量提交转发来的多条写请求（同一事件循环 tick 内并发入队 `RaftCore`，合并为单次落盘与复制批次）。
+async fn write_batch_to_shard(
+    pool: &RaftPool,
+    shard_id: ShardId,
+    reqs: Vec<ReducerCallRequest>,
+) -> Result<Vec<WriteAck>, String> {
+    let raft = get_shard_raft(pool, shard_id)?;
+    let resps = try_join_all(reqs.into_iter().map(|req| raft.client_write(req)))
+        .await
+        .map_err(err_str)?;
+    Ok(resps
+        .into_iter()
+        .map(|resp| WriteAck {
+            log_id: resp.log_id,
+        })
+        .collect())
 }
 
 /// 本节点视角的集群状态（以分片 0 为准，复用 [`handle_shard_status`] 消除重复提取）。

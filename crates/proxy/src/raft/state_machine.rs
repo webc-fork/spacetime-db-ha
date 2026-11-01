@@ -171,7 +171,10 @@ impl StateMachineStore {
             None => SnapshotData::default(),
         };
         let delivered = match state_ks.get(META_DELIVERED)? {
-            Some(value) => bitcode::decode::<u64>(&value).unwrap_or(0),
+            Some(value) => <[u8; 8]>::try_from(value.as_ref()).map_or_else(
+                |_| bitcode::decode::<u64>(&value).unwrap_or(0),
+                u64::from_le_bytes,
+            ),
             None => 0,
         };
 
@@ -255,7 +258,7 @@ impl StateMachineStore {
         self.shared.delivered.subscribe()
     }
 
-    /// 推进并持久化 `last_delivered` 水位（修复 P0-2）。
+    /// 推进并持久化 `last_delivered` 水位（栈上 8 字节小端序直写，零堆分配，修复 P0-2）。
     pub fn mark_delivered(&self, index: u64) {
         let mut updated = false;
         self.shared.delivered.send_if_modified(|cur| {
@@ -268,8 +271,10 @@ impl StateMachineStore {
             }
         });
         if updated {
-            let bytes = bitcode::encode(&index);
-            let _ = self.shared.state_ks.insert(META_DELIVERED, bytes);
+            let _ = self
+                .shared
+                .state_ks
+                .insert(META_DELIVERED, index.to_le_bytes());
         }
     }
 

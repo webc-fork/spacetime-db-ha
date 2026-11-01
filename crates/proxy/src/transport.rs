@@ -70,6 +70,7 @@ pub const SUB_REMOVE_NODE: &str = "remove-node";
 pub const SUB_LEADER: &str = "leader";
 pub const SUB_HEALTH: &str = "health";
 pub const SUB_WRITE: &str = "write";
+pub const SUB_WRITE_BATCH: &str = "write-batch";
 pub const SUB_SHARDS: &str = "shards";
 pub const SUB_SHARDS_PREFIX: &str = const_str::concat!(SUB_SHARDS, KEY_SEP);
 pub const SUB_SHARDS_CREATE: &str = const_str::concat!(SUB_SHARDS_PREFIX, "create");
@@ -79,6 +80,7 @@ pub const SUB_SHARDS_ROUTE_ADD: &str = const_str::concat!(SUB_SHARDS_ROUTE, "/ad
 pub const SUB_SHARDS_ROUTE_REMOVE: &str = const_str::concat!(SUB_SHARDS_ROUTE, "/remove");
 
 pub const SUFFIX_WRITE: &str = const_str::concat!(KEY_SEP, SUB_WRITE);
+pub const SUFFIX_WRITE_BATCH: &str = const_str::concat!(KEY_SEP, SUB_WRITE_BATCH);
 pub const SUFFIX_STATUS: &str = const_str::concat!(KEY_SEP, SUB_STATUS);
 
 pub const KEY_CLUSTER_STATUS: &str = const_str::concat!(CLUSTER_PREFIX, SUB_STATUS);

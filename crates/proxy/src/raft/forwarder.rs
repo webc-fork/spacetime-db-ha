@@ -21,7 +21,7 @@ use tracing::{info, warn};
 
 use crate::{
     raft::state_machine::{StateMachineStore, WriteReceiver},
-    transport::watch,
+    transport::{ZenohClientPool, watch},
     websocket::handler::{Message, ZenohStdbStream, recv_s2c_message},
 };
 
@@ -58,9 +58,29 @@ pub fn spawn(
     state_machine: Option<StateMachineStore>,
     shutdown_rx: watch::Receiver<bool>,
 ) {
-    runtime::spawn(run_with_state_machine(
+    spawn_pooled(
         node_id,
         stdb_url,
+        ZenohClientPool::new(),
+        write_rx,
+        state_machine,
+        shutdown_rx,
+    );
+}
+
+/// 启动复用节点级 [`ZenohClientPool`] 的分片写转发任务（全库与客户端代理共享同一底层 QUIC 会话）。
+pub fn spawn_pooled(
+    node_id: u64,
+    stdb_url: String,
+    zenoh_pool: ZenohClientPool,
+    write_rx: WriteReceiver,
+    state_machine: Option<StateMachineStore>,
+    shutdown_rx: watch::Receiver<bool>,
+) {
+    runtime::spawn(run_with_pool(
+        node_id,
+        stdb_url,
+        zenoh_pool,
         write_rx,
         state_machine,
         shutdown_rx,
@@ -84,6 +104,26 @@ pub async fn run_with_state_machine(
     stdb_url: String,
     write_rx: WriteReceiver,
     state_machine: Option<StateMachineStore>,
+    shutdown_rx: watch::Receiver<bool>,
+) {
+    run_with_pool(
+        node_id,
+        stdb_url,
+        ZenohClientPool::new(),
+        write_rx,
+        state_machine,
+        shutdown_rx,
+    )
+    .await;
+}
+
+/// 复用指定 [`ZenohClientPool`] 的转发循环：不同数据库按 `db_path` 隔离逻辑流（独立 `conn_id`），共享同一底层 QUIC 会话。
+pub async fn run_with_pool(
+    node_id: u64,
+    stdb_url: String,
+    zenoh_pool: ZenohClientPool,
+    write_rx: WriteReceiver,
+    state_machine: Option<StateMachineStore>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     // db_path -> 该库的有界投递队列。每库一个任务：库内保序，库间并行。
@@ -103,9 +143,10 @@ pub async fn run_with_state_machine(
                 let sender = if let Some(tx) = upstreams.get(&write.db_path) {
                     tx
                 } else {
-                    let tx = connect(
+                    let tx = connect_pooled(
                         stdb_url.clone(),
                         write.db_path.clone(),
+                        zenoh_pool.clone(),
                         state_machine.clone(),
                         shutdown_rx.clone(),
                     );
@@ -132,10 +173,28 @@ pub fn connect(
     state_machine: Option<StateMachineStore>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> UpstreamSender {
+    connect_pooled(
+        stdb_url,
+        db_path,
+        ZenohClientPool::new(),
+        state_machine,
+        shutdown_rx,
+    )
+}
+
+/// 建立复用 [`ZenohClientPool`] 的单库上游投递通道，断线后自动重连。
+pub fn connect_pooled(
+    stdb_url: String,
+    db_path: String,
+    zenoh_pool: ZenohClientPool,
+    state_machine: Option<StateMachineStore>,
+    shutdown_rx: watch::Receiver<bool>,
+) -> UpstreamSender {
     let (tx, rx) = bounded_async(UPSTREAM_QUEUE_CAPACITY);
     runtime::spawn(upstream_task(
         stdb_url,
         db_path,
+        zenoh_pool,
         rx,
         state_machine,
         shutdown_rx,
@@ -144,10 +203,11 @@ pub fn connect(
     tx
 }
 
-/// 单库投递任务：复用 [`ZenohStdbStream`] 建立上游会话并在断线后自动重连，队列里的写在重连后继续发送，不会丢失。
+/// 单库投递任务：复用 [`ZenohStdbStream::connect_pooled`] 建立上游多路流并在断线后自动重连，队列里的写在重连后继续发送，不会丢失。
 async fn upstream_task(
     stdb_url: String,
     db_path: String,
+    zenoh_pool: ZenohClientPool,
     rx: UpstreamReceiver,
     state_machine: Option<StateMachineStore>,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -155,25 +215,29 @@ async fn upstream_task(
     let mut pending: Option<(u64, Message)> = None;
 
     loop {
-        let stream =
-            match ZenohStdbStream::connect_with_timeout(&stdb_url, &db_path, CONNECT_RPC_TIMEOUT)
-                .await
-            {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        stdb_url = %stdb_url,
-                        db_path = %db_path,
-                        "Forwarder: SpacetimeDB Zenoh connect failed, retrying"
-                    );
-                    select! {
-                        _ = sleep(RECONNECT_DELAY).fuse() => {}
-                        _ = shutdown_rx.changed().fuse() => return,
-                    }
-                    continue;
+        let stream = match ZenohStdbStream::connect_pooled(
+            &zenoh_pool,
+            &stdb_url,
+            &db_path,
+            CONNECT_RPC_TIMEOUT,
+        )
+        .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    stdb_url = %stdb_url,
+                    db_path = %db_path,
+                    "Forwarder: SpacetimeDB Zenoh connect failed, retrying"
+                );
+                select! {
+                    _ = sleep(RECONNECT_DELAY).fuse() => {}
+                    _ = shutdown_rx.changed().fuse() => return,
                 }
-            };
+                continue;
+            }
+        };
 
         let (sender, s2c_sub) = stream.split();
         info!(db_path = %db_path, "Forwarder connected to SpacetimeDB over Zenoh QUIC");
@@ -212,6 +276,7 @@ async fn upstream_task(
                 }
                 Err(e) => {
                     warn!(error = %e, "Forwarder: SpacetimeDB send failed, reconnecting");
+                    zenoh_pool.evict(&stdb_url);
                     pending = Some((log_index, msg));
                     break;
                 }

@@ -22,8 +22,8 @@ use crate::{
     router::{DEFAULT_SHARD, ShardId, extract_module_name},
     transport::{
         CrossfireChannel, CrossfireHandler, KEY_STDB_CONNECT, STDB_C2S_PREFIX, STDB_S2C_PREFIX,
-        close_session, decode_query_payload, open_client_session, prefix_u64_key, reply_bitcode,
-        rpc_once, watch::Receiver,
+        ZenohClientPool, close_session, decode_query_payload, open_client_session, prefix_u64_key,
+        reply_bitcode, rpc_once, watch::Receiver,
     },
     websocket::ConnectionGuard,
 };
@@ -169,6 +169,8 @@ pub fn classify_message(msg: &Message) -> MessageKind {
 pub struct ZenohStdbSender {
     session: Session,
     c2s_key: String,
+    /// 是否独占底层 Zenoh 会话；复用连接池时为 `false`，关闭逻辑流时不关闭共享会话。
+    owns_session: bool,
 }
 
 impl ZenohStdbSender {
@@ -182,9 +184,11 @@ impl ZenohStdbSender {
         rpc_once::<Message, ()>(&self.session, &self.c2s_key, msg, timeout).await
     }
 
-    /// 关闭底层 Zenoh 客户端会话。
+    /// 关闭逻辑流；若为独占会话则同时关闭底层 Zenoh 客户端会话。
     pub fn close(&self) {
-        close_session(&self.session);
+        if self.owns_session {
+            close_session(&self.session);
+        }
     }
 }
 
@@ -195,19 +199,14 @@ pub struct ZenohStdbStream {
 }
 
 impl ZenohStdbStream {
-    /// 连接到代理或 SpacetimeDB 的指定数据库路径（使用默认超时）。
-    pub async fn connect(addr: &str, db_path: &str) -> Result<Self> {
-        Self::connect_with_timeout(addr, db_path, STREAM_RPC_TIMEOUT).await
-    }
-
-    /// 按指定握手超时连接到代理或 SpacetimeDB 的指定数据库路径；握手失败时自动关闭底层会话。
-    pub async fn connect_with_timeout(
-        addr: &str,
+    /// 在已打开的 `Session` 上握手建立多路复用逻辑流（按 `stream_id` / `conn_id` 隔离）。
+    async fn open_on_session(
+        session: Session,
         db_path: &str,
         timeout: Duration,
+        owns_session: bool,
     ) -> Result<Self> {
         let stream_id = next_stream_id();
-        let session = open_client_session(addr).await?;
         let s2c_key = prefix_u64_key(STDB_S2C_PREFIX, stream_id);
         let s2c_sub = match session
             .declare_subscriber(&s2c_key)
@@ -216,7 +215,9 @@ impl ZenohStdbStream {
         {
             Ok(sub) => sub,
             Err(e) => {
-                close_session(&session);
+                if owns_session {
+                    close_session(&session);
+                }
                 return Err(anyhow!("Failed to declare s2c subscriber: {e}"));
             }
         };
@@ -229,7 +230,9 @@ impl ZenohStdbStream {
             match rpc_once(&session, KEY_STDB_CONNECT, &req, timeout).await {
                 Ok(r) => r,
                 Err(e) => {
-                    close_session(&session);
+                    if owns_session {
+                        close_session(&session);
+                    }
                     return Err(e);
                 }
             };
@@ -238,9 +241,44 @@ impl ZenohStdbStream {
             sender: ZenohStdbSender {
                 session,
                 c2s_key: prefix_u64_key(STDB_C2S_PREFIX, resp.conn_id),
+                owns_session,
             },
             s2c_sub,
         })
+    }
+
+    /// 连接到代理或 SpacetimeDB 的指定数据库路径（使用默认超时）。
+    pub async fn connect(addr: &str, db_path: &str) -> Result<Self> {
+        Self::connect_with_timeout(addr, db_path, STREAM_RPC_TIMEOUT).await
+    }
+
+    /// 按指定握手超时连接到代理或 SpacetimeDB 的指定数据库路径；握手失败时自动关闭底层会话。
+    pub async fn connect_with_timeout(
+        addr: &str,
+        db_path: &str,
+        timeout: Duration,
+    ) -> Result<Self> {
+        let session = open_client_session(addr).await?;
+        Self::open_on_session(session, db_path, timeout, true).await
+    }
+
+    /// 复用 [`ZenohClientPool`] 中的长生命周期 QUIC 会话建立多路流（仅按 `stream_id` / `conn_id` 隔离，零重复 QUIC 建连开销）。
+    /// 若池中缓存会话已失效，自动驱逐并重连一次。
+    pub async fn connect_pooled(
+        pool: &ZenohClientPool,
+        addr: &str,
+        db_path: &str,
+        timeout: Duration,
+    ) -> Result<Self> {
+        let session = pool.get_or_connect(addr).await?;
+        match Self::open_on_session(session, db_path, timeout, false).await {
+            Ok(stream) => Ok(stream),
+            Err(first_err) => {
+                pool.evict(addr);
+                let session = pool.get_or_connect(addr).await.map_err(|_| first_err)?;
+                Self::open_on_session(session, db_path, timeout, false).await
+            }
+        }
     }
 
     /// 拆分为发送端与订阅接收端，便于读写任务独立持有而无需 `Arc` 共享 `!Sync` 的 `AsyncRx`。
@@ -308,13 +346,18 @@ pub async fn spawn_client_session(
         None => DEFAULT_SHARD,
     };
 
-    // 先建立到上游 SpacetimeDB 的连接，确保握手返回后即可收发
+    // 复用节点级 ZenohClientPool 与本地 SpacetimeDB 建立多路逻辑流，确保握手返回后即可收发
     let stdb_url = &pool.node_config.stdb_url;
-    let upstream = ZenohStdbStream::connect(stdb_url, &request_path)
-        .await
-        .with_context(|| {
-            format!("Failed to connect upstream SpacetimeDB at {stdb_url}{request_path}")
-        })?;
+    let upstream = ZenohStdbStream::connect_pooled(
+        pool.zenoh_pool(),
+        stdb_url,
+        &request_path,
+        STREAM_RPC_TIMEOUT,
+    )
+    .await
+    .with_context(|| {
+        format!("Failed to connect upstream SpacetimeDB at {stdb_url}{request_path}")
+    })?;
     let (upstream_tx, upstream_rx) = upstream.split();
 
     let c2s_key = prefix_u64_key(STDB_C2S_PREFIX, conn_id);

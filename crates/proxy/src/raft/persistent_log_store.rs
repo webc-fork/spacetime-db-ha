@@ -4,6 +4,7 @@ use std::{
     io,
     ops::{Bound, RangeBounds},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use bitcode::{DecodeOwned, Encode};
@@ -12,6 +13,7 @@ use openraft::{
     LogState, OptionalSend, RaftLogReader,
     storage::{IOFlushed, RaftLogStorage},
 };
+use parking_lot::Mutex;
 use tracing::{debug, info};
 
 use crate::{
@@ -46,6 +48,13 @@ fn to_be_bounds<RB: RangeBounds<u64>>(range: &RB) -> (Bound<[u8; 8]>, Bound<[u8;
     )
 }
 
+/// 内存缓存的日志边界状态，消除 `get_log_state` 每次从磁盘读取并反序列化末尾条目的开销。
+#[derive(Clone, Copy, Default)]
+struct LogStateCache {
+    last_purged: Option<RaftLogId>,
+    last_log_id: Option<RaftLogId>,
+}
+
 /// fjall 支撑的持久化日志存储（纯 Rust LSM-tree、跨 Keyspace 原子批量提交）。
 ///
 /// 每个分片一个数据库目录：`{data_dir}/shard-{shard_id}/fjall`。
@@ -54,6 +63,7 @@ pub struct PersistentLogStore {
     db: Database,
     log_ks: Keyspace,
     meta_ks: Keyspace,
+    cache: Arc<Mutex<LogStateCache>>,
 }
 
 impl PersistentLogStore {
@@ -70,12 +80,26 @@ impl PersistentLogStore {
         let log_ks = db.keyspace(LOG_KEYSPACE, KeyspaceCreateOptions::default)?;
         let meta_ks = db.keyspace(META_KEYSPACE, KeyspaceCreateOptions::default)?;
 
-        debug!(path = %db_path.display(), shard_id, "Persistent fjall log store opened");
-        Ok(Self {
+        let store = Self {
             db,
             log_ks,
             meta_ks,
-        })
+            cache: Arc::new(Mutex::new(LogStateCache::default())),
+        };
+        let last_purged = store
+            .read_meta::<WireLogId>(META_LAST_PURGED)?
+            .map(RaftLogId::from);
+        let last_log_id = store
+            .last_entry()?
+            .map(|entry| entry.log_id)
+            .or(last_purged);
+        *store.cache.lock() = LogStateCache {
+            last_purged,
+            last_log_id,
+        };
+
+        debug!(path = %db_path.display(), shard_id, "Persistent fjall log store opened");
+        Ok(store)
     }
 
     /// 返回底层 `fjall::Database` 引用，供同分片状态机共享同一数据库实例（修复 P2-10）。
@@ -83,11 +107,9 @@ impl PersistentLogStore {
         &self.db
     }
 
-    /// 读取当前记录的 `last_purged` 水位。
+    /// 读取当前记录的 `last_purged` 水位（O(1) 内存缓存读取）。
     pub fn last_purged_log_id(&self) -> Result<Option<RaftLogId>, StoreError> {
-        Ok(self
-            .read_meta::<WireLogId>(META_LAST_PURGED)?
-            .map(RaftLogId::from))
+        Ok(self.cache.lock().last_purged)
     }
 
     /// 按闭区间读取日志条目，用于启动时重放 `(last_delivered, last_applied]`（修复 P0-2）。
@@ -120,12 +142,17 @@ impl PersistentLogStore {
         entries: impl IntoIterator<Item = RaftEntry>,
     ) -> Result<(), StoreError> {
         let mut batch = self.db.batch();
+        let mut last_log_id = None;
         for entry in entries {
-            let index = entry.log_id.index;
+            let log_id = entry.log_id;
+            last_log_id = Some(log_id);
             let bytes = bitcode::encode(&WireEntry::from(entry));
-            batch.insert(&self.log_ks, index.to_be_bytes(), bytes);
+            batch.insert(&self.log_ks, log_id.index.to_be_bytes(), bytes);
         }
         batch.commit()?;
+        if let Some(log_id) = last_log_id {
+            self.cache.lock().last_log_id = Some(log_id);
+        }
         Ok(())
     }
 
@@ -192,17 +219,10 @@ impl RaftLogStorage<C> for PersistentLogStore {
     type LogReader = Self;
 
     async fn get_log_state(&mut self) -> Result<LogState<C>, io::Error> {
-        let last_purged = self.last_purged_log_id().map_err(storage_io_err)?;
-        let last_log_id = self
-            .last_entry()
-            .map_err(storage_io_err)?
-            .map(|entry| entry.log_id)
-            // 日志全部被 purge 后，最后一条日志就是 last_purged，否则 openraft 会认为状态回退
-            .or(last_purged);
-
+        let cache = *self.cache.lock();
         Ok(LogState {
-            last_purged_log_id: last_purged,
-            last_log_id,
+            last_purged_log_id: cache.last_purged,
+            last_log_id: cache.last_log_id,
         })
     }
 
@@ -233,6 +253,8 @@ impl RaftLogStorage<C> for PersistentLogStore {
             batch.remove(&self.log_ks, key);
         }
         batch.commit().map_err(storage_io_err)?;
+        let mut cache = self.cache.lock();
+        cache.last_log_id = last_log_id.or(cache.last_purged);
         Ok(())
     }
 
@@ -247,6 +269,14 @@ impl RaftLogStorage<C> for PersistentLogStore {
         let bytes = bitcode::encode(&WireLogId::from(log_id));
         batch.insert(&self.meta_ks, META_LAST_PURGED, bytes);
         batch.commit().map_err(storage_io_err)?;
+        let mut cache = self.cache.lock();
+        cache.last_purged = Some(log_id);
+        if cache
+            .last_log_id
+            .is_none_or(|last| last.index <= log_id.index)
+        {
+            cache.last_log_id = Some(log_id);
+        }
         Ok(())
     }
 }
