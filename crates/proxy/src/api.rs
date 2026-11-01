@@ -4,6 +4,7 @@
 use std::{collections::BTreeMap, fmt::Display, io::Cursor, rc::Rc};
 
 use anyhow::{Result, anyhow};
+use askama::Template;
 use bitcode::{Decode, DecodeOwned, Encode};
 use compio::{
     BufResult,
@@ -13,7 +14,6 @@ use compio::{
 };
 use futures::{FutureExt, select};
 use gxhash::HashMap;
-use itoa::Buffer as ItoaBuffer;
 use openraft::{
     BasicNode, ReadPolicy, ServerState, Snapshot,
     async_runtime::watch::WatchReceiver,
@@ -63,7 +63,6 @@ const CRLF: &str = "\r\n";
 /// HTTP 状态码短语。
 const STATUS_200: &str = "200 OK";
 const STATUS_404: &str = "404 Not Found";
-const STATUS_503: &str = "503 Service Unavailable";
 
 /// 公共 HTTP 响应头片段。
 const HDR_CONTENT_TYPE_JSON: &str =
@@ -77,9 +76,6 @@ const HTTP_200_JSON_PREFIX: &str =
 /// 编译期静态 HTTP 404 JSON 响应头前缀。
 const HTTP_404_JSON_PREFIX: &str =
     const_str::concat!(HTTP_VER, STATUS_404, HDR_CONTENT_TYPE_JSON, HDR_CONTENT_LEN);
-/// 编译期静态 HTTP 503 JSON 响应头前缀。
-const HTTP_503_JSON_PREFIX: &str =
-    const_str::concat!(HTTP_VER, STATUS_503, HDR_CONTENT_TYPE_JSON, HDR_CONTENT_LEN);
 
 /// 编译期静态健康检查 200 JSON 响应体与完整报文（自动在编译期计算 Content-Length，零堆分配）。
 const HEALTH_OK_BODY: &str = r#"{"status":"healthy"}"#;
@@ -90,9 +86,8 @@ const HTTP_200_HEALTH_RESP: &[u8] = const_str::concat_bytes!(
     HEALTH_OK_BODY
 );
 
-/// 编译期静态健康检查 503 JSON 响应体前缀与后缀。
-const HEALTH_ERR_PREFIX: &str = r#"{"status":"unhealthy","error":""#;
-const HEALTH_ERR_SUFFIX: &str = r#""}"#;
+/// 编译期静态健康检查 503 JSON 响应体固定包装长度（`{"status":"unhealthy","error":""}`）。
+const HEALTH_ERR_WRAP_LEN: usize = r#"{"status":"unhealthy","error":""}"#.len();
 
 /// 编译期静态 404 JSON 响应体与完整报文（自动在编译期计算 Content-Length，零堆分配）。
 const NOT_FOUND_BODY: &str = r#"{"error":"not found"}"#;
@@ -107,6 +102,13 @@ const HTTP_404_JSON_RESP: &[u8] = const_str::concat_bytes!(
 const REQ_GET_PREFIX: &str = "GET /";
 const REQ_GET_METRICS: &[u8] = const_str::concat_bytes!(REQ_GET_PREFIX, KEY_METRICS);
 const REQ_GET_HEALTH: &[u8] = const_str::concat_bytes!(REQ_GET_PREFIX, KEY_CLUSTER_HEALTH);
+
+/// 校验 HTTP 请求行是否精确匹配指定路径前缀（后跟空格、查询参数 `?` 或尾部 `/`）。
+#[inline]
+fn matches_get_path(head: &[u8], prefix: &[u8]) -> bool {
+    head.strip_prefix(prefix)
+        .is_some_and(|rest| matches!(rest.first(), Some(b' ' | b'?' | b'/')))
+}
 
 /// 取指定分片的 Raft 实例。
 fn get_shard_raft(pool: &RaftPool, shard_id: ShardId) -> Result<ShardRaft, String> {
@@ -531,39 +533,29 @@ async fn write_to_shard(
     })
 }
 
-/// 本节点视角的集群状态（以分片 0 为准）。
+/// 本节点视角的集群状态（以分片 0 为准，复用 [`handle_shard_status`] 消除重复提取）。
 pub fn handle_cluster_status(pool: &RaftPool) -> Result<ClusterStatus, String> {
-    let raft = get_default_raft(pool)?;
-    let active_shards = pool.list_shards();
-    let metrics_rx = raft.metrics();
-    let status = metrics_rx.borrow_watched();
-
+    let status = handle_shard_status(pool, DEFAULT_SHARD)?;
     Ok(ClusterStatus {
         node_id: pool.node_config.node_id,
-        state: server_state_str(status.state).to_owned(),
+        state: status.state,
         current_leader: status.current_leader,
-        current_term: leader_term(&status.vote),
-        last_applied: status.last_applied.map(|id| id.to_string()),
-        membership: format!("{:?}", status.membership_config),
-        active_shards,
+        current_term: status.current_term,
+        last_applied: status.last_applied,
+        membership: status.membership,
+        active_shards: pool.list_shards(),
     })
 }
 
-/// 当前 leader（分片 0）。
+/// 当前 leader（分片 0，复用 [`RaftPool::current_leader`] 消除地址解析重复）。
 pub fn handle_cluster_leader(pool: &RaftPool) -> Result<LeaderInfo, String> {
-    let raft = get_default_raft(pool)?;
-    let metrics_rx = raft.metrics();
-    let metrics = metrics_rx.borrow_watched();
-    let leader_id = metrics.current_leader;
+    let _ = get_default_raft(pool)?;
     let node_id = pool.node_config.node_id;
-    let leader_addr = leader_id.filter(|&id| id != node_id).and_then(|id| {
-        metrics
-            .membership_config
-            .membership()
-            .get_node(&id)
-            .map(|n| n.addr.clone())
-            .or_else(|| pool.peers.get(&id).map(|node| node.addr.clone()))
-    });
+    let current = pool.current_leader(DEFAULT_SHARD);
+    let leader_id = current.as_ref().map(|&(id, _)| id);
+    let leader_addr = current
+        .filter(|&(id, _)| id != node_id)
+        .map(|(_, addr)| addr);
 
     Ok(LeaderInfo {
         leader_id,
@@ -630,38 +622,28 @@ async fn propose_config(pool: &RaftPool, cmd: ShardConfigCommand) -> Result<(), 
 }
 
 // ============================================================================
-// 基于 compio + const &str 的最小开销 HTTP JSON `/metrics` 响应器
+// 基于 compio + askama::Template + const_str 的最小开销 HTTP JSON `/metrics` 响应器
 // ============================================================================
 
-/// 用编译期 `const &str` HTTP 头前缀与 `itoa` 栈缓冲拼装完整 HTTP JSON 响应帧。
-fn build_http_json_response(header_prefix: &str, json_body: &str) -> Vec<u8> {
-    let mut ibuf = ItoaBuffer::new();
-    let len_str = ibuf.format(json_body.len());
-    let mut resp = Vec::with_capacity(
-        header_prefix.len() + len_str.len() + HTTP_HEADER_END.len() + json_body.len(),
-    );
-    resp.extend_from_slice(header_prefix.as_bytes());
-    resp.extend_from_slice(len_str.as_bytes());
-    resp.extend_from_slice(HTTP_HEADER_END.as_bytes());
-    resp.extend_from_slice(json_body.as_bytes());
-    resp
+/// 动态 HTTP 200 JSON 响应编译期模板（用于 `/metrics` 导出）。
+#[derive(Template)]
+#[template(
+    source = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {{ body.len() }}\r\nConnection: close\r\n\r\n{{ body }}",
+    ext = "txt"
+)]
+struct Http200JsonTemplate<'a> {
+    body: &'a str,
 }
 
-/// 单次预分配拼装 503 健康检查错误 JSON 响应帧（消除中间 `String` 分配）。
-fn build_http_503_health_response(msg: &str) -> Vec<u8> {
-    let body_len = HEALTH_ERR_PREFIX.len() + msg.len() + HEALTH_ERR_SUFFIX.len();
-    let mut ibuf = ItoaBuffer::new();
-    let len_str = ibuf.format(body_len);
-    let mut resp = Vec::with_capacity(
-        HTTP_503_JSON_PREFIX.len() + len_str.len() + HTTP_HEADER_END.len() + body_len,
-    );
-    resp.extend_from_slice(HTTP_503_JSON_PREFIX.as_bytes());
-    resp.extend_from_slice(len_str.as_bytes());
-    resp.extend_from_slice(HTTP_HEADER_END.as_bytes());
-    resp.extend_from_slice(HEALTH_ERR_PREFIX.as_bytes());
-    resp.extend_from_slice(msg.as_bytes());
-    resp.extend_from_slice(HEALTH_ERR_SUFFIX.as_bytes());
-    resp
+/// 动态 HTTP 503 健康检查错误 JSON 响应编译期模板（单次渲染完整 HTTP 报文 + JSON 体）。
+#[derive(Template)]
+#[template(
+    source = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {{ body_len }}\r\nConnection: close\r\n\r\n{\"status\":\"unhealthy\",\"error\":\"{{ msg }}\"}",
+    ext = "txt"
+)]
+struct Http503HealthTemplate<'a> {
+    body_len: usize,
+    msg: &'a str,
 }
 
 /// 在给定 `compio::net::TcpListener` 上响应 HTTP JSON `GET /metrics` 与 `GET /cluster/health`。
@@ -681,19 +663,26 @@ pub async fn serve_metrics_tcp(
                     };
                     let head = &buf[..n];
 
-                    if head.starts_with(REQ_GET_METRICS) {
+                    if matches_get_path(head, REQ_GET_METRICS) {
                         pool.update_metrics();
                         let body = metrics::encode_metrics();
-                        let resp = build_http_json_response(HTTP_200_JSON_PREFIX, &body);
-                        let _ = stream.write_all(resp).await;
-                    } else if head.starts_with(REQ_GET_HEALTH) {
+                        let resp = Http200JsonTemplate { body: &body }
+                            .render()
+                            .unwrap_or_default();
+                        let _ = stream.write_all(resp.into_bytes()).await;
+                    } else if matches_get_path(head, REQ_GET_HEALTH) {
                         match handle_cluster_health(&pool).await {
                             Ok(_) => {
                                 let _ = stream.write_all(HTTP_200_HEALTH_RESP).await;
                             }
                             Err(msg) => {
-                                let resp = build_http_503_health_response(&msg);
-                                let _ = stream.write_all(resp).await;
+                                let resp = Http503HealthTemplate {
+                                    body_len: HEALTH_ERR_WRAP_LEN + msg.len(),
+                                    msg: &msg,
+                                }
+                                .render()
+                                .unwrap_or_default();
+                                let _ = stream.write_all(resp.into_bytes()).await;
                             }
                         }
                     } else {

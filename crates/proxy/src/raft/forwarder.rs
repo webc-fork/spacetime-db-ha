@@ -21,11 +21,8 @@ use tracing::{info, warn};
 
 use crate::{
     raft::state_machine::{StateMachineStore, WriteReceiver},
-    transport::{
-        CrossfireChannel, KEY_STDB_CONNECT, STDB_C2S_PREFIX, STDB_S2C_PREFIX, close_session,
-        open_client_session, prefix_u64_key, rpc_once, watch,
-    },
-    websocket::handler::{Message, StdbConnectRequest, StdbConnectResponse},
+    transport::watch,
+    websocket::handler::{Message, ZenohStdbStream, recv_s2c_message},
 };
 
 /// 上游连接失败后的重试间隔。
@@ -147,7 +144,7 @@ pub fn connect(
     tx
 }
 
-/// 单库投递任务：基于 Zenoh 明文 QUIC 断线重连，队列里的写在重连后继续发送，不会丢失。
+/// 单库投递任务：复用 [`ZenohStdbStream`] 建立上游会话并在断线后自动重连，队列里的写在重连后继续发送，不会丢失。
 async fn upstream_task(
     stdb_url: String,
     db_path: String,
@@ -158,55 +155,28 @@ async fn upstream_task(
     let mut pending: Option<(u64, Message)> = None;
 
     loop {
-        let stream_id = next_stream_id();
-        let session = match open_client_session(&stdb_url).await {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(error = %e, stdb_url = %stdb_url, "Forwarder: SpacetimeDB Zenoh connect failed, retrying");
-                select! {
-                    _ = sleep(RECONNECT_DELAY).fuse() => {}
-                    _ = shutdown_rx.changed().fuse() => return,
+        let stream =
+            match ZenohStdbStream::connect_with_timeout(&stdb_url, &db_path, CONNECT_RPC_TIMEOUT)
+                .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        stdb_url = %stdb_url,
+                        db_path = %db_path,
+                        "Forwarder: SpacetimeDB Zenoh connect failed, retrying"
+                    );
+                    select! {
+                        _ = sleep(RECONNECT_DELAY).fuse() => {}
+                        _ = shutdown_rx.changed().fuse() => return,
+                    }
+                    continue;
                 }
-                continue;
-            }
-        };
+            };
 
-        let s2c_key = prefix_u64_key(STDB_S2C_PREFIX, stream_id);
-        let Ok(s2c_sub) = session
-            .declare_subscriber(&s2c_key)
-            .with(CrossfireChannel::new())
-            .await
-        else {
-            close_session(&session);
-            continue;
-        };
-
-        let req = StdbConnectRequest {
-            stream_id,
-            db_path: db_path.clone(),
-        };
-        let conn_resp: StdbConnectResponse = match rpc_once(
-            &session,
-            KEY_STDB_CONNECT,
-            &req,
-            CONNECT_RPC_TIMEOUT,
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(error = %e, db_path = %db_path, "Forwarder: stdb/connect handshake failed, retrying");
-                close_session(&session);
-                select! {
-                    _ = sleep(RECONNECT_DELAY).fuse() => {}
-                    _ = shutdown_rx.changed().fuse() => return,
-                }
-                continue;
-            }
-        };
-
-        let c2s_key = prefix_u64_key(STDB_C2S_PREFIX, conn_resp.conn_id);
-        info!(db_path = %db_path, conn_id = conn_resp.conn_id, "Forwarder connected to SpacetimeDB over Zenoh QUIC");
+        let (sender, s2c_sub) = stream.split();
+        info!(db_path = %db_path, "Forwarder connected to SpacetimeDB over Zenoh QUIC");
 
         loop {
             let next_item = if let Some(item) = pending.take() {
@@ -214,31 +184,25 @@ async fn upstream_task(
             } else {
                 select! {
                     item = rx.recv().fuse() => item.ok(),
-                    incoming = s2c_sub.recv().fuse() => {
+                    incoming = recv_s2c_message(&s2c_sub).fuse() => {
                         match incoming {
-                            Ok(sample) => {
-                                let bytes = sample.payload().to_bytes();
-                                if let Ok(Message::Close(_)) = bitcode::decode::<Message>(&bytes) {
-                                    break;
-                                }
-                                continue;
-                            }
-                            Err(_) => break,
+                            Ok(Some(Message::Close(_)) | None) | Err(_) => break,
+                            Ok(Some(_)) => continue,
                         }
                     }
                     _ = shutdown_rx.changed().fuse() => {
-                        close_session(&session);
+                        sender.close();
                         return;
                     }
                 }
             };
 
             let Some((log_index, msg)) = next_item else {
-                close_session(&session);
+                sender.close();
                 return;
             };
 
-            match rpc_once::<Message, ()>(&session, &c2s_key, &msg, SEND_RPC_TIMEOUT).await {
+            match sender.send_with_timeout(&msg, SEND_RPC_TIMEOUT).await {
                 Ok(()) => {
                     if let Some(sm) = &state_machine
                         && log_index > 0
@@ -254,6 +218,6 @@ async fn upstream_task(
             }
         }
 
-        close_session(&session);
+        sender.close();
     }
 }

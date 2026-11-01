@@ -15,6 +15,7 @@ use spacetime_db_ha::{
         AddNodeRequest, AddRouteRequest, ClusterStatus, CreateShardRequest, RemoveNodeRequest,
         RemoveRouteRequest, RemoveShardRequest, ShardListResponse, ShardStatusResponse,
     },
+    raft::parse_peer_spec,
     transport::{
         KEY_CLUSTER_ADD_NODE, KEY_CLUSTER_INIT, KEY_CLUSTER_REMOVE_NODE, KEY_CLUSTER_SHARDS,
         KEY_CLUSTER_SHARDS_PREFIX, KEY_CLUSTER_STATUS, KEY_SHARDS_CREATE, KEY_SHARDS_REMOVE,
@@ -205,19 +206,10 @@ async fn main() -> Result<()> {
             let mut first_addr: Option<String> = None;
 
             for node_spec in nodes {
-                let (id_str, addr) = node_spec.split_once('=').with_context(|| {
-                    format!("Invalid node format '{node_spec}', expected 'id=host:port'")
-                })?;
-
-                let id: u64 = id_str
-                    .parse()
-                    .with_context(|| format!("Invalid node ID '{id_str}'"))?;
-
-                let clean_addr = normalize_addr(addr, true);
+                let (id, clean_addr) = parse_peer_spec(node_spec)?;
                 if first_addr.is_none() {
                     first_addr = Some(clean_addr.clone());
                 }
-
                 members.insert(id, clean_addr);
             }
 

@@ -420,13 +420,23 @@ where
     Resp: DecodeOwned,
 {
     let payload = bitcode::encode(req);
+    rpc_payload_once(session, key_expr, &payload, timeout).await
+}
+
+/// 使用已编码的 `bitcode` 字节切片在客户端会话上发起查询（重连重试时可复用同一份编码结果，避免重复序列化）。
+async fn rpc_payload_once<Resp: DecodeOwned>(
+    session: &Session,
+    key_expr: &str,
+    payload: &[u8],
+    timeout: Duration,
+) -> Result<Resp> {
     for attempt in 0..5 {
         if attempt > 0 {
             sleep(RETRY_BACKOFF).await;
         }
         let replies = session
             .get(key_expr)
-            .payload(ZBytes::from(payload.as_slice()))
+            .payload(ZBytes::from(payload))
             .timeout(timeout)
             .with(CrossfireChannel::with_capacity(RPC_REPLY_CAPACITY))
             .await
@@ -508,7 +518,7 @@ impl ZenohClientPool {
             .await
     }
 
-    /// 带超时配置的 `bitcode` RPC 调用。
+    /// 带超时配置的 `bitcode` RPC 调用（单次编码，断线重连时直接复用同一份 `payload`）。
     pub async fn rpc_with_timeout<Req, Resp>(
         &self,
         target_addr: &str,
@@ -520,8 +530,9 @@ impl ZenohClientPool {
         Req: Encode,
         Resp: DecodeOwned,
     {
+        let payload = bitcode::encode(req);
         let session = self.get_or_connect(target_addr).await?;
-        match rpc_once(&session, key_expr, req, timeout).await {
+        match rpc_payload_once(&session, key_expr, &payload, timeout).await {
             Ok(resp) => Ok(resp),
             Err(first_err) => {
                 // 若因远端刚注册 queryable 或连接中断导致无响应，短暂等待后重试一次
@@ -531,7 +542,7 @@ impl ZenohClientPool {
                     Ok(s) => s,
                     Err(_) => bail!("{first_err}"),
                 };
-                rpc_once(&session, key_expr, req, timeout).await
+                rpc_payload_once(&session, key_expr, &payload, timeout).await
             }
         }
     }

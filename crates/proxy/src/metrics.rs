@@ -1,14 +1,14 @@
-//! 基于 Rust 标准库原子类型与编译期 `const &str` 静态片段实现的零锁最小开销 JSON 指标收集与导出器。
+//! 基于 Rust 标准库原子类型与 `askama::Template` 编译期模板实现的零锁最小开销 JSON 指标收集与导出器。
 //!
 //! 所有指标均为 `const` 构造的静态实例，不依赖 `lazy_static`、`LazyLock` 或 `serde_json`；
-//! 导出 JSON 时通过编译期静态字符串片段拼接 + `itoa` / `zmij` 栈上缓冲直接写入单次预分配 `String`。
+//! 导出 JSON 时通过 `askama::Template` 编译期静态模板 + `zmij` 栈上浮点格式化直接渲染为单次预分配 `String`。
 
 use std::{
     sync::atomic::{AtomicI64, AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
-use itoa::Buffer as ItoaBuffer;
+use askama::Template;
 use zmij::Buffer as ZmijBuffer;
 
 /// 直方图分桶数量。
@@ -34,110 +34,25 @@ const fn ms_array_to_nanos<const N: usize>(ms: [u64; N]) -> [u64; N] {
 /// 写操作延迟直方图桶上界（纳秒，编译期由 `ms_array_to_nanos` 计算）。
 const LATENCY_BUCKETS_NANOS: [u64; BUCKET_COUNT] = ms_array_to_nanos(LATENCY_BUCKETS_MS);
 
-// ============================================================================
-// 编译期公共 JSON 指标键名与结构片段（基于 const_str 组合）
-// ============================================================================
-
-/// 指标公共命名空间前缀。
-const METRIC_NS: &str = "spacetime_db_ha_";
-/// JSON 首键定界符。
-const JSON_FIRST_KEY_START: &str = "{\"";
-/// JSON 后续键定界符。
-const JSON_NEXT_KEY_START: &str = ",\"";
-/// JSON 键名结束定界符。
-const JSON_KEY_END: &str = "\":";
-
-/// 编译期静态 JSON 键名前缀片段（零运行时转义或反射开销）。
-const JSON_P0: &str =
-    const_str::concat!(JSON_FIRST_KEY_START, METRIC_NS, "raft_term", JSON_KEY_END);
-const JSON_P1: &str = const_str::concat!(
-    JSON_NEXT_KEY_START,
-    METRIC_NS,
-    "raft_is_leader",
-    JSON_KEY_END
-);
-const JSON_P2: &str = const_str::concat!(
-    JSON_NEXT_KEY_START,
-    METRIC_NS,
-    "shards_active",
-    JSON_KEY_END
-);
-const JSON_P3: &str = const_str::concat!(
-    JSON_NEXT_KEY_START,
-    METRIC_NS,
-    "delivery_lag_entries",
-    JSON_KEY_END
-);
-const JSON_P4: &str = const_str::concat!(
-    JSON_NEXT_KEY_START,
-    METRIC_NS,
-    "connections_active",
-    JSON_KEY_END
-);
-const JSON_P5: &str =
-    const_str::concat!(JSON_NEXT_KEY_START, METRIC_NS, "writes_total", JSON_KEY_END);
-const JSON_P6: &str =
-    const_str::concat!(JSON_NEXT_KEY_START, METRIC_NS, "reads_total", JSON_KEY_END);
-const JSON_P7: &str = const_str::concat!(
-    JSON_NEXT_KEY_START,
-    METRIC_NS,
-    "write_latency_seconds",
-    JSON_KEY_END,
-    JSON_FIRST_KEY_START,
-    "buckets",
-    JSON_KEY_END
-);
-
-/// 编译期静态直方图分桶 JSON 键名片段。
-const JSON_BUCKET_PREFIXES: [&str; BUCKET_COUNT] = [
-    const_str::concat!(JSON_FIRST_KEY_START, "0.001", JSON_KEY_END),
-    const_str::concat!(JSON_NEXT_KEY_START, "0.005", JSON_KEY_END),
-    const_str::concat!(JSON_NEXT_KEY_START, "0.01", JSON_KEY_END),
-    const_str::concat!(JSON_NEXT_KEY_START, "0.025", JSON_KEY_END),
-    const_str::concat!(JSON_NEXT_KEY_START, "0.05", JSON_KEY_END),
-    const_str::concat!(JSON_NEXT_KEY_START, "0.1", JSON_KEY_END),
-    const_str::concat!(JSON_NEXT_KEY_START, "0.25", JSON_KEY_END),
-    const_str::concat!(JSON_NEXT_KEY_START, "0.5", JSON_KEY_END),
-    const_str::concat!(JSON_NEXT_KEY_START, "1.0", JSON_KEY_END),
-];
-
-const JSON_BUCKET_INF: &str = const_str::concat!(JSON_NEXT_KEY_START, "+Inf", JSON_KEY_END);
-const JSON_SUM: &str = const_str::concat!("}", JSON_NEXT_KEY_START, "sum", JSON_KEY_END);
-const JSON_COUNT: &str = const_str::concat!(JSON_NEXT_KEY_START, "count", JSON_KEY_END);
-const JSON_ENTRIES_APPLIED: &str = const_str::concat!(
-    "}",
-    JSON_NEXT_KEY_START,
-    METRIC_NS,
-    "entries_applied_total",
-    JSON_KEY_END
-);
-const JSON_SUFFIX: &str = "}";
-
-/// 编译期计算全部静态 JSON 键名片段的总字节长度。
-const JSON_STATIC_LEN: usize = {
-    let mut len = JSON_P0.len()
-        + JSON_P1.len()
-        + JSON_P2.len()
-        + JSON_P3.len()
-        + JSON_P4.len()
-        + JSON_P5.len()
-        + JSON_P6.len()
-        + JSON_P7.len()
-        + JSON_BUCKET_INF.len()
-        + JSON_SUM.len()
-        + JSON_COUNT.len()
-        + JSON_ENTRIES_APPLIED.len()
-        + JSON_SUFFIX.len();
-    let mut i = 0;
-    while i < BUCKET_COUNT {
-        len += JSON_BUCKET_PREFIXES[i].len();
-        i += 1;
-    }
-    len
-};
-
-/// JSON 指标导出预分配容量（编译期由静态键长 + 20 个数值的最大字符长度向上取整至 2 的幂计算）。
-const METRICS_BUF_CAPACITY: usize = (JSON_STATIC_LEN + 20 * 20).next_power_of_two();
+/// 编译期预编译的指标 JSON 导出模板（由 `askama` 在编译期展开为定长缓冲预分配与静态切片直写）。
+#[derive(Template)]
+#[template(
+    source = r#"{"spacetime_db_ha_raft_term":{{ raft_term }},"spacetime_db_ha_raft_is_leader":{{ raft_is_leader }},"spacetime_db_ha_shards_active":{{ shards_active }},"spacetime_db_ha_delivery_lag_entries":{{ delivery_lag }},"spacetime_db_ha_connections_active":{{ connections_active }},"spacetime_db_ha_writes_total":{{ writes_total }},"spacetime_db_ha_reads_total":{{ reads_total }},"spacetime_db_ha_write_latency_seconds":{"buckets":{"0.001":{{ buckets[0] }},"0.005":{{ buckets[1] }},"0.01":{{ buckets[2] }},"0.025":{{ buckets[3] }},"0.05":{{ buckets[4] }},"0.1":{{ buckets[5] }},"0.25":{{ buckets[6] }},"0.5":{{ buckets[7] }},"1.0":{{ buckets[8] }},"+Inf":{{ count }}},"sum":{{ sum_secs }},"count":{{ count }}},"spacetime_db_ha_entries_applied_total":{{ entries_applied }}}"#,
+    ext = "txt"
+)]
+struct MetricsJsonTemplate<'a> {
+    raft_term: i64,
+    raft_is_leader: i64,
+    shards_active: i64,
+    delivery_lag: i64,
+    connections_active: i64,
+    writes_total: u64,
+    reads_total: u64,
+    buckets: [u64; BUCKET_COUNT],
+    count: u64,
+    sum_secs: &'a str,
+    entries_applied: u64,
+}
 
 /// 无锁整型 Gauge 指标。
 pub struct IntGauge {
@@ -272,46 +187,30 @@ pub static READS_TOTAL: IntCounter = IntCounter::new();
 pub static WRITE_LATENCY: Histogram = Histogram::new();
 pub static ENTRIES_APPLIED: IntCounter = IntCounter::new();
 
-/// 导出所有指标为最小开销 JSON 字符串（编译期 `const &str` 静态片段 + `itoa` + `zmij`）。
+/// 导出所有指标为最小开销 JSON 字符串（基于 `askama::Template` 编译期模板 + `zmij`）。
 pub fn encode_metrics() -> String {
-    let mut out = String::with_capacity(METRICS_BUF_CAPACITY);
-    let mut ibuf = ItoaBuffer::new();
-    let mut fbuf = ZmijBuffer::new();
-
-    out.push_str(JSON_P0);
-    out.push_str(ibuf.format(RAFT_TERM.get()));
-    out.push_str(JSON_P1);
-    out.push_str(ibuf.format(RAFT_IS_LEADER.get()));
-    out.push_str(JSON_P2);
-    out.push_str(ibuf.format(SHARDS_ACTIVE.get()));
-    out.push_str(JSON_P3);
-    out.push_str(ibuf.format(DELIVERY_LAG.get()));
-    out.push_str(JSON_P4);
-    out.push_str(ibuf.format(CONNECTIONS_ACTIVE.get()));
-    out.push_str(JSON_P5);
-    out.push_str(ibuf.format(WRITES_TOTAL.get()));
-    out.push_str(JSON_P6);
-    out.push_str(ibuf.format(READS_TOTAL.get()));
-    out.push_str(JSON_P7);
-
+    let mut buckets = [0u64; BUCKET_COUNT];
     let mut cumulative: u64 = 0;
-    for (bucket, prefix) in WRITE_LATENCY.buckets.iter().zip(&JSON_BUCKET_PREFIXES) {
-        cumulative += bucket.load(Ordering::Relaxed);
-        out.push_str(prefix);
-        out.push_str(ibuf.format(cumulative));
+    for (dst, src) in buckets.iter_mut().zip(&WRITE_LATENCY.buckets) {
+        cumulative += src.load(Ordering::Relaxed);
+        *dst = cumulative;
     }
     let count = WRITE_LATENCY.count.load(Ordering::Relaxed).max(cumulative);
-    out.push_str(JSON_BUCKET_INF);
-    out.push_str(ibuf.format(count));
+    let sum_secs_val = WRITE_LATENCY.sum_nanos.load(Ordering::Relaxed) as f64 / NANOS_PER_SEC;
 
-    let sum_secs = WRITE_LATENCY.sum_nanos.load(Ordering::Relaxed) as f64 / NANOS_PER_SEC;
-    out.push_str(JSON_SUM);
-    out.push_str(fbuf.format(sum_secs));
-    out.push_str(JSON_COUNT);
-    out.push_str(ibuf.format(count));
-    out.push_str(JSON_ENTRIES_APPLIED);
-    out.push_str(ibuf.format(ENTRIES_APPLIED.get()));
-    out.push_str(JSON_SUFFIX);
-
-    out
+    let mut fbuf = ZmijBuffer::new();
+    let tpl = MetricsJsonTemplate {
+        raft_term: RAFT_TERM.get(),
+        raft_is_leader: RAFT_IS_LEADER.get(),
+        shards_active: SHARDS_ACTIVE.get(),
+        delivery_lag: DELIVERY_LAG.get(),
+        connections_active: CONNECTIONS_ACTIVE.get(),
+        writes_total: WRITES_TOTAL.get(),
+        reads_total: READS_TOTAL.get(),
+        buckets,
+        count,
+        sum_secs: fbuf.format(sum_secs_val),
+        entries_applied: ENTRIES_APPLIED.get(),
+    };
+    tpl.render().unwrap_or_default()
 }

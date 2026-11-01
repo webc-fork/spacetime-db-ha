@@ -16,7 +16,7 @@ use compio::{
 use futures::{FutureExt, select};
 use gxhash::{HashMap, HashMapExt};
 use openraft::{
-    BasicNode, Config, Raft, ReadPolicy,
+    BasicNode, Config, Membership, Raft, ReadPolicy,
     async_runtime::watch::WatchReceiver,
     entry::EntryPayload,
     error::{ClientWriteError, RaftError},
@@ -35,7 +35,7 @@ use crate::{
         },
         types::{RaftLogId, ReducerCallRequest, TypeConfig, WriteAck, leader_term},
     },
-    router::{DEFAULT_SHARD, SHARD_CONFIG_TAG, ShardConfigCommand, ShardId, ShardRouter},
+    router::{DEFAULT_SHARD, ShardConfigCommand, ShardId, ShardRouter, is_shard_config_entry},
     transport::{
         CLUSTER_PREFIX, SUFFIX_WRITE, ZenohClientPool, mid_u64_key, normalize_addr, watch,
     },
@@ -69,29 +69,46 @@ const READ_BARRIER_TIMEOUT: Duration = Duration::from_millis(200);
 /// 未初始化分片协调重试间隔（修复 P1-7）。
 const SHARD_RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
 
+/// 解析单条 `id=host:port` 节点规格并规范化连接地址（一处定义，供代理与 CLI 共享）。
+pub fn parse_peer_spec(spec: &str) -> Result<(u64, String)> {
+    let (id_str, addr) = spec
+        .split_once('=')
+        .with_context(|| format!("Invalid node format '{spec}', expected 'id=host:port'"))?;
+    let id = id_str
+        .parse::<u64>()
+        .with_context(|| format!("Invalid node ID '{id_str}'"))?;
+    Ok((id, normalize_addr(addr, true)))
+}
+
 /// 解析 `id=host:port` 形式的对端列表，单趟遍历完成，非法项记日志后跳过。
 pub fn parse_peers(peers: &[String]) -> BTreeMap<u64, BasicNode> {
     peers
         .iter()
-        .filter_map(|peer| match peer.split_once('=') {
-            Some((id_str, addr)) => match id_str.parse::<u64>() {
-                Ok(id) => Some((
-                    id,
-                    BasicNode {
-                        addr: normalize_addr(addr, true),
-                    },
-                )),
-                Err(_) => {
-                    warn!(peer = %peer, "Failed to parse peer node ID");
-                    None
-                }
-            },
-            None => {
-                warn!(peer = %peer, "Invalid peer format, expected 'id=host:port'");
+        .filter_map(|peer| match parse_peer_spec(peer) {
+            Ok((id, addr)) => Some((id, BasicNode { addr })),
+            Err(e) => {
+                warn!(peer = %peer, error = %e, "Skipping invalid peer specification");
                 None
             }
         })
         .collect()
+}
+
+/// 等待单调递增水位通道达到 `target`（一处定义，供 `wait_applied` 与 `wait_delivered` 共用）。
+async fn wait_watermark(mut rx: watch::Receiver<u64>, target: u64, timeout_dur: Duration) -> bool {
+    if *rx.borrow_and_update() >= target {
+        return true;
+    }
+    timeout(timeout_dur, async {
+        while rx.changed().await.is_ok() {
+            if *rx.borrow_and_update() >= target {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// 已提交、待投递给本地 SpacetimeDB 的写请求。
@@ -263,22 +280,19 @@ impl RaftPool {
             let entries = log_store.read_entries_range(delivered + 1, applied)?;
             for entry in entries {
                 let idx = entry.log_id.index;
-                if let EntryPayload::Normal(req) = entry.payload {
-                    let is_cfg = shard_id == DEFAULT_SHARD
-                        && req.db_path.is_empty()
-                        && req.raw_message.first() == Some(&SHARD_CONFIG_TAG);
-                    if !is_cfg {
-                        // 重放时设 origin_node_id = 0，确保无论当初由哪个节点提议，本节点恢复后都会补投
-                        let _ = write_tx
-                            .send(CommittedWrite {
-                                log_index: idx,
-                                origin_node_id: 0,
-                                db_path: req.db_path,
-                                raw_message: req.raw_message,
-                            })
-                            .await;
-                        continue;
-                    }
+                if let EntryPayload::Normal(req) = entry.payload
+                    && !is_shard_config_entry(shard_id, &req.db_path, &req.raw_message)
+                {
+                    // 重放时设 origin_node_id = 0，确保无论当初由哪个节点提议，本节点恢复后都会补投
+                    let _ = write_tx
+                        .send(CommittedWrite {
+                            log_index: idx,
+                            origin_node_id: 0,
+                            db_path: req.db_path,
+                            raw_message: req.raw_message,
+                        })
+                        .await;
+                    continue;
                 }
                 state_machine.mark_delivered(idx);
             }
@@ -412,6 +426,21 @@ impl RaftPool {
         }
     }
 
+    /// 解析指定节点的可路由广播地址（一处定义，供成员表提取与 leader 查询共用，修复 P1-8）。
+    fn resolve_node_addr(
+        &self,
+        membership: &Membership<u64, BasicNode>,
+        node_id: u64,
+    ) -> Option<String> {
+        if node_id == self.node_config.node_id {
+            Some(self.node_config.advertise_raft_addr())
+        } else if let Some(node) = membership.get_node(&node_id) {
+            Some(node.addr.clone())
+        } else {
+            self.peers.get(&node_id).map(|node| node.addr.clone())
+        }
+    }
+
     /// 从某分片的 Raft 指标读出当前选民集合（使用可路由广播地址，修复 P1-8）。
     fn current_members(&self, shard_id: ShardId) -> BTreeMap<u64, BasicNode> {
         let shards = self.shards.read();
@@ -425,18 +454,8 @@ impl RaftPool {
         membership
             .voter_ids()
             .filter_map(|id| {
-                if id == self.node_config.node_id {
-                    Some((
-                        id,
-                        BasicNode {
-                            addr: self.node_config.advertise_raft_addr(),
-                        },
-                    ))
-                } else if let Some(node) = membership.get_node(&id) {
-                    Some((id, node.clone()))
-                } else {
-                    self.peers.get(&id).map(|node| (id, node.clone()))
-                }
+                self.resolve_node_addr(membership, id)
+                    .map(|addr| (id, BasicNode { addr }))
             })
             .collect()
     }
@@ -495,7 +514,7 @@ impl RaftPool {
 
     /// 等待本节点把日志应用到指定 index。
     pub async fn wait_applied(&self, shard_id: ShardId, index: u64) -> Result<()> {
-        let mut applied = {
+        let applied = {
             let shards = self.shards.read();
             let shard = shards
                 .get(&shard_id)
@@ -503,22 +522,7 @@ impl RaftPool {
             shard.state_machine.applied_rx()
         };
 
-        if *applied.borrow_and_update() >= index {
-            return Ok(());
-        }
-
-        let applied_in_time = timeout(APPLY_TIMEOUT, async {
-            while applied.changed().await.is_ok() {
-                if *applied.borrow_and_update() >= index {
-                    return true;
-                }
-            }
-            false
-        })
-        .await
-        .unwrap_or(false);
-
-        if applied_in_time {
+        if wait_watermark(applied, index, APPLY_TIMEOUT).await {
             return Ok(());
         }
         bail!("timed out waiting for log index {index} to be applied")
@@ -529,7 +533,7 @@ impl RaftPool {
         if target_index == 0 {
             return;
         }
-        let mut delivered = {
+        let delivered = {
             let shards = self.shards.read();
             let Some(shard) = shards.get(&shard_id) else {
                 return;
@@ -537,18 +541,7 @@ impl RaftPool {
             shard.state_machine.delivered_rx()
         };
 
-        if *delivered.borrow_and_update() >= target_index {
-            return;
-        }
-
-        let _ = timeout(DELIVER_ORDER_TIMEOUT, async {
-            while delivered.changed().await.is_ok() {
-                if *delivered.borrow_and_update() >= target_index {
-                    break;
-                }
-            }
-        })
-        .await;
+        let _ = wait_watermark(delivered, target_index, DELIVER_ORDER_TIMEOUT).await;
     }
 
     /// 标记指定日志索引的写已投递到上游 SpacetimeDB（修复 P0-2）。
@@ -619,15 +612,7 @@ impl RaftPool {
         let metrics_rx = shard.raft.metrics();
         let metrics = metrics_rx.borrow_watched();
         let leader_id = metrics.current_leader?;
-
-        let addr = if leader_id == self.node_config.node_id {
-            self.node_config.advertise_raft_addr()
-        } else if let Some(node) = metrics.membership_config.membership().get_node(&leader_id) {
-            node.addr.clone()
-        } else {
-            self.peers.get(&leader_id)?.addr.clone()
-        };
-
+        let addr = self.resolve_node_addr(metrics.membership_config.membership(), leader_id)?;
         Some((leader_id, addr))
     }
 

@@ -178,34 +178,65 @@ pub struct ZenohStdbSender {
 impl ZenohStdbSender {
     /// 向服务端发送一条帧消息。
     pub async fn send(&self, msg: Message) -> Result<()> {
-        rpc_once::<Message, ()>(&self.session, &self.c2s_key, &msg, STREAM_RPC_TIMEOUT).await
+        self.send_with_timeout(&msg, STREAM_RPC_TIMEOUT).await
+    }
+
+    /// 按指定超时向服务端发送一条帧消息（按引用传递，失败时调用方可零克隆保留原消息重试）。
+    pub async fn send_with_timeout(&self, msg: &Message, timeout: Duration) -> Result<()> {
+        rpc_once::<Message, ()>(&self.session, &self.c2s_key, msg, timeout).await
+    }
+
+    /// 关闭底层 Zenoh 客户端会话。
+    pub fn close(&self) {
+        close_session(&self.session);
     }
 }
 
-/// 客户端连接封装（基于 Zenoh 明文 QUIC + `bitcode` + `crossfire`），供客户端与测试使用。
+/// 客户端连接封装（基于 Zenoh 明文 QUIC + `bitcode` + `crossfire`），供客户端、转发器与测试统一复用。
 pub struct ZenohStdbStream {
     sender: ZenohStdbSender,
     s2c_sub: Subscriber<CrossfireHandler<Sample>>,
 }
 
 impl ZenohStdbStream {
-    /// 连接到代理或 SpacetimeDB 的指定数据库路径。
+    /// 连接到代理或 SpacetimeDB 的指定数据库路径（使用默认超时）。
     pub async fn connect(addr: &str, db_path: &str) -> Result<Self> {
+        Self::connect_with_timeout(addr, db_path, STREAM_RPC_TIMEOUT).await
+    }
+
+    /// 按指定握手超时连接到代理或 SpacetimeDB 的指定数据库路径；握手失败时自动关闭底层会话。
+    pub async fn connect_with_timeout(
+        addr: &str,
+        db_path: &str,
+        timeout: Duration,
+    ) -> Result<Self> {
         let stream_id = next_stream_id();
         let session = open_client_session(addr).await?;
         let s2c_key = prefix_u64_key(STDB_S2C_PREFIX, stream_id);
-        let s2c_sub = session
+        let s2c_sub = match session
             .declare_subscriber(&s2c_key)
             .with(CrossfireChannel::new())
             .await
-            .map_err(|e| anyhow!("Failed to declare s2c subscriber: {e}"))?;
+        {
+            Ok(sub) => sub,
+            Err(e) => {
+                close_session(&session);
+                return Err(anyhow!("Failed to declare s2c subscriber: {e}"));
+            }
+        };
 
         let req = StdbConnectRequest {
             stream_id,
             db_path: db_path.to_owned(),
         };
         let resp: StdbConnectResponse =
-            rpc_once(&session, KEY_STDB_CONNECT, &req, STREAM_RPC_TIMEOUT).await?;
+            match rpc_once(&session, KEY_STDB_CONNECT, &req, timeout).await {
+                Ok(r) => r,
+                Err(e) => {
+                    close_session(&session);
+                    return Err(e);
+                }
+            };
 
         Ok(Self {
             sender: ZenohStdbSender {
@@ -234,12 +265,12 @@ impl ZenohStdbStream {
     /// 关闭客户端会话。
     pub async fn close(self) {
         let _ = self.sender.send(Message::Close(None)).await;
-        close_session(&self.sender.session);
+        self.sender.close();
     }
 }
 
-/// 从 `s2c` 订阅通道接收并解码下一条帧消息。
-async fn recv_s2c_message(
+/// 从 `s2c` 订阅通道接收并解码下一条帧消息（一处定义，供客户端会话与上游转发器共用）。
+pub(crate) async fn recv_s2c_message(
     s2c_sub: &Subscriber<CrossfireHandler<Sample>>,
 ) -> Result<Option<Message>> {
     let Ok(sample) = s2c_sub.recv().await else {
