@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # ============================================================================
-# End-to-End Test: RaftTimeDB 3-Node Docker Cluster
+# End-to-End Test: spacetime-db-ha 3-Node Docker Cluster
 # ============================================================================
 #
 # This script:
-# 1. Starts a 3-node RaftTimeDB cluster via Docker Compose
+# 1. Starts a 3-node spacetime-db-ha cluster via Docker Compose
 # 2. Waits for all nodes to be healthy
-# 3. Bootstraps the Raft cluster via rtdb init
+# 3. Bootstraps the Raft cluster via sdha init
 # 4. Verifies leader election
 # 5. Tests write forwarding (write to follower succeeds)
 # 6. Kills a node and verifies the cluster re-elects a leader
@@ -14,7 +14,7 @@
 #
 # Prerequisites:
 #   - Docker and Docker Compose
-#   - rtdb CLI (cargo install --path crates/cli)
+#   - sdha CLI (cargo install --path crates/cli)
 #   - curl
 #
 # Usage:
@@ -57,7 +57,7 @@ run_test() {
 # Setup
 # ============================================================================
 
-info "Starting 3-node RaftTimeDB cluster..."
+info "Starting 3-node spacetime-db-ha cluster..."
 cd "$PROJECT_ROOT"
 
 docker compose -f "$COMPOSE_FILE" up -d --build 2>/dev/null || {
@@ -109,7 +109,7 @@ run_test "Node 3 management API (4003) is reachable" \
     "curl -sf http://localhost:4003/cluster/status >/dev/null 2>&1"
 
 # ============================================================================
-# Test: Cluster Bootstrap (rtdb init)
+# Test: Cluster Bootstrap (sdha init)
 # ============================================================================
 
 info "Bootstrapping the Raft cluster..."

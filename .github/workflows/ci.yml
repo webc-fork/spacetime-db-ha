@@ -72,12 +72,12 @@ jobs:
       - run: cargo build --release --target ${{ matrix.target }}
       - uses: actions/upload-artifact@v4
         with:
-          name: rafttimedb-${{ matrix.target }}
+          name: spacetime-db-ha-${{ matrix.target }}
           path: |
-            target/${{ matrix.target }}/release/rafttimedb
-            target/${{ matrix.target }}/release/rafttimedb.exe
-            target/${{ matrix.target }}/release/rtdb
-            target/${{ matrix.target }}/release/rtdb.exe
+            target/${{ matrix.target }}/release/spacetime-db-ha
+            target/${{ matrix.target }}/release/spacetime-db-ha.exe
+            target/${{ matrix.target }}/release/sdha
+            target/${{ matrix.target }}/release/sdha.exe
 
   # Test on multiple platforms
   test-platforms:
@@ -97,7 +97,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: docker build -f deploy/docker/Dockerfile -t rafttimedb:test .
+      - run: docker build -f deploy/docker/Dockerfile -t spacetime-db-ha:test .
 
   # E2E test with Docker Compose (runs after Docker build succeeds)
   e2e:

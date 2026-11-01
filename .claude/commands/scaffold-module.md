@@ -1,6 +1,6 @@
 # /scaffold-module — Generate a SpacetimeDB Module
 
-Create a new SpacetimeDB module (Rust crate) ready to deploy on RaftTimeDB.
+Create a new SpacetimeDB module (Rust crate) ready to deploy on spacetime-db-ha.
 
 ## Usage
 

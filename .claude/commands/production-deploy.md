@@ -1,6 +1,6 @@
-# /production-deploy — Deploy RaftTimeDB to Production Servers
+# /production-deploy — Deploy spacetime-db-ha to Production Servers
 
-Full production deployment of a RaftTimeDB cluster across multiple bare-metal or VM servers with systemd, TLS, and load balancing.
+Full production deployment of a spacetime-db-ha cluster across multiple bare-metal or VM servers with systemd, TLS, and load balancing.
 
 ## Usage
 
@@ -17,10 +17,10 @@ Each server runs two processes:
 | Process | Port | Purpose |
 |---------|------|---------|
 | SpacetimeDB | 3000 (localhost only) | The actual database engine |
-| RaftTimeDB proxy | 3001 (WS), 4001 (Raft API) | Consensus + client proxy |
+| spacetime-db-ha proxy | 3001 (WS), 4001 (Raft API) | Consensus + client proxy |
 
 ```
-Client → LB:443 → any server:3001 (RaftTimeDB) → localhost:3000 (SpacetimeDB)
+Client → LB:443 → any server:3001 (spacetime-db-ha) → localhost:3000 (SpacetimeDB)
                        ↕ Raft consensus (port 4001) ↕
               other servers:4001 ←→ their localhost:3000
 ```
@@ -63,8 +63,8 @@ nc -zv server-c 4001
 
 ### 4. Each server needs
 - Linux with systemd
-- A user account for running the services (e.g., `rafttimedb`)
-- Directories: `/opt/rafttimedb/`, `/var/lib/rafttimedb/`, `/etc/rafttimedb/`
+- A user account for running the services (e.g., `spacetime-db-ha`)
+- Directories: `/opt/spacetime-db-ha/`, `/var/lib/spacetime-db-ha/`, `/etc/spacetime-db-ha/`
 - SpacetimeDB standalone binary installed (from https://spacetimedb.com/install)
 
 ## Step 1: Build the Binary
@@ -72,16 +72,16 @@ nc -zv server-c 4001
 On the build machine (can be any server or a CI box):
 
 ```bash
-cd /path/to/RaftTimeDB
+cd /path/to/spacetime-db-ha
 cargo build --release
 ```
 
 Verify the binary exists:
 ```bash
-ls -la target/release/rafttimedb
+ls -la target/release/spacetime-db-ha
 ```
 
-The binary is at `target/release/rafttimedb`. It is a statically-linkable Linux binary (if built on Linux). If cross-compiling, use:
+The binary is at `target/release/spacetime-db-ha`. It is a statically-linkable Linux binary (if built on Linux). If cross-compiling, use:
 ```bash
 cargo build --release --target x86_64-unknown-linux-gnu
 ```
@@ -93,7 +93,7 @@ cargo install --path crates/cli
 
 Verify:
 ```bash
-rtdb --help
+sdha --help
 ```
 
 If either build fails, fix compilation errors before proceeding. Do not continue with a broken binary.
@@ -104,15 +104,15 @@ Run the following on **every** server. This creates the required user, directori
 
 ```bash
 # Create service user (no login shell, no home directory needed)
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin rafttimedb
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin spacetime-db-ha
 
 # Create directories
-sudo mkdir -p /opt/rafttimedb/bin
-sudo mkdir -p /var/lib/rafttimedb
-sudo mkdir -p /etc/rafttimedb
+sudo mkdir -p /opt/spacetime-db-ha/bin
+sudo mkdir -p /var/lib/spacetime-db-ha
+sudo mkdir -p /etc/spacetime-db-ha
 
 # Set ownership
-sudo chown rafttimedb:rafttimedb /var/lib/rafttimedb
+sudo chown spacetime-db-ha:spacetime-db-ha /var/lib/spacetime-db-ha
 ```
 
 ## Step 3: Copy Binaries to All Servers
@@ -124,17 +124,17 @@ SERVERS="server-a server-b server-c"
 
 for server in $SERVERS; do
   echo "=== Deploying to $server ==="
-  scp target/release/rafttimedb ${server}:/tmp/rafttimedb
-  ssh ${server} "sudo mv /tmp/rafttimedb /opt/rafttimedb/bin/rafttimedb && sudo chmod +x /opt/rafttimedb/bin/rafttimedb"
+  scp target/release/spacetime-db-ha ${server}:/tmp/spacetime-db-ha
+  ssh ${server} "sudo mv /tmp/spacetime-db-ha /opt/spacetime-db-ha/bin/spacetime-db-ha && sudo chmod +x /opt/spacetime-db-ha/bin/spacetime-db-ha"
   echo "$server done"
 done
 ```
 
 Verify on each server:
 ```bash
-ssh server-a "/opt/rafttimedb/bin/rafttimedb --help"
-ssh server-b "/opt/rafttimedb/bin/rafttimedb --help"
-ssh server-c "/opt/rafttimedb/bin/rafttimedb --help"
+ssh server-a "/opt/spacetime-db-ha/bin/spacetime-db-ha --help"
+ssh server-b "/opt/spacetime-db-ha/bin/spacetime-db-ha --help"
+ssh server-c "/opt/spacetime-db-ha/bin/spacetime-db-ha --help"
 ```
 
 If any `scp` or `ssh` command fails, check SSH access and fix before continuing.
@@ -153,8 +153,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=rafttimedb
-Group=rafttimedb
+User=spacetime-db-ha
+Group=spacetime-db-ha
 ExecStart=/usr/local/bin/spacetimedb-standalone start --listen-addr 127.0.0.1:3000
 Restart=always
 RestartSec=5
@@ -171,43 +171,43 @@ WantedBy=multi-user.target
 
 **Note:** Adjust the `ExecStart` path to wherever `spacetimedb-standalone` is installed on your servers. Find it with `which spacetimedb-standalone` or `which spacetime`. The listen address is `127.0.0.1:3000` — localhost only, never exposed externally.
 
-### 4b. RaftTimeDB service
+### 4b. spacetime-db-ha service
 
-Create `/etc/systemd/system/rafttimedb.service` on **every** server:
+Create `/etc/systemd/system/spacetime-db-ha.service` on **every** server:
 
 ```ini
 [Unit]
-Description=RaftTimeDB Consensus Proxy
+Description=spacetime-db-ha Consensus Proxy
 After=spacetimedb.service
 Requires=spacetimedb.service
 
 [Service]
 Type=simple
-User=rafttimedb
-Group=rafttimedb
-EnvironmentFile=/etc/rafttimedb/config.env
-ExecStart=/opt/rafttimedb/bin/rafttimedb \
-  --node-id ${RTDB_NODE_ID} \
-  --listen-addr ${RTDB_LISTEN_ADDR} \
-  --raft-addr ${RTDB_RAFT_ADDR} \
-  --stdb-url ${RTDB_STDB_URL} \
-  --peers ${RTDB_PEERS} \
-  --data-dir ${RTDB_DATA_DIR}
-# Uncomment for TLS (requires cert/key in /etc/rafttimedb/certs/):
-# ExecStart=/opt/rafttimedb/bin/rafttimedb \
-#   --node-id ${RTDB_NODE_ID} \
-#   --listen-addr ${RTDB_LISTEN_ADDR} \
-#   --raft-addr ${RTDB_RAFT_ADDR} \
-#   --stdb-url ${RTDB_STDB_URL} \
-#   --peers ${RTDB_PEERS} \
-#   --data-dir ${RTDB_DATA_DIR} \
-#   --tls-cert ${RTDB_TLS_CERT} \
-#   --tls-key ${RTDB_TLS_KEY} \
-#   --tls-ca-cert ${RTDB_TLS_CA_CERT}
+User=spacetime-db-ha
+Group=spacetime-db-ha
+EnvironmentFile=/etc/spacetime-db-ha/config.env
+ExecStart=/opt/spacetime-db-ha/bin/spacetime-db-ha \
+  --node-id ${SPACETIME_DB_HA_NODE_ID} \
+  --listen-addr ${SPACETIME_DB_HA_LISTEN_ADDR} \
+  --raft-addr ${SPACETIME_DB_HA_RAFT_ADDR} \
+  --stdb-url ${SPACETIME_DB_HA_STDB_URL} \
+  --peers ${SPACETIME_DB_HA_PEERS} \
+  --data-dir ${SPACETIME_DB_HA_DATA_DIR}
+# Uncomment for TLS (requires cert/key in /etc/spacetime-db-ha/certs/):
+# ExecStart=/opt/spacetime-db-ha/bin/spacetime-db-ha \
+#   --node-id ${SPACETIME_DB_HA_NODE_ID} \
+#   --listen-addr ${SPACETIME_DB_HA_LISTEN_ADDR} \
+#   --raft-addr ${SPACETIME_DB_HA_RAFT_ADDR} \
+#   --stdb-url ${SPACETIME_DB_HA_STDB_URL} \
+#   --peers ${SPACETIME_DB_HA_PEERS} \
+#   --data-dir ${SPACETIME_DB_HA_DATA_DIR} \
+#   --tls-cert ${SPACETIME_DB_HA_TLS_CERT} \
+#   --tls-key ${SPACETIME_DB_HA_TLS_KEY} \
+#   --tls-ca-cert ${SPACETIME_DB_HA_TLS_CA_CERT}
 Restart=always
 RestartSec=3
 LimitNOFILE=65536
-Environment=RUST_LOG=rafttimedb=info,openraft=warn
+Environment=RUST_LOG=spacetime_db_ha=info,openraft=warn
 
 # Security hardening
 ProtectSystem=full
@@ -222,65 +222,65 @@ Copy the unit files to all servers:
 ```bash
 for server in $SERVERS; do
   scp spacetimedb.service ${server}:/tmp/spacetimedb.service
-  scp rafttimedb.service ${server}:/tmp/rafttimedb.service
+  scp spacetime-db-ha.service ${server}:/tmp/spacetime-db-ha.service
   ssh ${server} "sudo mv /tmp/spacetimedb.service /etc/systemd/system/spacetimedb.service && \
-                 sudo mv /tmp/rafttimedb.service /etc/systemd/system/rafttimedb.service && \
+                 sudo mv /tmp/spacetime-db-ha.service /etc/systemd/system/spacetime-db-ha.service && \
                  sudo systemctl daemon-reload"
 done
 ```
 
 ## Step 5: Create config.env for Each Server
 
-Each server gets a **unique** config file at `/etc/rafttimedb/config.env`. The `RTDB_NODE_ID` and `RTDB_PEERS` differ per server.
+Each server gets a **unique** config file at `/etc/spacetime-db-ha/config.env`. The `SPACETIME_DB_HA_NODE_ID` and `SPACETIME_DB_HA_PEERS` differ per server.
 
 ### 3-server example (server-a, server-b, server-c):
 
-**server-a** (`/etc/rafttimedb/config.env`):
+**server-a** (`/etc/spacetime-db-ha/config.env`):
 ```bash
-RTDB_NODE_ID=1
-RTDB_LISTEN_ADDR=0.0.0.0:3001
-RTDB_RAFT_ADDR=0.0.0.0:4001
-RTDB_STDB_URL=ws://127.0.0.1:3000
-RTDB_PEERS=2=server-b:4001,3=server-c:4001
-RTDB_DATA_DIR=/var/lib/rafttimedb
-RUST_LOG=rafttimedb=info,openraft=warn
+SPACETIME_DB_HA_NODE_ID=1
+SPACETIME_DB_HA_LISTEN_ADDR=0.0.0.0:3001
+SPACETIME_DB_HA_RAFT_ADDR=0.0.0.0:4001
+SPACETIME_DB_HA_STDB_URL=ws://127.0.0.1:3000
+SPACETIME_DB_HA_PEERS=2=server-b:4001,3=server-c:4001
+SPACETIME_DB_HA_DATA_DIR=/var/lib/spacetime-db-ha
+RUST_LOG=spacetime_db_ha=info,openraft=warn
 
 # TLS (optional — uncomment and set paths to enable encrypted inter-node communication)
-# RTDB_TLS_CERT=/etc/rafttimedb/certs/node.crt
-# RTDB_TLS_KEY=/etc/rafttimedb/certs/node.key
-# RTDB_TLS_CA_CERT=/etc/rafttimedb/certs/ca.crt
+# SPACETIME_DB_HA_TLS_CERT=/etc/spacetime-db-ha/certs/node.crt
+# SPACETIME_DB_HA_TLS_KEY=/etc/spacetime-db-ha/certs/node.key
+# SPACETIME_DB_HA_TLS_CA_CERT=/etc/spacetime-db-ha/certs/ca.crt
 ```
 
-**server-b** (`/etc/rafttimedb/config.env`):
+**server-b** (`/etc/spacetime-db-ha/config.env`):
 ```bash
-RTDB_NODE_ID=2
-RTDB_LISTEN_ADDR=0.0.0.0:3001
-RTDB_RAFT_ADDR=0.0.0.0:4001
-RTDB_STDB_URL=ws://127.0.0.1:3000
-RTDB_PEERS=1=server-a:4001,3=server-c:4001
-RTDB_DATA_DIR=/var/lib/rafttimedb
-RUST_LOG=rafttimedb=info,openraft=warn
+SPACETIME_DB_HA_NODE_ID=2
+SPACETIME_DB_HA_LISTEN_ADDR=0.0.0.0:3001
+SPACETIME_DB_HA_RAFT_ADDR=0.0.0.0:4001
+SPACETIME_DB_HA_STDB_URL=ws://127.0.0.1:3000
+SPACETIME_DB_HA_PEERS=1=server-a:4001,3=server-c:4001
+SPACETIME_DB_HA_DATA_DIR=/var/lib/spacetime-db-ha
+RUST_LOG=spacetime_db_ha=info,openraft=warn
 
 # TLS (optional)
-# RTDB_TLS_CERT=/etc/rafttimedb/certs/node.crt
-# RTDB_TLS_KEY=/etc/rafttimedb/certs/node.key
-# RTDB_TLS_CA_CERT=/etc/rafttimedb/certs/ca.crt
+# SPACETIME_DB_HA_TLS_CERT=/etc/spacetime-db-ha/certs/node.crt
+# SPACETIME_DB_HA_TLS_KEY=/etc/spacetime-db-ha/certs/node.key
+# SPACETIME_DB_HA_TLS_CA_CERT=/etc/spacetime-db-ha/certs/ca.crt
 ```
 
-**server-c** (`/etc/rafttimedb/config.env`):
+**server-c** (`/etc/spacetime-db-ha/config.env`):
 ```bash
-RTDB_NODE_ID=3
-RTDB_LISTEN_ADDR=0.0.0.0:3001
-RTDB_RAFT_ADDR=0.0.0.0:4001
-RTDB_STDB_URL=ws://127.0.0.1:3000
-RTDB_PEERS=1=server-a:4001,2=server-b:4001
-RTDB_DATA_DIR=/var/lib/rafttimedb
-RUST_LOG=rafttimedb=info,openraft=warn
+SPACETIME_DB_HA_NODE_ID=3
+SPACETIME_DB_HA_LISTEN_ADDR=0.0.0.0:3001
+SPACETIME_DB_HA_RAFT_ADDR=0.0.0.0:4001
+SPACETIME_DB_HA_STDB_URL=ws://127.0.0.1:3000
+SPACETIME_DB_HA_PEERS=1=server-a:4001,2=server-b:4001
+SPACETIME_DB_HA_DATA_DIR=/var/lib/spacetime-db-ha
+RUST_LOG=spacetime_db_ha=info,openraft=warn
 
 # TLS (optional)
-# RTDB_TLS_CERT=/etc/rafttimedb/certs/node.crt
-# RTDB_TLS_KEY=/etc/rafttimedb/certs/node.key
-# RTDB_TLS_CA_CERT=/etc/rafttimedb/certs/ca.crt
+# SPACETIME_DB_HA_TLS_CERT=/etc/spacetime-db-ha/certs/node.crt
+# SPACETIME_DB_HA_TLS_KEY=/etc/spacetime-db-ha/certs/node.key
+# SPACETIME_DB_HA_TLS_CA_CERT=/etc/spacetime-db-ha/certs/ca.crt
 ```
 
 ### Generating config.env programmatically
@@ -310,13 +310,13 @@ for i in $(seq 0 $((COUNT - 1))); do
     fi
   done
 
-  CONFIG="RTDB_NODE_ID=${NODE_ID}
-RTDB_LISTEN_ADDR=0.0.0.0:3001
-RTDB_RAFT_ADDR=0.0.0.0:4001
-RTDB_STDB_URL=ws://127.0.0.1:3000
-RTDB_PEERS=${PEERS}
-RTDB_DATA_DIR=/var/lib/rafttimedb
-RUST_LOG=rafttimedb=info,openraft=warn"
+  CONFIG="SPACETIME_DB_HA_NODE_ID=${NODE_ID}
+SPACETIME_DB_HA_LISTEN_ADDR=0.0.0.0:3001
+SPACETIME_DB_HA_RAFT_ADDR=0.0.0.0:4001
+SPACETIME_DB_HA_STDB_URL=ws://127.0.0.1:3000
+SPACETIME_DB_HA_PEERS=${PEERS}
+SPACETIME_DB_HA_DATA_DIR=/var/lib/spacetime-db-ha
+RUST_LOG=spacetime_db_ha=info,openraft=warn"
 
   echo "=== ${SERVER} (node ${NODE_ID}) ==="
   echo "$CONFIG"
@@ -325,7 +325,7 @@ RUST_LOG=rafttimedb=info,openraft=warn"
   # Write and deploy
   echo "$CONFIG" > /tmp/config-${SERVER}.env
   scp /tmp/config-${SERVER}.env ${SERVER}:/tmp/config.env
-  ssh ${SERVER} "sudo mv /tmp/config.env /etc/rafttimedb/config.env && sudo chown rafttimedb:rafttimedb /etc/rafttimedb/config.env && sudo chmod 600 /etc/rafttimedb/config.env"
+  ssh ${SERVER} "sudo mv /tmp/config.env /etc/spacetime-db-ha/config.env && sudo chown spacetime-db-ha:spacetime-db-ha /etc/spacetime-db-ha/config.env && sudo chmod 600 /etc/spacetime-db-ha/config.env"
 done
 ```
 
@@ -341,15 +341,15 @@ If using IP addresses instead of hostnames:
 
 ## Step 6: Start Services on All Servers
 
-Start SpacetimeDB first, then RaftTimeDB. Order matters because `rafttimedb.service` depends on `spacetimedb.service`.
+Start SpacetimeDB first, then spacetime-db-ha. Order matters because `spacetime-db-ha.service` depends on `spacetimedb.service`.
 
 ```bash
 for server in $SERVERS; do
   echo "=== Starting services on $server ==="
-  ssh ${server} "sudo systemctl enable spacetimedb rafttimedb && \
+  ssh ${server} "sudo systemctl enable spacetimedb spacetime-db-ha && \
                  sudo systemctl start spacetimedb && \
                  sleep 2 && \
-                 sudo systemctl start rafttimedb"
+                 sudo systemctl start spacetime-db-ha"
 done
 ```
 
@@ -357,7 +357,7 @@ Verify both services are running on each server:
 ```bash
 for server in $SERVERS; do
   echo "=== $server ==="
-  ssh ${server} "systemctl is-active spacetimedb && systemctl is-active rafttimedb"
+  ssh ${server} "systemctl is-active spacetimedb && systemctl is-active spacetime-db-ha"
 done
 ```
 
@@ -370,17 +370,17 @@ active
 If any service is not active, check its logs:
 ```bash
 ssh <server> "sudo journalctl -u spacetimedb --no-pager -n 30"
-ssh <server> "sudo journalctl -u rafttimedb --no-pager -n 30"
+ssh <server> "sudo journalctl -u spacetime-db-ha --no-pager -n 30"
 ```
 
 Common startup failures:
 - **SpacetimeDB "address already in use"** — another instance is running on port 3000. Kill it: `sudo ss -tlnp | grep 3000`
-- **RaftTimeDB "connection refused" to SpacetimeDB** — SpacetimeDB hasn't started yet. Increase the sleep or check SpacetimeDB logs.
-- **RaftTimeDB "address already in use" on 3001 or 4001** — another instance running. Check with `sudo ss -tlnp | grep -E '3001|4001'`
+- **spacetime-db-ha "connection refused" to SpacetimeDB** — SpacetimeDB hasn't started yet. Increase the sleep or check SpacetimeDB logs.
+- **spacetime-db-ha "address already in use" on 3001 or 4001** — another instance running. Check with `sudo ss -tlnp | grep -E '3001|4001'`
 
 ## Step 7: Publish the Module to All SpacetimeDB Instances
 
-Every SpacetimeDB instance must have the **identical** module published. RaftTimeDB replicates reducer calls, not module deployments.
+Every SpacetimeDB instance must have the **identical** module published. spacetime-db-ha replicates reducer calls, not module deployments.
 
 ```bash
 MODULE_PATH="/path/to/your/module"
@@ -423,15 +423,15 @@ Each should return a result, not an error. If any fail, re-publish to that serve
 
 Run this **exactly once** from any machine that can reach any server's port 4001:
 
-### Option A: Using the rtdb CLI
+### Option A: Using the sdha CLI
 
 ```bash
-rtdb init --nodes 1=server-a:4001 2=server-b:4001 3=server-c:4001
+sdha init --nodes 1=server-a:4001 2=server-b:4001 3=server-c:4001
 ```
 
 For 5 nodes:
 ```bash
-rtdb init --nodes 1=server-a:4001 2=server-b:4001 3=server-c:4001 4=server-d:4001 5=server-e:4001
+sdha init --nodes 1=server-a:4001 2=server-b:4001 3=server-c:4001 4=server-d:4001 5=server-e:4001
 ```
 
 ### Option B: Using curl directly
@@ -455,9 +455,9 @@ This triggers leader election. Within 1-5 seconds, one node becomes the leader.
 ### 9a. Check Raft status on all nodes
 
 ```bash
-rtdb status --addr http://server-a:4001
-rtdb status --addr http://server-b:4001
-rtdb status --addr http://server-c:4001
+sdha status --addr http://server-a:4001
+sdha status --addr http://server-b:4001
+sdha status --addr http://server-c:4001
 ```
 
 Or with curl:
@@ -495,15 +495,15 @@ All servers should return the same data.
 
 ## Step 10: Load Balancer Setup
 
-The load balancer is **external** to RaftTimeDB. It sits in front of the cluster and distributes client WebSocket connections across all nodes. RaftTimeDB handles leader forwarding internally — clients can connect to any node (leader or follower).
+The load balancer is **external** to spacetime-db-ha. It sits in front of the cluster and distributes client WebSocket connections across all nodes. spacetime-db-ha handles leader forwarding internally — clients can connect to any node (leader or follower).
 
 ### Option 1: nginx (WebSocket proxy)
 
-Install nginx on a separate machine or use a managed nginx instance. Create `/etc/nginx/sites-available/rafttimedb`:
+Install nginx on a separate machine or use a managed nginx instance. Create `/etc/nginx/sites-available/spacetime-db-ha`:
 
 ```nginx
-upstream rafttimedb {
-    # List all RaftTimeDB nodes
+upstream spacetime-db-ha {
+    # List all spacetime-db-ha nodes
     server server-a:3001;
     server server-b:3001;
     server server-c:3001;
@@ -518,7 +518,7 @@ server {
 
     # WebSocket proxy
     location / {
-        proxy_pass http://rafttimedb;
+        proxy_pass http://spacetime-db-ha;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
@@ -536,7 +536,7 @@ server {
 
 Enable and test:
 ```bash
-sudo ln -s /etc/nginx/sites-available/rafttimedb /etc/nginx/sites-enabled/
+sudo ln -s /etc/nginx/sites-available/spacetime-db-ha /etc/nginx/sites-enabled/
 sudo nginx -t && sudo systemctl reload nginx
 ```
 
@@ -571,7 +571,7 @@ HAProxy checks health via the Raft management API (`GET /cluster/status` on port
 - Target group: all servers on port 3001
 - Health check: HTTP GET on port 4001, path `/cluster/health`, expect 200
 - For WebSocket, ALB is preferred (handles upgrade headers automatically)
-- Enable stickiness if your app needs it (not required for RaftTimeDB correctness)
+- Enable stickiness if your app needs it (not required for spacetime-db-ha correctness)
 
 **GCP:**
 - Use a TCP/SSL Load Balancer for WebSocket support
@@ -606,18 +606,18 @@ Each node exposes Prometheus metrics at `GET http://<node>:4001/metrics`. Availa
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `rafttimedb_raft_term` | Gauge | Current Raft term |
-| `rafttimedb_raft_is_leader` | Gauge | 1 if this node is leader, 0 otherwise |
-| `rafttimedb_connections_active` | Gauge | Active WebSocket client connections |
-| `rafttimedb_writes_total` | Counter | Total writes proposed through Raft |
-| `rafttimedb_reads_total` | Counter | Total reads forwarded directly |
-| `rafttimedb_write_latency_seconds` | Histogram | Write latency (Raft consensus + forward) |
-| `rafttimedb_entries_applied_total` | Counter | Raft log entries applied to state machine |
+| `spacetime-db-ha_raft_term` | Gauge | Current Raft term |
+| `spacetime-db-ha_raft_is_leader` | Gauge | 1 if this node is leader, 0 otherwise |
+| `spacetime-db-ha_connections_active` | Gauge | Active WebSocket client connections |
+| `spacetime-db-ha_writes_total` | Counter | Total writes proposed through Raft |
+| `spacetime-db-ha_reads_total` | Counter | Total reads forwarded directly |
+| `spacetime-db-ha_write_latency_seconds` | Histogram | Write latency (Raft consensus + forward) |
+| `spacetime-db-ha_entries_applied_total` | Counter | Raft log entries applied to state machine |
 
 Add to your `prometheus.yml`:
 ```yaml
 scrape_configs:
-  - job_name: rafttimedb
+  - job_name: spacetime-db-ha
     static_configs:
       - targets:
           - server-a:4001
@@ -638,22 +638,22 @@ scrape_configs:
 ### systemd journal (primary log source)
 
 ```bash
-# Follow RaftTimeDB logs in real-time
-sudo journalctl -u rafttimedb -f
+# Follow spacetime-db-ha logs in real-time
+sudo journalctl -u spacetime-db-ha -f
 
 # Follow SpacetimeDB logs
 sudo journalctl -u spacetimedb -f
 
-# Show last 100 lines of RaftTimeDB logs
-sudo journalctl -u rafttimedb -n 100 --no-pager
+# Show last 100 lines of spacetime-db-ha logs
+sudo journalctl -u spacetime-db-ha -n 100 --no-pager
 
 # Show only errors and warnings
-sudo journalctl -u rafttimedb -p warning --no-pager
+sudo journalctl -u spacetime-db-ha -p warning --no-pager
 ```
 
 ### Cluster health check script
 
-Create `/opt/rafttimedb/bin/health-check.sh` on one server (or a monitoring box):
+Create `/opt/spacetime-db-ha/bin/health-check.sh` on one server (or a monitoring box):
 
 ```bash
 #!/bin/bash
@@ -708,7 +708,7 @@ fi
 ```bash
 # Add to crontab on a monitoring server
 # Runs every minute, logs warnings to syslog
-* * * * * /opt/rafttimedb/bin/health-check.sh 2>&1 | logger -t rafttimedb-health
+* * * * * /opt/spacetime-db-ha/bin/health-check.sh 2>&1 | logger -t spacetime-db-ha-health
 ```
 
 ## Complete Deployment Checklist
@@ -720,10 +720,10 @@ Run through this checklist to confirm everything is deployed correctly:
 [ ] systemd unit files installed on all servers
 [ ] config.env created with correct node ID and peers on each server
 [ ] SpacetimeDB running on all servers (port 3000, localhost only)
-[ ] RaftTimeDB running on all servers (ports 3001 + 4001)
+[ ] spacetime-db-ha running on all servers (ports 3001 + 4001)
 [ ] Module published to every SpacetimeDB instance
-[ ] Cluster bootstrapped (rtdb init, run once)
-[ ] Exactly 1 leader, N-1 followers visible in rtdb status
+[ ] Cluster bootstrapped (sdha init, run once)
+[ ] Exactly 1 leader, N-1 followers visible in sdha status
 [ ] All nodes on the same term
 [ ] WebSocket connection works to each node directly
 [ ] Load balancer configured and routing to all nodes
@@ -737,35 +737,35 @@ Run through this checklist to confirm everything is deployed correctly:
 
 | Problem | Diagnosis | Fix |
 |---------|-----------|-----|
-| "No leader" after bootstrap | `rtdb init` not run, or all nodes just restarted | Run `rtdb init` again (safe to retry) |
-| "Connection refused" on 4001 | RaftTimeDB not running or firewall blocking | `systemctl status rafttimedb`, check firewall |
+| "No leader" after bootstrap | `sdha init` not run, or all nodes just restarted | Run `sdha init` again (safe to retry) |
+| "Connection refused" on 4001 | spacetime-db-ha not running or firewall blocking | `systemctl status spacetime-db-ha`, check firewall |
 | Module missing on one node | Forgot to publish to that SpacetimeDB instance | `spacetime publish --server http://127.0.0.1:3000 ...` on that server |
 | Writes succeed but data missing on some nodes | Module not identical across nodes | Re-publish the same module to all nodes |
 | WebSocket 404 through load balancer | LB not forwarding upgrade headers | Add `proxy_set_header Upgrade/Connection` in nginx, or use ALB on AWS |
 | Cluster works but clients disconnect on leader change | Expected — clients on the old leader lose connection | Use load balancer so clients reconnect to a healthy node automatically |
 | SpacetimeDB high CPU | Module reducers are expensive | Profile the module, optimize hot reducers |
-| Disk full on `/var/lib/rafttimedb` | Raft log growing without compaction | Check snapshot configuration, increase disk |
+| Disk full on `/var/lib/spacetime-db-ha` | Raft log growing without compaction | Check snapshot configuration, increase disk |
 
 ## Rolling Upgrades
 
-To upgrade the RaftTimeDB binary without downtime:
+To upgrade the spacetime-db-ha binary without downtime:
 
 ```bash
 # Upgrade one node at a time, starting with followers
 # 1. Identify the leader
-rtdb status --addr http://server-a:4001
+sdha status --addr http://server-a:4001
 
 # 2. Upgrade a FOLLOWER first
-ssh server-b "sudo systemctl stop rafttimedb && \
-  sudo cp /opt/rafttimedb/bin/rafttimedb /opt/rafttimedb/bin/rafttimedb.bak"
-scp target/release/rafttimedb server-b:/tmp/rafttimedb
-ssh server-b "sudo mv /tmp/rafttimedb /opt/rafttimedb/bin/rafttimedb && \
-  sudo chmod +x /opt/rafttimedb/bin/rafttimedb && \
-  sudo systemctl start rafttimedb"
+ssh server-b "sudo systemctl stop spacetime-db-ha && \
+  sudo cp /opt/spacetime-db-ha/bin/spacetime-db-ha /opt/spacetime-db-ha/bin/spacetime-db-ha.bak"
+scp target/release/spacetime-db-ha server-b:/tmp/spacetime-db-ha
+ssh server-b "sudo mv /tmp/spacetime-db-ha /opt/spacetime-db-ha/bin/spacetime-db-ha && \
+  sudo chmod +x /opt/spacetime-db-ha/bin/spacetime-db-ha && \
+  sudo systemctl start spacetime-db-ha"
 
 # 3. Wait for it to rejoin and verify
 sleep 5
-rtdb status --addr http://server-b:4001
+sdha status --addr http://server-b:4001
 
 # 4. Repeat for the other follower(s)
 # 5. Upgrade the leader LAST (this triggers a leader election, which is fine)

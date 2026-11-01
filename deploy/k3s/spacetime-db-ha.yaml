@@ -1,10 +1,10 @@
-# RaftTimeDB on K3s/K8s — 3-node cluster
+# spacetime-db-ha on K3s/K8s — 3-node cluster
 #
 # Usage:
-#   kubectl apply -f rafttimedb.yaml
+#   kubectl apply -f spacetime-db-ha.yaml
 #
 # This creates:
-#   - StatefulSet with 3 pods (each running RaftTimeDB + SpacetimeDB)
+#   - StatefulSet with 3 pods (each running spacetime-db-ha + SpacetimeDB)
 #   - Headless service for Raft peer discovery
 #   - LoadBalancer service for client connections
 #
@@ -15,13 +15,13 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: rafttimedb-raft
+  name: spacetime-db-ha-raft
   labels:
-    app: rafttimedb
+    app: spacetime-db-ha
 spec:
   clusterIP: None
   selector:
-    app: rafttimedb
+    app: spacetime-db-ha
   ports:
     - port: 4001
       name: raft
@@ -31,13 +31,13 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: rafttimedb
+  name: spacetime-db-ha
   labels:
-    app: rafttimedb
+    app: spacetime-db-ha
 spec:
   type: LoadBalancer
   selector:
-    app: rafttimedb
+    app: spacetime-db-ha
   ports:
     - port: 3001
       name: ws
@@ -47,23 +47,23 @@ spec:
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: rafttimedb
+  name: spacetime-db-ha
 spec:
-  serviceName: rafttimedb-raft
+  serviceName: spacetime-db-ha-raft
   replicas: 3
   selector:
     matchLabels:
-      app: rafttimedb
+      app: spacetime-db-ha
   template:
     metadata:
       labels:
-        app: rafttimedb
+        app: spacetime-db-ha
     spec:
       terminationGracePeriodSeconds: 30
       containers:
-        # RaftTimeDB proxy
-        - name: rafttimedb
-          image: ghcr.io/nodenestor/rafttimedb:latest
+        # spacetime-db-ha proxy
+        - name: spacetime-db-ha
+          image: ghcr.io/webc-fork/spacetime-db-ha:latest
           ports:
             - containerPort: 3001
               name: ws
@@ -74,17 +74,17 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-            - name: RTDB_NODE_ID
+            - name: SPACETIME_DB_HA_NODE_ID
               value: "$(POD_NAME)"
-            - name: RTDB_LISTEN_ADDR
+            - name: SPACETIME_DB_HA_LISTEN_ADDR
               value: "0.0.0.0:3001"
-            - name: RTDB_RAFT_ADDR
+            - name: SPACETIME_DB_HA_RAFT_ADDR
               value: "0.0.0.0:4001"
-            - name: RTDB_STDB_URL
+            - name: SPACETIME_DB_HA_STDB_URL
               value: "ws://127.0.0.1:3000"
-            - name: RTDB_PEERS
-              value: "rafttimedb-0.rafttimedb-raft:4001,rafttimedb-1.rafttimedb-raft:4001,rafttimedb-2.rafttimedb-raft:4001"
-            - name: RTDB_DATA_DIR
+            - name: SPACETIME_DB_HA_PEERS
+              value: "spacetime-db-ha-0.spacetime-db-ha-raft:4001,spacetime-db-ha-1.spacetime-db-ha-raft:4001,spacetime-db-ha-2.spacetime-db-ha-raft:4001"
+            - name: SPACETIME_DB_HA_DATA_DIR
               value: "/data/raft"
           volumeMounts:
             - name: raft-data

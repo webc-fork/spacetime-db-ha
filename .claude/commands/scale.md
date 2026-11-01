@@ -1,4 +1,4 @@
-# /scale — Scale the RaftTimeDB Cluster
+# /scale — Scale the spacetime-db-ha Cluster
 
 Add or remove nodes from the running cluster. Handles docker-compose entries, SpacetimeDB instances, module deployment, and Raft membership changes.
 
@@ -47,19 +47,19 @@ For each new node N, add two services to `deploy/docker/docker-compose.yml`:
       - raft-net
 ```
 
-**RaftTimeDB proxy node:**
+**spacetime-db-ha proxy node:**
 ```yaml
   node-N:
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
     environment:
-      RTDB_NODE_ID: "N"
-      RTDB_LISTEN_ADDR: "0.0.0.0:3001"
-      RTDB_RAFT_ADDR: "0.0.0.0:4001"
-      RTDB_STDB_URL: "ws://stdb-N:3000"
-      RTDB_PEERS: "<comma-separated list of ALL OTHER nodes: id=node-id:4001>"
-      RUST_LOG: "rafttimedb=info,openraft=warn"
+      SPACETIME_DB_HA_NODE_ID: "N"
+      SPACETIME_DB_HA_LISTEN_ADDR: "0.0.0.0:3001"
+      SPACETIME_DB_HA_RAFT_ADDR: "0.0.0.0:4001"
+      SPACETIME_DB_HA_STDB_URL: "ws://stdb-N:3000"
+      SPACETIME_DB_HA_PEERS: "<comma-separated list of ALL OTHER nodes: id=node-id:4001>"
+      RUST_LOG: "spacetime_db_ha=info,openraft=warn"
     ports:
       - "300N:3001"
       - "400N:4001"
@@ -75,7 +75,7 @@ volumes:
   stdb-data-N:
 ```
 
-**RTDB_PEERS format:** comma-separated `id=hostname:port` for ALL other nodes.
+**SPACETIME_DB_HA_PEERS format:** comma-separated `id=hostname:port` for ALL other nodes.
 Example for node 4 in a 5-node cluster: `"1=node-1:4001,2=node-2:4001,3=node-3:4001,5=node-5:4001"`
 
 ### 3. Start only the new containers
@@ -109,7 +109,7 @@ curl -s -X POST http://localhost:4001/cluster/add-node \
 
 Or via the CLI:
 ```bash
-cargo run -p rtdb -- add-node --node-id N --addr node-N:4001 --cluster http://localhost:4001
+cargo run -p sdha -- add-node --node-id N --addr node-N:4001 --cluster http://localhost:4001
 ```
 
 ### 6. Verify
@@ -133,7 +133,7 @@ curl -s -X POST http://localhost:4001/cluster/remove-node \
 
 Or via CLI:
 ```bash
-cargo run -p rtdb -- remove-node --node-id N --cluster http://localhost:4001
+cargo run -p sdha -- remove-node --node-id N --cluster http://localhost:4001
 ```
 
 **Never remove the current leader** — remove followers first. Check who's leader with:

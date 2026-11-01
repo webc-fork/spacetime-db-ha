@@ -1,18 +1,21 @@
 [package]
-name = "rafttimedb-cli"
+name = "spacetime-db-ha-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "CLI tool for managing RaftTimeDB clusters"
+description = "CLI tool for managing spacetime-db-ha clusters"
+repository.workspace = true
 
 [[bin]]
-name = "rtdb"
+name = "sdha"
 path = "src/main.rs"
 
 [dependencies]
-tokio.workspace = true
 clap.workspace = true
-serde_json.workspace = true
 anyhow.workspace = true
-openraft.workspace = true
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+zenoh = { version = "1.10.2", default-features = false, features = ["transport_udp", "transport_quic", "transport_quic_datagram"] }
+gxhash = "3.5.0"
+crossfire = "3.1.22"
+bitcode = { version = "0.6.9", default-features = false, features = ["std", "derive"] }
+compio = { version = "0.19", features = ["macros"] }
+rimalloc = { git = "https://github.com/moggedhedien/rimalloc.git", version = "0.1.0" }

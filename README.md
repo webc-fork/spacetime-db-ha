@@ -1,12 +1,14 @@
 <div align="center">
 
-# RaftTimeDB
+[中文](./doc/zh/README.md)
+
+# spacetime-db-ha
 
 ### Make SpacetimeDB indestructible.
 
 Distributed, fault-tolerant clustering for [SpacetimeDB](https://spacetimedb.com) — automatic replication, failover, and horizontal scaling without modifying SpacetimeDB itself.
 
-[![CI](https://github.com/NodeNestor/RaftimeDB/actions/workflows/ci.yml/badge.svg)](https://github.com/NodeNestor/RaftimeDB/actions)
+[![CI](https://github.com/webc-fork/spacetime-db-ha/actions/workflows/ci.yml/badge.svg)](https://github.com/webc-fork/spacetime-db-ha/actions)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85+-orange.svg)](https://www.rust-lang.org)
 
@@ -18,13 +20,13 @@ Distributed, fault-tolerant clustering for [SpacetimeDB](https://spacetimedb.com
 
 SpacetimeDB collapses your entire backend into the database — no servers, no microservices, just WASM modules running at memory speed. But it runs on a single node. If that node dies, everything dies.
 
-**RaftTimeDB fixes that.** It wraps SpacetimeDB in a [Raft consensus](https://raft.github.io/) layer that replicates every write across multiple nodes. Kill any node — the cluster keeps running. No data loss. No downtime. Clients don't even notice.
+**spacetime-db-ha fixes that.** It wraps SpacetimeDB in a [Raft consensus](https://raft.github.io/) layer over [Zenoh](https://zenoh.io/) + plaintext QUIC (`udp/<addr>#rel=1`) and [`bitcode`](https://github.com/SoftbearStudios/bitcode) serialization, replicating every write across multiple nodes with a single embedded [`fjall`](https://github.com/fjall-rs/fjall) LSM-tree storage engine per shard. Kill any node — the cluster keeps running. No data loss. No downtime.
 
 ```
 Your app (unchanged)
        │
-       ▼
-  RaftTimeDB ──── Raft ──── RaftTimeDB ──── Raft ──── RaftTimeDB
+       ▼ (Zenoh + plaintext QUIC + bitcode)
+  spacetime-db-ha ──── Raft ──── spacetime-db-ha ──── Raft ──── spacetime-db-ha
        │                        │                        │
   SpacetimeDB              SpacetimeDB              SpacetimeDB
   (identical)              (identical)              (identical)
@@ -37,61 +39,76 @@ Your app (unchanged)
 Spins up a 3-node cluster locally in seconds.
 
 ```bash
-git clone https://github.com/NodeNestor/RaftimeDB.git
-cd RaftTimeDB/deploy/docker
+git clone https://github.com/webc-fork/spacetime-db-ha.git
+cd spacetime-db-ha/deploy/docker
 docker compose up
 ```
 
-Connect your SpacetimeDB client to `ws://localhost:3001` (or `:3002`, `:3003` — any node works).
+Connect your Zenoh client to `udp/127.0.0.1:3001#rel=1` (or `:3002`, `:3003` — any node works).
 
 ### Option 2: Pre-built Binary
 
-Download from [Releases](https://github.com/NodeNestor/RaftimeDB/releases) for your platform:
+Download from [Releases](https://github.com/webc-fork/spacetime-db-ha/releases) for your platform:
 
 | Platform | Binary |
 |----------|--------|
-| Linux x86_64 | `rafttimedb-x86_64-unknown-linux-gnu` |
-| Windows x86_64 | `rafttimedb-x86_64-pc-windows-msvc.exe` |
-| macOS ARM | `rafttimedb-aarch64-apple-darwin` |
+| Linux x86_64 | `spacetime-db-ha-x86_64-unknown-linux-gnu` |
+| Windows x86_64 | `spacetime-db-ha-x86_64-pc-windows-msvc.exe` |
+| macOS ARM | `spacetime-db-ha-aarch64-apple-darwin` |
 
 ```bash
 # Start 3 nodes (each alongside a SpacetimeDB instance)
-rafttimedb --node-id 1 --peers node2:4001,node3:4001 --stdb-url ws://localhost:3000
-rafttimedb --node-id 2 --peers node1:4001,node3:4001 --stdb-url ws://localhost:3010
-rafttimedb --node-id 3 --peers node1:4001,node2:4001 --stdb-url ws://localhost:3020
+spacetime-db-ha --node-id 1 --peers 2=node2:4001,3=node3:4001 --stdb-url 127.0.0.1:3000
+spacetime-db-ha --node-id 2 --peers 1=node1:4001,3=node3:4001 --stdb-url 127.0.0.1:3010
+spacetime-db-ha --node-id 3 --peers 1=node1:4001,2=node2:4001 --stdb-url 127.0.0.1:3020
 ```
 
 ### Option 3: Build from Source
 
 ```bash
-# Requires Rust 1.85+
+# Requires Rust 1.85+ (nightly recommended)
 cargo install --path crates/proxy
-rafttimedb --help
+cargo install --path crates/cli
+spacetime-db-ha --help
+sdha --help
 ```
 
 ## How It Works
 
-SpacetimeDB reducers are **pure, deterministic, and replayable** — same inputs always produce same outputs. This is the key insight: if you feed the same ordered sequence of reducer calls to multiple SpacetimeDB instances, they all end up with identical state.
+SpacetimeDB reducers are **deterministic and replayable** — given the same ordered sequence of reducer calls, multiple SpacetimeDB instances converge to identical state.
 
-RaftTimeDB uses [Raft consensus](https://raft.github.io/) to create that ordered sequence across a cluster.
+spacetime-db-ha uses [Raft consensus](https://raft.github.io/) over Zenoh + plaintext QUIC to create that globally ordered sequence across a cluster.
 
-### The One-Byte Trick
+### Single-Byte Tag Classification
 
-The proxy reads **a single byte** from each WebSocket message to classify it:
+The proxy inspects **a single byte** from each BSATN payload to classify it:
 
 ```
-message[0] = BSATN tag byte (SpacetimeDB v2 protocol)
+payload[0] = BSATN tag byte (SpacetimeDB v2 protocol)
 
-Tag 0: Subscribe        → READ  → forward directly (no consensus)
-Tag 1: Unsubscribe      → READ  → forward directly
-Tag 2: OneOffQuery       → READ  → forward directly
-Tag 3: CallReducer       → WRITE → replicate through Raft, then forward
-Tag 4: CallProcedure     → WRITE → replicate through Raft, then forward
+Tag 0: Subscribe        → READ  → wait causal read barrier, then forward directly
+Tag 1: Unsubscribe      → READ  → wait causal read barrier, then forward directly
+Tag 2: OneOffQuery      → READ  → wait causal read barrier, then forward directly
+Tag 3: CallReducer      → WRITE → replicate through Raft, then deliver in log order
+Tag 4: CallProcedure    → WRITE → replicate through Raft, then deliver in log order
 ```
 
-- **Writes** go through Raft consensus first (adds ~1-5ms), then to SpacetimeDB
-- **Reads** go straight to the local SpacetimeDB (zero overhead — state is identical on all replicas)
-- The entire message is replicated as an **opaque blob** — no BSATN deserialization needed
+- **Writes** go through Raft consensus first, persist to the local `fjall` database (`raft_log` + `state_machine`), and are delivered to local SpacetimeDB in strict Raft log index order (`last_delivered` watermark)
+- **Reads** wait for local `applied` to catch up to the node's known `last_log_index` (causal read barrier), then go straight to the local SpacetimeDB
+- The entire BSATN message is replicated as an **opaque blob** — no BSATN schema deserialization needed
+
+### Delivery & Consistency Guarantees
+
+- **Unified At-Least-Once Delivery**: Every committed write is persisted in `fjall` before forwarding. A per-shard `last_delivered` watermark tracks upstream delivery; on restart, any committed entries in `(last_delivered, last_applied]` are automatically replayed before accepting new traffic.
+- **Strict Log-Index Ordering**: Even when multiple clients write concurrently to the same shard, upstream delivery waits for `log_id.index - 1` to be delivered before sending `log_id.index`.
+- **Single-Engine Atomic Storage**: Each shard shares one `fjall::Database` (`{data_dir}/shard-{id}/fjall`) with three keyspaces (`raft_log`, `raft_meta`, `state_machine`), ensuring atomic cross-keyspace `WriteBatch` log purges and startup watermark alignment.
+- **Bounded Backpressure**: All internal queues (`FORWARDER_CHANNEL_CAPACITY = 4096`, `CONFIG_CHANNEL_CAPACITY = 256`, `UPSTREAM_QUEUE_CAPACITY = 1024`) are bounded to prevent unbounded memory growth under slow upstreams.
+
+### Architectural Boundaries & Assumptions
+
+1. **Deterministic & Idempotent Reducers**: Because crash recovery replays `(last_delivered, last_applied]` under at-least-once semantics, SpacetimeDB reducers should be deterministic and idempotent.
+2. **Shard 0 Metadata Plane**: Shard creation, deletion, and module routing (`ShardConfigCommand`) are replicated through Shard 0's Raft group (prefixed with `SHARD_CONFIG_MAGIC = [0xFF, b'S', b'F', b'G']`). If Shard 0 loses quorum, shard topology changes pause while existing shards continue serving traffic.
+3. **Accounting Snapshots**: Raft snapshots store consensus metadata (`last_applied`, `last_delivered`, membership, shard routes). SpacetimeDB business tables live inside each node's local SpacetimeDB instance.
 
 ### What Happens When a Node Dies
 
@@ -109,12 +126,12 @@ Later:   Node 1 (LEADER) ←→ Node 2 ←→ Node 3 (rejoins, catches up)
 1. Raft detects the failure (missed heartbeats, ~1-2 seconds)
 2. If the leader died, remaining nodes elect a new leader (<5 seconds)
 3. Cluster continues serving with the remaining majority
-4. When the dead node comes back, it catches up from the Raft log
+4. When the dead node comes back, it catches up from the Raft log and replays any undelivered entries
 5. **Zero data loss** — Raft only acknowledges writes after majority commit
 
 ## Deploy Anywhere
 
-RaftTimeDB is a single binary. Run it wherever you want.
+spacetime-db-ha is a single binary. Run it wherever you want.
 
 ### Docker Compose (local dev / small deployments)
 
@@ -123,38 +140,38 @@ cd deploy/docker
 docker compose up
 ```
 
-3 SpacetimeDB instances + 3 RaftTimeDB proxies. Ports 3001-3003 exposed.
+3 SpacetimeDB instances + 3 spacetime-db-ha proxies. Ports 3001-3003 exposed.
 
 ### Docker (single node)
 
 ```bash
-docker run -p 3001:3001 -p 4001:4001 \
-  -e RTDB_NODE_ID=1 \
-  -e RTDB_STDB_URL=ws://host.docker.internal:3000 \
-  -e RTDB_PEERS=node2:4001,node3:4001 \
-  ghcr.io/nodenestor/rafttimedb:latest
+docker run -p 3001:3001/udp -p 4001:4001/udp -p 4001:4001/tcp \
+  -e SPACETIME_DB_HA_NODE_ID=1 \
+  -e SPACETIME_DB_HA_STDB_URL=host.docker.internal:3000 \
+  -e SPACETIME_DB_HA_PEERS=2=node2:4001,3=node3:4001 \
+  ghcr.io/webc-fork/spacetime-db-ha:latest
 ```
 
 ### Windows
 
-Download `rafttimedb.exe` from [Releases](https://github.com/NodeNestor/RaftimeDB/releases) or build from source:
+Download `spacetime-db-ha.exe` from [Releases](https://github.com/webc-fork/spacetime-db-ha/releases) or build from source:
 
 ```powershell
 cargo build --release
-.\target\release\rafttimedb.exe --node-id 1 --stdb-url ws://localhost:3000 --peers node2:4001,node3:4001
+.\target\release\spacetime-db-ha.exe --node-id 1 --stdb-url 127.0.0.1:3000 --peers 2=node2:4001,3=node3:4001
 ```
 
 ### Linux / macOS
 
 ```bash
 cargo build --release
-./target/release/rafttimedb --node-id 1 --stdb-url ws://localhost:3000 --peers node2:4001,node3:4001
+./target/release/spacetime-db-ha --node-id 1 --stdb-url 127.0.0.1:3000 --peers 2=node2:4001,3=node3:4001
 ```
 
 ### Kubernetes (K8s / K3s)
 
 ```bash
-helm install rafttimedb deploy/helm/rafttimedb \
+helm install spacetime-db-ha deploy/helm/spacetime-db-ha \
   --set replicas=3 \
   --set spacetimedb.image=clockworklabs/spacetime:latest
 ```
@@ -172,35 +189,40 @@ kubectl apply -f deploy/k3s/
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: rafttimedb
+  name: spacetime-db-ha
 spec:
-  serviceName: rafttimedb-raft
+  serviceName: spacetime-db-ha-raft
   replicas: 3
   selector:
     matchLabels:
-      app: rafttimedb
+      app: spacetime-db-ha
   template:
     metadata:
       labels:
-        app: rafttimedb
+        app: spacetime-db-ha
     spec:
       containers:
-        - name: rafttimedb
-          image: ghcr.io/nodenestor/rafttimedb:latest
+        - name: spacetime-db-ha
+          image: ghcr.io/webc-fork/spacetime-db-ha:latest
           ports:
-            - containerPort: 3001  # Client WebSocket
-              name: ws
-            - containerPort: 4001  # Raft inter-node
-              name: raft
+            - containerPort: 3001  # Client Zenoh QUIC (UDP)
+              protocol: UDP
+              name: client-quic
+            - containerPort: 4001  # Raft Zenoh QUIC (UDP)
+              protocol: UDP
+              name: raft-quic
+            - containerPort: 4001  # Health & Prometheus Metrics (TCP)
+              protocol: TCP
+              name: metrics-tcp
           env:
-            - name: RTDB_NODE_ID
+            - name: SPACETIME_DB_HA_NODE_ID
               valueFrom:
                 fieldRef:
-                  fieldPath: metadata.name  # rafttimedb-0, rafttimedb-1, ...
-            - name: RTDB_STDB_URL
-              value: "ws://localhost:3000"
-            - name: RTDB_PEERS
-              value: "rafttimedb-0.rafttimedb-raft:4001,rafttimedb-1.rafttimedb-raft:4001,rafttimedb-2.rafttimedb-raft:4001"
+                  fieldPath: metadata.name
+            - name: SPACETIME_DB_HA_STDB_URL
+              value: "127.0.0.1:3000"
+            - name: SPACETIME_DB_HA_PEERS
+              value: "1=spacetime-db-ha-0.spacetime-db-ha-raft:4001,2=spacetime-db-ha-1.spacetime-db-ha-raft:4001,3=spacetime-db-ha-2.spacetime-db-ha-raft:4001"
         - name: spacetimedb
           image: clockworklabs/spacetime:latest
           command: ["spacetimedb-standalone", "start", "--listen-addr", "0.0.0.0:3000"]
@@ -217,32 +239,6 @@ spec:
         resources:
           requests:
             storage: 10Gi
----
-# Headless service for Raft peer discovery
-apiVersion: v1
-kind: Service
-metadata:
-  name: rafttimedb-raft
-spec:
-  clusterIP: None
-  selector:
-    app: rafttimedb
-  ports:
-    - port: 4001
-      name: raft
----
-# Client-facing service
-apiVersion: v1
-kind: Service
-metadata:
-  name: rafttimedb
-spec:
-  type: LoadBalancer
-  selector:
-    app: rafttimedb
-  ports:
-    - port: 3001
-      name: ws
 ```
 
 </details>
@@ -251,55 +247,58 @@ spec:
 
 ```bash
 # Machine 1 (192.168.1.10)
-rafttimedb --node-id 1 --listen-addr 0.0.0.0:3001 --raft-addr 0.0.0.0:4001 \
-  --stdb-url ws://127.0.0.1:3000 --peers 192.168.1.11:4001,192.168.1.12:4001
+spacetime-db-ha --node-id 1 --listen-addr 0.0.0.0:3001 --raft-addr 0.0.0.0:4001 \
+  --raft-advertise-addr 192.168.1.10:4001 \
+  --stdb-url 127.0.0.1:3000 --peers 2=192.168.1.11:4001,3=192.168.1.12:4001
 
 # Machine 2 (192.168.1.11)
-rafttimedb --node-id 2 --listen-addr 0.0.0.0:3001 --raft-addr 0.0.0.0:4001 \
-  --stdb-url ws://127.0.0.1:3000 --peers 192.168.1.10:4001,192.168.1.12:4001
+spacetime-db-ha --node-id 2 --listen-addr 0.0.0.0:3001 --raft-addr 0.0.0.0:4001 \
+  --raft-advertise-addr 192.168.1.11:4001 \
+  --stdb-url 127.0.0.1:3000 --peers 1=192.168.1.10:4001,3=192.168.1.12:4001
 
 # Machine 3 (192.168.1.12)
-rafttimedb --node-id 3 --listen-addr 0.0.0.0:3001 --raft-addr 0.0.0.0:4001 \
-  --stdb-url ws://127.0.0.1:3000 --peers 192.168.1.10:4001,192.168.1.11:4001
+spacetime-db-ha --node-id 3 --listen-addr 0.0.0.0:3001 --raft-addr 0.0.0.0:4001 \
+  --raft-advertise-addr 192.168.1.12:4001 \
+  --stdb-url 127.0.0.1:3000 --peers 1=192.168.1.10:4001,2=192.168.1.11:4001
 ```
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│                    RaftTimeDB Node                        │
-│                                                          │
-│  ┌────────────────────────────────────────────────────┐  │
-│  │              WebSocket Proxy (:3001)                │  │
-│  │                                                    │  │
-│  │  Client msg ──► Read tag byte ──► Write? ──────┐   │  │
-│  │                      │                         │   │  │
-│  │                      │ Read                    │   │  │
-│  │                      ▼                         ▼   │  │
-│  │              Forward directly          Raft consensus  │
-│  │              to SpacetimeDB       (replicate to peers) │
-│  │                      │                         │   │  │
-│  │                      │            After commit │   │  │
-│  │                      ▼                    ▼    │   │  │
-│  │              ┌──────────────────────────────┐  │   │  │
-│  │              │  Local SpacetimeDB (:3000)   │  │   │  │
-│  │              │  (identical on all nodes)    │  │   │  │
-│  │              └──────────────────────────────┘  │   │  │
-│  └────────────────────────────────────────────────┘  │  │
-│                                                      │  │
-│  ┌────────────────────────────────────────────────┐  │  │
-│  │           Raft Transport (:4001)               │  │  │
-│  │  Communicates with peer nodes for consensus    │  │  │
-│  └────────────────────────────────────────────────┘  │  │
-└──────────────────────────────────────────────────────┘  │
-                                                          │
-        ◄──── Raft protocol ────►                         │
-                                                          │
-┌──────────────────┐          ┌──────────────────┐        │
-│  RaftTimeDB      │          │  RaftTimeDB      │        │
-│  Node 2          │          │  Node 3          │        │
-│  (same layout)   │          │  (same layout)   │        │
-└──────────────────┘          └──────────────────┘        │
+┌──────────────────────────────────────────────────────────────┐
+│                     spacetime-db-ha Node                     │
+│                                                              │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │        Zenoh Client Proxy (udp/:3001#rel=1)            │  │
+│  │                                                        │  │
+│  │  Client msg ──► Read tag byte ──► Write? ──────────┐   │  │
+│  │                      │                             │   │  │
+│  │                      │ Read (wait read barrier)    │   │  │
+│  │                      ▼                             ▼   │  │
+│  │              Forward directly              Raft consensus │
+│  │              to SpacetimeDB           (Zenoh QUIC + fjall)│
+│  │                      │                             │   │  │
+│  │                      │         Log-ordered deliver │   │  │
+│  │                      ▼                        ▼    │   │  │
+│  │              ┌──────────────────────────────────┐  │   │  │
+│  │              │    Local SpacetimeDB (:3000)     │  │   │  │
+│  │              │    (identical on all nodes)      │  │   │  │
+│  │              └──────────────────────────────────┘  │   │  │
+│  └────────────────────────────────────────────────────┘   │  │
+│                                                           │  │
+│  ┌────────────────────────────────────────────────────┐   │  │
+│  │  Raft & Mgmt Transport (udp/:4001#rel=1 + TCP)     │   │  │
+│  │  Zenoh QUIC RPCs (bitcode) + /metrics & /health    │   │  │
+│  └────────────────────────────────────────────────────┘   │  │
+└───────────────────────────────────────────────────────────┘  │
+                                                               │
+        ◄──── Zenoh + Plaintext QUIC + bitcode ────►           │
+                                                               │
+┌──────────────────┐          ┌──────────────────┐             │
+│ spacetime-db-ha  │          │ spacetime-db-ha  │             │
+│ Node 2           │          │ Node 3           │             │
+│ (same layout)    │          │ (same layout)    │             │
+└──────────────────┘          └──────────────────┘             │
 ```
 
 ## Use Cases
@@ -311,26 +310,32 @@ Thousands of players across sharded game zones. Each zone is a SpacetimeDB modul
 Hundreds of autonomous agents with shared state. Agents call reducers to update shared knowledge, subscribe to tables for real-time updates. The swarm is indestructible — pull the plug on any node, agents reconnect and keep going.
 
 ### Real-Time Collaboration
-Shared documents, cursors, presence. SpacetimeDB's subscription system pushes deltas to all connected clients. RaftTimeDB ensures the backing state survives failures.
+Shared documents, cursors, presence. SpacetimeDB's subscription system pushes deltas to all connected clients. spacetime-db-ha ensures the backing state survives failures.
 
 ### Any SpacetimeDB App That Can't Afford Downtime
-If your app matters, it should be replicated. RaftTimeDB makes that a config change, not a rewrite.
+If your app matters, it should be replicated. spacetime-db-ha makes that a config change, not a rewrite.
 
-## CLI Tool
+## CLI Tool (`sdha`)
+
+All cluster and shard operations communicate over Zenoh + plaintext QUIC using `bitcode` payloads:
 
 ```bash
 # Cluster management
-rtdb init --nodes 1=node1:4001 2=node2:4001 3=node3:4001   # Bootstrap cluster (once)
-rtdb status --addr http://localhost:4001                      # Show node status
-rtdb add-node --node-id 4 --addr new-node:4001               # Add a node
-rtdb remove-node --node-id 2                                  # Remove a node
+sdha init --nodes 1=127.0.0.1:4001 2=127.0.0.1:4002 3=127.0.0.1:4003  # Bootstrap cluster (once)
+sdha status --addr 127.0.0.1:4001                                     # Show node status
+sdha add-node --node-id 4 --addr 127.0.0.1:4004 --cluster 127.0.0.1:4001
+sdha remove-node --node-id 2 --cluster 127.0.0.1:4001
 
-# Shard management (multi-raft)
-rtdb create-shard --shard-id 1 --cluster http://localhost:4001
-rtdb add-route --module my_game --shard-id 1 --cluster http://localhost:4001
-rtdb remove-route --module my_game --cluster http://localhost:4001
-rtdb list-shards --addr http://localhost:4001
-rtdb shard-status --shard-id 1 --addr http://localhost:4001
+# Shard management (Multi-Raft)
+sdha create-shard --shard-id 1 --cluster 127.0.0.1:4001
+sdha remove-shard --shard-id 1 --cluster 127.0.0.1:4001
+sdha add-route --module my_game --shard-id 1 --cluster 127.0.0.1:4001
+sdha remove-route --module my_game --cluster 127.0.0.1:4001
+sdha list-shards --addr 127.0.0.1:4001
+sdha shard-status --shard-id 1 --addr 127.0.0.1:4001
+
+# Module deployment across SpacetimeDB nodes
+sdha deploy --module ./my_module.wasm --name my_game --servers 127.0.0.1:3000 127.0.0.1:3010
 ```
 
 ## Configuration
@@ -339,56 +344,52 @@ All options can be set via CLI flags or environment variables:
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
-| `--node-id` | `RTDB_NODE_ID` | *required* | Unique node identifier |
-| `--listen-addr` | `RTDB_LISTEN_ADDR` | `0.0.0.0:3001` | Client WebSocket address |
-| `--raft-addr` | `RTDB_RAFT_ADDR` | `0.0.0.0:4001` | Raft inter-node address |
-| `--stdb-url` | `RTDB_STDB_URL` | `ws://127.0.0.1:3000` | Local SpacetimeDB URL |
-| `--peers` | `RTDB_PEERS` | *required* | Comma-separated peer Raft addresses |
-| `--data-dir` | `RTDB_DATA_DIR` | `./data` | Persistent data directory |
-| `--tls-cert` | `RTDB_TLS_CERT` | *none* | Path to TLS certificate (PEM) |
-| `--tls-key` | `RTDB_TLS_KEY` | *none* | Path to TLS private key (PEM) |
-| `--tls-ca-cert` | `RTDB_TLS_CA_CERT` | *none* | CA cert for peer verification (PEM) |
+| `--node-id` | `SPACETIME_DB_HA_NODE_ID` | *required* | Unique node identifier (`u64`) |
+| `--listen-addr` | `SPACETIME_DB_HA_LISTEN_ADDR` | `0.0.0.0:3001` | Client Zenoh plaintext QUIC listen address (`udp/<addr>#rel=1`) |
+| `--raft-addr` | `SPACETIME_DB_HA_RAFT_ADDR` | `0.0.0.0:4001` | Raft & management Zenoh QUIC (UDP) + `/metrics` & `/cluster/health` (TCP) |
+| `--raft-advertise-addr` | `SPACETIME_DB_HA_RAFT_ADVERTISE_ADDR` | *falls back to `--raft-addr`* | Peer-reachable Raft address advertised in membership tables |
+| `--stdb-url` | `SPACETIME_DB_HA_STDB_URL` | `127.0.0.1:3000` | Local SpacetimeDB Zenoh plaintext QUIC endpoint |
+| `--peers` | `SPACETIME_DB_HA_PEERS` | `""` | Comma-separated peer Raft addresses (`id=host:port` or `host:port`) |
+| `--data-dir` | `SPACETIME_DB_HA_DATA_DIR` | `./data` | Persistent data directory (`{data_dir}/shard-{id}/fjall`) |
 
 ## Production Features
 
-RaftTimeDB includes everything needed for production deployments:
+spacetime-db-ha includes everything needed for production deployments:
 
-- **TLS encryption** — inter-node Raft RPCs and management API served over HTTPS (`--tls-cert` + `--tls-key`)
-- **Prometheus metrics** — `GET /metrics` exposes Raft term, leader status, connections, write latency, and more
-- **Health checks** — `GET /cluster/health` returns 200 when leader is known, 503 otherwise
-- **Leader discovery** — `GET /cluster/leader` returns the current leader's address for client routing
-- **Client reconnection hints** — on graceful shutdown, WebSocket close frames include `leader=<id>:<addr>` so clients know where to reconnect
-- **Graceful shutdown** — Ctrl+C / SIGTERM triggers coordinated shutdown: drain connections, send close frames, 5-second drain period
-- **Persistent Raft log** — redb (pure Rust, ACID) stores Raft log + vote on disk; nodes survive restarts
-- **Snapshot support** — fast catch-up for new or restarted nodes
-- **Multi-shard (Multi-Raft)** — each SpacetimeDB module can get its own Raft group for parallel write throughput
+- **Zenoh + Plaintext QUIC Transport** — low-latency `udp/<addr>#rel=1` transport for client proxy, upstream forwarding, Raft replication, and cluster management without HTTP/WebSocket/TLS overhead
+- **Compact `bitcode` Serialization** — all RPC frames, Raft log entries, and management payloads are encoded with `bitcode` instead of JSON
+- **Single-Engine `fjall` Persistence** — pure-Rust LSM-tree storage engine with atomic cross-keyspace batches (`raft_log`, `raft_meta`, `state_machine`) per shard
+- **Prometheus Metrics** — available via TCP `GET /metrics` on `raft-addr` and Zenoh queryable `metrics` (exposes Raft term, leader status, active shards, delivery lag entries, connections, and write latency)
+- **Linearizable Health Checks** — available via TCP `GET /cluster/health` on `raft-addr` and Zenoh queryable `cluster/health`; verifies the node is running, has a known leader, and (if leader) passes `ensure_linearizable()`
+- **Leader Discovery & Reconnection Hints** — Zenoh queryable `cluster/leader` and pub/sub topic `stdb/client/{session_id}/control` broadcast `leader=<id>:<addr>` during graceful drain
+- **Self-Healing Shard Reconciler** — background reconciler periodically checks uninitialized shards and drives idempotent Raft initialization
+- **Multi-Shard (Multi-Raft)** — dynamically create and remove shards and module routes via Shard 0 consensus
 
 ## Roadmap
 
 ### Phase 1: Single-Shard Replication
-- [x] WebSocket proxy with BSATN single-byte tag inspection
-- [x] Raft consensus integration (openraft)
+- [x] Zenoh + plaintext QUIC proxy with BSATN single-byte tag inspection
+- [x] Raft consensus integration (`openraft` + `bitcode`)
 - [x] Docker Compose (3-node local cluster)
 - [x] GitHub Actions CI (Linux, Windows, macOS)
 - [x] Cluster bootstrap and leader election
-- [x] Persistent log store (redb — pure Rust, ACID)
-- [x] End-to-end working demo
+- [x] Persistent log & state machine store (`fjall` LSM-tree)
+- [x] Crash-recovery replay via `last_delivered` watermark
 
 ### Phase 2: Production Ready
-- [x] TLS encryption for inter-node and client communication
-- [x] Prometheus metrics (Raft health, connections, latency)
-- [x] Snapshot support (new node catch-up)
+- [x] Prometheus metrics (`GET /metrics` + Zenoh `metrics`, including shard count & delivery lag)
+- [x] Snapshot support & startup watermark alignment
 - [x] Client reconnection hints on failover
 - [x] Graceful shutdown and connection draining
-- [x] Health check and leader discovery endpoints
+- [x] Linearizable health check and leader discovery endpoints
 - [x] Helm chart for K8s/K3s
 
 ### Phase 3: Horizontal Scaling (Multi-Raft)
 - [x] Each SpacetimeDB module gets its own Raft group
 - [x] Shard router (route clients to correct Raft group by module name)
-- [x] Shard management API + CLI (create shards, add/remove routes)
-- [x] Shard config replicated via Raft consensus (no external store)
-- [x] Per-shard persistent log stores with auto-migration
+- [x] Shard management API + CLI (`create-shard`, `remove-shard`, `add-route`, `remove-route`)
+- [x] Shard config replicated via Shard 0 Raft consensus (`SHARD_CONFIG_MAGIC`)
+- [x] Per-shard `fjall` instances with background initialization reconciler
 - [x] Backwards compatible — existing single-shard clusters work unchanged
 - [ ] Shard splitting when memory threshold exceeded
 - [ ] Coalesced heartbeats across Raft groups (CockroachDB pattern)
@@ -406,13 +407,15 @@ RaftTimeDB includes everything needed for production deployments:
 | Component | Choice | Why |
 |-----------|--------|-----|
 | Language | [Rust](https://www.rust-lang.org) | Same as SpacetimeDB. Memory safe. Fast. |
-| Consensus | [openraft](https://github.com/databendlabs/openraft) | Async/Tokio, event-driven, 3.5M+ writes/sec |
-| WebSocket | [tokio-tungstenite](https://github.com/snapview/tokio-tungstenite) | Mature, full message inspection, zero-copy |
-| Runtime | [Tokio](https://tokio.rs) | Industry standard async runtime |
+| Consensus | [openraft](https://github.com/databendlabs/openraft) (`openraft-rt-compio`) | Async/Compio event-driven Raft consensus |
+| Transport | [Zenoh](https://zenoh.io/) (`udp/<addr>#rel=1`) | Unified pub/sub & query/reply over plaintext QUIC (`LinkUnicastQuicUnsecure`) |
+| Serialization | [bitcode](https://github.com/SoftbearStudios/bitcode) | Ultra-fast, compact bitwise serialization (replaces JSON & `serde`) |
+| Channels | [crossfire](https://github.com/frostyplanet/crossfire-rs) | High-performance lockless MPSC/MPMC async & blocking channels |
+| Runtime | [compio](https://github.com/compio-rs/compio) | Completion-based async runtime (`io_uring` / IOCP / polling) |
+| Allocator | [rimalloc](https://github.com/moggedhedien/rimalloc) | High-performance pure-Rust global memory allocator (`Rimalloc`) |
 | Protocol | BSATN (SpacetimeDB native) | One-byte classification, opaque blob replication |
-| TLS | [rustls](https://github.com/rustls/rustls) + [tokio-rustls](https://github.com/rustls/tokio-rustls) | Pure Rust TLS, no OpenSSL dependency |
-| Metrics | [prometheus](https://github.com/tikv/rust-prometheus) | Same crate TiKV uses. Text format for Grafana/etc. |
-| Persistence | [redb](https://github.com/cberner/redb) | Pure Rust embedded ACID database for Raft log |
+| Metrics | Native Lockless Atomics (`const &str` + `itoa` + `zmij`) | Zero-lock `const` static HTTP JSON exposition via `compio` TCP & Zenoh |
+| Persistence | [fjall](https://github.com/fjall-rs/fjall) | Pure Rust LSM-tree storage engine with cross-keyspace atomic batches |
 | K8s *(planned)* | [kube-rs](https://kube.rs) | Rust-native K8s operator framework, CNCF Sandbox |
 
 ## Design Decisions
@@ -421,6 +424,18 @@ RaftTimeDB includes everything needed for production deployments:
 <summary><b>Why a proxy instead of forking SpacetimeDB?</b></summary>
 
 We don't modify SpacetimeDB at all. New SpacetimeDB versions work automatically. The proxy reads one byte per message — it's invisible to both clients and SpacetimeDB. Your existing modules work unchanged.
+</details>
+
+<details>
+<summary><b>Why Zenoh + plaintext QUIC + bitcode instead of HTTP/WebSocket/JSON?</b></summary>
+
+Zenoh over plaintext QUIC (`udp/<addr>#rel=1`) provides multiplexed streams, built-in pub/sub and queryables, and eliminates HTTP/WebSocket framing and TLS handshake overhead on internal networks. Pairing it with `bitcode` yields compact binary payloads and lower CPU/serialization latency than JSON.
+</details>
+
+<details>
+<summary><b>Why fjall over redb?</b></summary>
+
+Write-intensive Raft logs benefit from an LSM-tree architecture (`fjall`), and sharing a single `fjall::Database` with multiple keyspaces (`raft_log`, `raft_meta`, `state_machine`) per shard allows atomic cross-keyspace `WriteBatch` commits without managing multiple database files per shard.
 </details>
 
 <details>
@@ -433,12 +448,6 @@ openraft is event-driven (not tick-based), so operations proceed at network spee
 <summary><b>Why no shared storage (Longhorn/Ceph)?</b></summary>
 
 Raft replication handles durability. Adding distributed storage underneath is a redundant replication layer with added latency. Each node uses local disk — same approach CockroachDB and TiKV use.
-</details>
-
-<details>
-<summary><b>Why not just wait for SpacetimeDB to add clustering?</b></summary>
-
-They might! But SpacetimeDB is focused on their game (BitCraft) and single-node performance. Clustering is not on their near-term roadmap. RaftTimeDB fills the gap now, and if SpacetimeDB adds native clustering later, the patterns here will inform that work.
 </details>
 
 ## Contributing

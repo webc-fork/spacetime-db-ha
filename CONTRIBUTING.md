@@ -1,6 +1,6 @@
-# Contributing to RaftTimeDB
+# Contributing to spacetime-db-ha
 
-Thanks for your interest in contributing! RaftTimeDB is early-stage and there's a lot to build.
+Thanks for your interest in contributing! spacetime-db-ha is early-stage and there's a lot to build.
 
 ## Getting Started
 
@@ -13,15 +13,16 @@ Thanks for your interest in contributing! RaftTimeDB is early-stage and there's 
 ### Building
 
 ```bash
-git clone https://github.com/NodeNestor/RaftimeDB.git
-cd RaftTimeDB
+git clone https://github.com/webc-fork/spacetime-db-ha.git
+cd spacetime-db-ha
 cargo build
 ```
 
 ### Running the Tests
 
 ```bash
-cargo test
+./test.sh          # cargo nextest: unit + integration tests (crates/proxy/tests/)
+./sh/clippy.sh     # fixrs + rustfmt + clippy (-D warnings)
 ```
 
 ### Running Locally (Docker Compose)
@@ -42,7 +43,7 @@ crates/
 │       ├── raft/       # Raft consensus (openraft)
 │       ├── websocket/  # WebSocket proxy (client ↔ SpacetimeDB)
 │       └── router/     # Shard routing (multi-raft)
-├── cli/            # CLI tool (rtdb)
+├── cli/            # CLI tool (sdha)
 deploy/
 ├── docker/         # Docker Compose for local dev
 ├── helm/           # Helm chart for K8s/K3s
@@ -51,7 +52,7 @@ deploy/
 
 ## What Needs Work
 
-Check the [GitHub Issues](https://github.com/NodeNestor/RaftimeDB/issues) for current priorities. The big areas:
+Check the [GitHub Issues](https://github.com/webc-fork/spacetime-db-ha/issues) for current priorities. The big areas:
 
 ### Completed
 - ~~Cluster bootstrap (initial leader election)~~
@@ -81,7 +82,7 @@ Check the [GitHub Issues](https://github.com/NodeNestor/RaftimeDB/issues) for cu
 
 1. Fork the repo and create a branch from `main`
 2. Make your changes
-3. Ensure `cargo test` and `cargo clippy` pass
+3. Ensure `./test.sh` and `./sh/clippy.sh` pass
 4. Write a clear PR description explaining what and why
 5. Submit!
 

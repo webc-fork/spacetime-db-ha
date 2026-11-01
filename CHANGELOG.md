@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - WebSocket proxy with BSATN tag byte inspection (read/write classification)
 - Raft consensus integration via openraft
 - State machine that forwards committed writes to SpacetimeDB
-- CLI tool (`rtdb`) with cluster management commands
+- CLI tool (`sdha`) with cluster management commands
 - Docker Compose setup for local 3-node cluster
 - Dockerfile with multi-stage Rust build
 - Persistent Raft log store using redb (pure Rust, ACID) — survives restarts
@@ -36,3 +36,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CLI shard commands: `create-shard`, `add-route`, `remove-route`, `list-shards`, `shard-status`
 - Membership changes (`add-node`/`remove-node`) now propagate to all active shards
 - Full backwards compatibility — existing single-shard clusters work with zero config changes (shard 0 is the default)
+
+### Changed
+- Renamed the project from RaftimeDB to spacetime-db-ha: crate and binary names, CLI command (`sdha`), environment variables (`SPACETIME_DB_HA_*`), Prometheus metric prefix (`spacetime_db_ha_*`), Helm chart, k3s manifests, Docker image and CI artifacts
+- Writes are forwarded only after the entry is applied locally, so nothing executes before consensus commits and each connection keeps read-your-writes
+- Raft entries now carry the target `db_path`; the per-shard forwarder multiplexes one shared upstream connection per database instead of reusing the first client's path
+- The state machine persists its applied watermark, membership and shard routing to `state-machine.redb` — a restart resumes from that watermark instead of replaying every historical write
+- Split `spacetime-db-ha` into a library + thin binary (`lib.rs` / `server.rs`) so integration tests can live in `crates/proxy/tests/`
+- Message classification uses a compile-time 256-entry lookup table instead of per-message branching
+- Write payloads carry `bytes::Bytes` end-to-end — leader forwarding and log serialization no longer copy the message
+- State machine takes one lock per applied entry (`parking_lot`) and reuses installed snapshot bytes
+- `get_log_state` reports `last_purged` for a fully purged log, so openraft no longer sees a state rollback after restart
+- Log store helpers use a small internal error type; `truncate`/`purge` propagate redb errors instead of dropping them
+- Management API returns structured errors instead of panicking when shard 0 is unavailable
+
+### Removed
+- Unused in-memory log store (`raft/log_store.rs`) and empty `websocket/upstream.rs` placeholder
+- Dead exports: `is_read_tag`, `is_known_tag`, `ShardRouter::route_count`, `ShardRouter::set_default_shard`, `StateMachineStore::last_applied`, `StateMachineStore::applied_count`
+- Unused `toml` workspace dependency and stale workspace metadata

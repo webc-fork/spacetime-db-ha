@@ -1,4 +1,4 @@
-# Local development: 3-node RaftTimeDB cluster with 3 SpacetimeDB instances.
+# Local development: 3-node spacetime-db-ha cluster with 3 SpacetimeDB instances.
 # Usage: docker compose up
 #
 # This gives you a fully functional 3-node Raft cluster locally.
@@ -7,7 +7,7 @@
 # SpacetimeDB HTTP ports exposed on 5001-5003 for module publishing.
 #
 # After startup, bootstrap the cluster:
-#   rtdb init --nodes 1=node-1:4001 2=node-2:4001 3=node-3:4001
+#   sdha init --nodes 1=node-1:4001 2=node-2:4001 3=node-3:4001
 #
 # Publish modules to all nodes:
 #   ./scripts/publish-all.sh my_module_dir
@@ -44,20 +44,20 @@ services:
     networks:
       - raft-net
 
-  # --- RaftTimeDB proxy nodes ---
+  # --- spacetime-db-ha proxy nodes ---
   # Ports: 3001-3003 (client WebSocket), 4001-4003 (Raft API + Prometheus metrics at /metrics)
   node-1:
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
     environment:
-      RTDB_NODE_ID: "1"
-      RTDB_LISTEN_ADDR: "0.0.0.0:3001"
-      RTDB_RAFT_ADDR: "0.0.0.0:4001"
-      RTDB_STDB_URL: "ws://stdb-1:3000"
-      RTDB_PEERS: "2=node-2:4001,3=node-3:4001"
-      RTDB_DATA_DIR: "/data"
-      RUST_LOG: "rafttimedb=info,openraft=warn"
+      SPACETIME_DB_HA_NODE_ID: "1"
+      SPACETIME_DB_HA_LISTEN_ADDR: "0.0.0.0:3001"
+      SPACETIME_DB_HA_RAFT_ADDR: "0.0.0.0:4001"
+      SPACETIME_DB_HA_STDB_URL: "ws://stdb-1:3000"
+      SPACETIME_DB_HA_PEERS: "2=node-2:4001,3=node-3:4001"
+      SPACETIME_DB_HA_DATA_DIR: "/data"
+      RUST_LOG: "spacetime_db_ha=info,openraft=warn"
     ports:
       - "3001:3001"
       - "4001:4001"
@@ -79,13 +79,13 @@ services:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
     environment:
-      RTDB_NODE_ID: "2"
-      RTDB_LISTEN_ADDR: "0.0.0.0:3001"
-      RTDB_RAFT_ADDR: "0.0.0.0:4001"
-      RTDB_STDB_URL: "ws://stdb-2:3000"
-      RTDB_PEERS: "1=node-1:4001,3=node-3:4001"
-      RTDB_DATA_DIR: "/data"
-      RUST_LOG: "rafttimedb=info,openraft=warn"
+      SPACETIME_DB_HA_NODE_ID: "2"
+      SPACETIME_DB_HA_LISTEN_ADDR: "0.0.0.0:3001"
+      SPACETIME_DB_HA_RAFT_ADDR: "0.0.0.0:4001"
+      SPACETIME_DB_HA_STDB_URL: "ws://stdb-2:3000"
+      SPACETIME_DB_HA_PEERS: "1=node-1:4001,3=node-3:4001"
+      SPACETIME_DB_HA_DATA_DIR: "/data"
+      RUST_LOG: "spacetime_db_ha=info,openraft=warn"
     ports:
       - "3002:3001"
       - "4002:4001"
@@ -107,13 +107,13 @@ services:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
     environment:
-      RTDB_NODE_ID: "3"
-      RTDB_LISTEN_ADDR: "0.0.0.0:3001"
-      RTDB_RAFT_ADDR: "0.0.0.0:4001"
-      RTDB_STDB_URL: "ws://stdb-3:3000"
-      RTDB_PEERS: "1=node-1:4001,2=node-2:4001"
-      RTDB_DATA_DIR: "/data"
-      RUST_LOG: "rafttimedb=info,openraft=warn"
+      SPACETIME_DB_HA_NODE_ID: "3"
+      SPACETIME_DB_HA_LISTEN_ADDR: "0.0.0.0:3001"
+      SPACETIME_DB_HA_RAFT_ADDR: "0.0.0.0:4001"
+      SPACETIME_DB_HA_STDB_URL: "ws://stdb-3:3000"
+      SPACETIME_DB_HA_PEERS: "1=node-1:4001,2=node-2:4001"
+      SPACETIME_DB_HA_DATA_DIR: "/data"
+      RUST_LOG: "spacetime_db_ha=info,openraft=warn"
     ports:
       - "3003:3001"
       - "4003:4001"

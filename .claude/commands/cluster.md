@@ -1,4 +1,4 @@
-# /cluster — RaftTimeDB Cluster Management
+# /cluster — spacetime-db-ha Cluster Management
 
 Manage the local Docker Compose development cluster.
 
@@ -26,7 +26,7 @@ Wait 3 seconds, then verify all 6 containers are running with `docker ps`. Repor
 ```bash
 docker compose -f deploy/docker/docker-compose.yml down -v
 ```
-The `-v` flag removes volumes too. Verify no RaftTimeDB containers remain.
+The `-v` flag removes volumes too. Verify no spacetime-db-ha containers remain.
 
 ### `status`
 Query all 3 management API endpoints and display a summary table:

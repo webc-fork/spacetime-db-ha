@@ -1,432 +1,550 @@
 use std::{
-    collections::HashMap,
-    io::{Cursor, Error},
-    sync::{Arc, Mutex},
+    fs::create_dir_all,
+    io::{self, Cursor},
+    path::Path,
+    sync::Arc,
 };
 
-use openraft::{
-    BasicNode, Entry, ErrorSubject, ErrorVerb, LogId, RaftLogId, RaftSnapshotBuilder, Snapshot,
-    SnapshotMeta, StorageError, StoredMembership, entry::EntryPayload, storage::RaftStateMachine,
+use bitcode::{Decode, Encode};
+use crossfire::{
+    AsyncRx, MAsyncTx,
+    mpsc::{Array, bounded_async},
 };
-use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
-use tracing::debug;
+use fjall::{Database, Keyspace, KeyspaceCreateOptions};
+use futures::{Stream, StreamExt};
+use gxhash::HashMap;
+use openraft::{
+    OptionalSend, RaftSnapshotBuilder, Snapshot, SnapshotMeta,
+    entry::EntryPayload,
+    storage::{EntryResponder, RaftStateMachine},
+};
+use parking_lot::Mutex;
+use tracing::{debug, warn};
 
 use crate::{
     metrics,
-    raft::types::{ReducerCallResponse, TypeConfig},
-    router::{self, SHARD_CONFIG_TAG, ShardConfigCommand, ShardId},
+    raft::{
+        CommittedWrite,
+        codec::{WireLogId, WireStoredMembership},
+        error::{StoreError, storage_io_err},
+        persistent_log_store::{DB_DIR, shard_dir},
+        types::{
+            RaftEntry, RaftLogId, RaftSnapshot, RaftSnapshotMeta, RaftStoredMembership,
+            ReducerCallResponse, TypeConfig,
+        },
+    },
+    router::{self, DEFAULT_SHARD, SHARD_CONFIG_TAG, ShardConfigCommand, ShardId},
+    transport::watch,
 };
 
 type C = TypeConfig;
 
-/// Serializable snapshot of the state machine's metadata.
-/// SpacetimeDB is the source of truth for actual data; we only snapshot
-/// Raft bookkeeping (last_applied, membership, applied_count) and shard config.
-#[derive(Serialize, Deserialize)]
+/// 有界队列容量（修复 P2-12：消除无界通道内存膨胀）。
+pub const FORWARDER_CHANNEL_CAPACITY: usize = 4096;
+/// 分片配置命令队列容量。
+pub const CONFIG_CHANNEL_CAPACITY: usize = 256;
+
+/// 提交后待投递的写请求有界通道发送端（基于 `crossfire`）。
+pub type WriteSender = MAsyncTx<Array<CommittedWrite>>;
+/// 提交后待投递的写请求有界通道接收端（基于 `crossfire`）。
+pub type WriteReceiver = AsyncRx<Array<CommittedWrite>>;
+/// 分片配置命令有界通道发送端（基于 `crossfire`）。
+pub type ConfigSender = MAsyncTx<Array<ShardConfigCommand>>;
+/// 分片配置命令有界通道接收端（基于 `crossfire`）。
+pub type ConfigReceiver = AsyncRx<Array<ShardConfigCommand>>;
+
+/// 创建待投递写请求的有界异步通道。
+pub fn write_channel(capacity: usize) -> (WriteSender, WriteReceiver) {
+    bounded_async(capacity)
+}
+
+/// 创建分片配置命令的有界异步通道。
+pub fn config_channel(capacity: usize) -> (ConfigSender, ConfigReceiver) {
+    bounded_async(capacity)
+}
+
+/// 状态机元数据 Keyspace：键 -> `bitcode` 序列化元数据。
+const STATE_KEYSPACE: &str = "state_machine";
+/// 元数据键。
+const META_KEY: &str = "meta";
+/// 已投递到上游 SpacetimeDB 的最新日志索引键（修复 P0-2）。
+const META_DELIVERED: &str = "last_delivered";
+
+/// 状态机元数据的可序列化快照。
+///
+/// 真实数据以 SpacetimeDB 为准，这里只固化 Raft 记账信息与分片配置。
+#[derive(Encode, Decode, Default)]
 struct SnapshotData {
-    last_applied: Option<LogId<u64>>,
-    last_membership: StoredMembership<u64, BasicNode>,
-    applied_count: u64,
-    /// Shard routing table (module_name -> shard_id). Only populated on shard 0.
-    #[serde(default)]
+    last_applied: Option<WireLogId>,
+    last_membership: WireStoredMembership,
+    /// 分片路由表（模块名 -> 分片），仅分片 0 有内容。
     shard_routes: HashMap<String, ShardId>,
-    /// Active shard IDs (excluding shard 0 which always exists). Only populated on shard 0.
-    #[serde(default)]
+    /// 已激活的分片 ID（不含分片 0），仅分片 0 有内容。
     active_shards: Vec<ShardId>,
 }
 
-/// The Raft state machine for RaftTimeDB.
+/// Raft 状态机（基于 fjall 持久化）。
 ///
-/// When a reducer call is committed by Raft consensus, this state machine
-/// forwards the raw WebSocket message to the local SpacetimeDB instance.
-/// Since SpacetimeDB reducers are pure and deterministic, all replicas
-/// executing the same ordered sequence of reducer calls produce identical state.
-///
-/// Shard 0's state machine additionally handles shard config commands (0xFF prefix).
+/// reducer 调用被 Raft 提交后，这里先持久化水位，再把写请求交给本地转发器。
+/// 同时持久化 `last_delivered` 水位，崩溃重启后自动重放 `(last_delivered, last_applied]`。
 #[derive(Clone)]
 pub struct StateMachineStore {
+    shard_id: ShardId,
     inner: Arc<Mutex<StateMachineInner>>,
-    /// Channel sends (origin_node_id, raw_message). The forwarder task uses
-    /// origin_node_id to skip writes that the local handler already forwarded.
-    forwarder: Arc<Mutex<Option<mpsc::UnboundedSender<(u64, Vec<u8>)>>>>,
-    /// Channel for shard config commands (shard 0 only).
-    shard_config_tx: Arc<Mutex<Option<mpsc::UnboundedSender<ShardConfigCommand>>>>,
-    /// Cached snapshot for fast retrieval by new nodes.
-    cached_snapshot: Arc<Mutex<Option<Snapshot<C>>>>,
+    /// 把已提交的写投递给转发任务。
+    forwarder: Arc<Mutex<Option<WriteSender>>>,
+    /// 分片配置命令通道，仅分片 0 使用。
+    shard_config_tx: Arc<Mutex<Option<ConfigSender>>>,
+    /// 缓存最近一次快照，供新节点快速拉取。
+    cached_snapshot: Arc<Mutex<Option<RaftSnapshot>>>,
+    /// 状态机元数据 Keyspace（与 `PersistentLogStore` 共享同一个 `fjall::Database`）。
+    state_ks: Keyspace,
+    /// 已应用到本节点的最新日志 index，供写入方等待「写已落地」。
+    applied: Arc<watch::Sender<u64>>,
+    /// 已投递到上游 SpacetimeDB 的最新日志 index（用于保序与崩溃重放）。
+    delivered: Arc<watch::Sender<u64>>,
 }
 
 struct StateMachineInner {
-    last_applied: Option<LogId<u64>>,
-    last_membership: StoredMembership<u64, BasicNode>,
-    applied_count: u64,
-    /// Shard routing table maintained by shard 0's state machine.
+    last_applied: Option<RaftLogId>,
+    last_membership: RaftStoredMembership,
     shard_routes: HashMap<String, ShardId>,
-    /// Active shard IDs (excluding shard 0).
     active_shards: Vec<ShardId>,
 }
 
-impl Default for StateMachineStore {
-    fn default() -> Self {
-        Self::new()
+impl StateMachineInner {
+    /// 把配置命令体现在状态机内部状态上（快照据此重建）。
+    fn apply_command(&mut self, cmd: &ShardConfigCommand) {
+        match cmd {
+            ShardConfigCommand::CreateShard { shard_id } => {
+                if !self.active_shards.contains(shard_id) {
+                    self.active_shards.push(*shard_id);
+                }
+            }
+            ShardConfigCommand::RemoveShard { shard_id } => {
+                self.active_shards.retain(|id| id != shard_id);
+                self.shard_routes.retain(|_, sid| sid != shard_id);
+            }
+            ShardConfigCommand::AddRoute {
+                module_name,
+                shard_id,
+            } => {
+                self.shard_routes.insert(module_name.clone(), *shard_id);
+            }
+            ShardConfigCommand::RemoveRoute { module_name } => {
+                self.shard_routes.remove(module_name);
+            }
+        }
+    }
+
+    /// 生成待持久化的快照数据。
+    fn snapshot_data(&self) -> SnapshotData {
+        SnapshotData {
+            last_applied: self.last_applied.map(WireLogId::from),
+            last_membership: WireStoredMembership::from(&self.last_membership),
+            shard_routes: self.shard_routes.clone(),
+            active_shards: self.active_shards.clone(),
+        }
     }
 }
 
 impl StateMachineStore {
-    pub fn new() -> Self {
-        Self {
+    /// 独立打开（或创建）分片的持久化状态机，使用与日志库一致的 `fjall` 目录。
+    pub fn open(data_dir: &Path, shard_id: ShardId) -> Result<Self, StoreError> {
+        let dir = shard_dir(data_dir, shard_id);
+        create_dir_all(&dir)?;
+        let db = Database::builder(dir.join(DB_DIR)).open()?;
+        Self::open_with_db(&db, shard_id)
+    }
+
+    /// 复用已打开的 `fjall::Database` 实例创建状态机（修复 P2-10：单库统一持久化）。
+    pub fn open_with_db(db: &Database, shard_id: ShardId) -> Result<Self, StoreError> {
+        let state_ks = db.keyspace(STATE_KEYSPACE, KeyspaceCreateOptions::default)?;
+
+        let meta = match state_ks.get(META_KEY)? {
+            Some(value) => bitcode::decode(&value)?,
+            None => SnapshotData::default(),
+        };
+        let delivered = match state_ks.get(META_DELIVERED)? {
+            Some(value) => bitcode::decode::<u64>(&value).unwrap_or(0),
+            None => 0,
+        };
+
+        let last_applied = meta.last_applied.map(RaftLogId::from);
+        let last_membership = RaftStoredMembership::from(meta.last_membership);
+        let applied = last_applied.map_or(0, |log_id| log_id.index);
+        debug!(
+            shard_id,
+            applied, delivered, "State machine restored from fjall"
+        );
+
+        Ok(Self {
+            shard_id,
             inner: Arc::new(Mutex::new(StateMachineInner {
-                last_applied: None,
-                last_membership: StoredMembership::default(),
-                applied_count: 0,
-                shard_routes: HashMap::new(),
-                active_shards: Vec::new(),
+                last_applied,
+                last_membership,
+                shard_routes: meta.shard_routes,
+                active_shards: meta.active_shards,
             })),
             forwarder: Arc::new(Mutex::new(None)),
             shard_config_tx: Arc::new(Mutex::new(None)),
             cached_snapshot: Arc::new(Mutex::new(None)),
+            state_ks,
+            applied: Arc::new(watch::channel(applied).0),
+            delivered: Arc::new(watch::channel(delivered).0),
+        })
+    }
+
+    /// 启动时校验 `last_applied >= last_purged`，防止状态机落后于已清理日志（修复 P2-10）。
+    pub fn align_with_purged(&self, last_purged: Option<RaftLogId>) -> Result<(), StoreError> {
+        let Some(purged) = last_purged else {
+            return Ok(());
+        };
+        let needs_align = {
+            let mut inner = self.inner.lock();
+            if inner.last_applied.map_or(0, |id| id.index) < purged.index {
+                inner.last_applied = Some(purged);
+                true
+            } else {
+                false
+            }
+        };
+        if needs_align {
+            self.persist()?;
+            self.applied.send_replace(purged.index);
+            self.mark_delivered(purged.index);
+        }
+        Ok(())
+    }
+
+    /// 设置已提交写的投递通道。
+    pub fn set_forwarder(&self, tx: WriteSender) {
+        *self.forwarder.lock() = Some(tx);
+    }
+
+    /// 设置分片配置命令通道，仅分片 0 的状态机需要。
+    pub fn set_shard_config_tx(&self, tx: ConfigSender) {
+        *self.shard_config_tx.lock() = Some(tx);
+    }
+
+    /// 订阅「已应用的日志 index」，用于等待某条写真正落地。
+    pub fn applied_rx(&self) -> watch::Receiver<u64> {
+        self.applied.subscribe()
+    }
+
+    /// 当前已应用的最大日志 index。
+    pub fn last_applied_index(&self) -> u64 {
+        *self.applied.borrow()
+    }
+
+    /// 当前已投递到上游的最大日志 index。
+    pub fn last_delivered_index(&self) -> u64 {
+        *self.delivered.borrow()
+    }
+
+    /// 订阅「已投递到上游的日志 index」，用于跨连接全局保序（修复 P0-1）。
+    pub fn delivered_rx(&self) -> watch::Receiver<u64> {
+        self.delivered.subscribe()
+    }
+
+    /// 推进并持久化 `last_delivered` 水位（修复 P0-2）。
+    pub fn mark_delivered(&self, index: u64) {
+        let mut updated = false;
+        self.delivered.send_if_modified(|cur| {
+            if index > *cur {
+                *cur = index;
+                updated = true;
+                true
+            } else {
+                false
+            }
+        });
+        if updated {
+            let bytes = bitcode::encode(&index);
+            let _ = self.state_ks.insert(META_DELIVERED, bytes);
         }
     }
 
-    /// Set the channel used to forward committed reducer calls to SpacetimeDB.
-    pub fn set_forwarder(&self, tx: mpsc::UnboundedSender<(u64, Vec<u8>)>) {
-        *self.forwarder.lock().unwrap() = Some(tx);
+    /// 读取已持久化的分片配置（激活分片列表与路由表）。
+    pub fn persisted_topology(&self) -> (Vec<ShardId>, HashMap<String, ShardId>) {
+        let inner = self.inner.lock();
+        (inner.active_shards.clone(), inner.shard_routes.clone())
     }
 
-    /// Set the channel for dispatching shard config commands to the RaftPool.
-    /// Only used by shard 0's state machine.
-    pub fn set_shard_config_tx(&self, tx: mpsc::UnboundedSender<ShardConfigCommand>) {
-        *self.shard_config_tx.lock().unwrap() = Some(tx);
+    /// 把当前记账状态落盘。先取快照再写盘，避免持锁做 IO。
+    fn persist(&self) -> Result<(), StoreError> {
+        let data = self.inner.lock().snapshot_data();
+        let bytes = bitcode::encode(&data);
+        self.state_ks.insert(META_KEY, bytes)?;
+        Ok(())
     }
 
-    /// Get the last applied log ID.
-    pub fn last_applied(&self) -> Option<LogId<u64>> {
-        self.inner.lock().unwrap().last_applied
+    /// 批量应用日志条目（供 `RaftStateMachine::apply` 与单测直接调用）。
+    pub async fn apply_entries<I>(
+        &mut self,
+        entries: I,
+    ) -> Result<Vec<ReducerCallResponse>, io::Error>
+    where
+        I: IntoIterator<Item = RaftEntry>,
+    {
+        let mut results = Vec::new();
+        self.apply_entries_with_hook(entries, |resp| results.push(resp))
+            .await?;
+        Ok(results)
     }
 
-    /// Get the count of applied application entries.
-    pub fn applied_count(&self) -> u64 {
-        self.inner.lock().unwrap().applied_count
+    /// 内部共享的应用逻辑。
+    async fn apply_entries_with_hook<I, F>(
+        &mut self,
+        entries: I,
+        mut on_applied: F,
+    ) -> Result<(), io::Error>
+    where
+        I: IntoIterator<Item = RaftEntry>,
+        F: FnMut(ReducerCallResponse),
+    {
+        let forwarder = self.forwarder.lock().clone();
+        let shard_config_tx = self.shard_config_tx.lock().clone();
+        let mut pending_commands = Vec::new();
+        let mut pending_writes = Vec::new();
+        let mut non_write_indices = Vec::new();
+        let mut last_index = None;
+        let mut count = 0usize;
+
+        for entry in entries {
+            let log_id = entry.log_id;
+            let is_application = matches!(&entry.payload, EntryPayload::Normal(_));
+
+            // 先分类，反序列化与分支判断都不持锁
+            // 仅当分片 0 且 db_path 为空且首字节为 SHARD_CONFIG_TAG 时，才按分片配置命令解析（修复 P2-14）
+            let (membership, command, write) = match entry.payload {
+                EntryPayload::Membership(membership) => (
+                    Some(RaftStoredMembership::new(Some(log_id), membership)),
+                    None,
+                    None,
+                ),
+                EntryPayload::Normal(request) => {
+                    if self.shard_id == DEFAULT_SHARD
+                        && request.db_path.is_empty()
+                        && request.raw_message.first() == Some(&SHARD_CONFIG_TAG)
+                    {
+                        match router::decode_shard_config(&request.raw_message) {
+                            Some(command) => (None, Some(command), None),
+                            None => {
+                                warn!(
+                                    log_index = log_id.index,
+                                    "Dropping malformed shard config entry"
+                                );
+                                (None, None, None)
+                            }
+                        }
+                    } else {
+                        (None, None, Some((log_id.index, request)))
+                    }
+                }
+                EntryPayload::Blank => (None, None, None),
+            };
+
+            {
+                let mut inner = self.inner.lock();
+                inner.last_applied = Some(log_id);
+                if let Some(membership) = membership {
+                    inner.last_membership = membership;
+                }
+                if let Some(command) = &command {
+                    inner.apply_command(command);
+                }
+            }
+
+            if let Some(command) = command {
+                pending_commands.push(command);
+                non_write_indices.push(log_id.index);
+            } else if let Some((idx, request)) = write {
+                pending_writes.push(CommittedWrite {
+                    log_index: idx,
+                    origin_node_id: request.origin_node_id,
+                    db_path: request.db_path,
+                    raw_message: request.raw_message,
+                });
+            } else {
+                non_write_indices.push(log_id.index);
+            }
+
+            if is_application {
+                metrics::ENTRIES_APPLIED.inc();
+            }
+
+            last_index = Some(log_id.index);
+            count += 1;
+        }
+
+        // 先落盘再投递（修复 P0-2：保证持久化先于外部副作用）
+        self.persist().map_err(storage_io_err)?;
+
+        if let Some(tx) = &shard_config_tx {
+            for command in pending_commands {
+                let _ = tx.send(command).await;
+            }
+        }
+
+        // 非业务写条目（Blank / Membership / 配置命令）无需投递上游，若无前置未投递写则合并推进一次 delivered 水位
+        let initial_delivered = self.last_delivered_index();
+        let mut delivered_target = initial_delivered;
+        for idx in non_write_indices {
+            if delivered_target + 1 == idx {
+                delivered_target = idx;
+            }
+        }
+        if delivered_target > initial_delivered {
+            self.mark_delivered(delivered_target);
+        }
+
+        if let Some(tx) = &forwarder {
+            for write in pending_writes {
+                debug!(
+                    log_index = write.log_index,
+                    msg_len = write.raw_message.len(),
+                    db_path = %write.db_path,
+                    "Forwarding committed reducer call to SpacetimeDB"
+                );
+                let _ = tx.send(write).await;
+            }
+        } else if let Some(last_write) = pending_writes.last() {
+            // 未挂载转发器时（如纯状态机单测），直接推进 delivered 水位
+            self.mark_delivered(last_write.log_index);
+        }
+
+        if let Some(index) = last_index {
+            self.applied.send_replace(index);
+        }
+
+        for _ in 0..count {
+            on_applied(ReducerCallResponse { success: true });
+        }
+
+        Ok(())
     }
 }
 
 impl RaftStateMachine<C> for StateMachineStore {
     type SnapshotBuilder = Self;
+    type SnapshotData = Cursor<Vec<u8>>;
 
     async fn applied_state(
         &mut self,
-    ) -> Result<(Option<LogId<u64>>, StoredMembership<u64, BasicNode>), StorageError<u64>> {
-        let inner = self.inner.lock().unwrap();
+    ) -> Result<(Option<RaftLogId>, RaftStoredMembership), io::Error> {
+        let inner = self.inner.lock();
         Ok((inner.last_applied, inner.last_membership.clone()))
     }
 
-    async fn apply<I>(&mut self, entries: I) -> Result<Vec<ReducerCallResponse>, StorageError<u64>>
+    async fn apply<Strm>(&mut self, mut entries: Strm) -> Result<(), io::Error>
     where
-        I: IntoIterator<Item = Entry<C>> + Send,
-        I::IntoIter: Send,
+        Strm: Stream<Item = Result<EntryResponder<C>, io::Error>> + Unpin + OptionalSend,
     {
-        let mut results = Vec::new();
-        let forwarder = self.forwarder.lock().unwrap().clone();
-        let shard_config_tx = self.shard_config_tx.lock().unwrap().clone();
-
-        for entry in entries {
-            let log_id = *entry.get_log_id();
-
-            {
-                let mut inner = self.inner.lock().unwrap();
-                inner.last_applied = Some(log_id);
-
-                if let EntryPayload::Membership(ref membership) = entry.payload {
-                    inner.last_membership = StoredMembership::new(Some(log_id), membership.clone());
-                }
-            }
-
-            if let EntryPayload::Normal(request) = &entry.payload {
-                let is_shard_config = request.raw_message.first() == Some(&SHARD_CONFIG_TAG);
-
-                if is_shard_config {
-                    // Shard config command — decode and dispatch, don't forward to SpacetimeDB
-                    if let Some(cmd) = router::decode_shard_config(&request.raw_message) {
-                        // Update internal state for snapshots
-                        {
-                            let mut inner = self.inner.lock().unwrap();
-                            match &cmd {
-                                ShardConfigCommand::CreateShard { shard_id } => {
-                                    if !inner.active_shards.contains(shard_id) {
-                                        inner.active_shards.push(*shard_id);
-                                    }
-                                }
-                                ShardConfigCommand::AddRoute {
-                                    module_name,
-                                    shard_id,
-                                } => {
-                                    inner.shard_routes.insert(module_name.clone(), *shard_id);
-                                }
-                                ShardConfigCommand::RemoveRoute { module_name } => {
-                                    inner.shard_routes.remove(module_name);
-                                }
-                            }
-                        }
-
-                        // Dispatch to RaftPool
-                        if let Some(ref tx) = shard_config_tx {
-                            let _ = tx.send(cmd);
-                        }
-                    }
-                } else {
-                    // Normal write — forward to SpacetimeDB
-                    debug!(
-                        log_index = log_id.index,
-                        msg_len = request.raw_message.len(),
-                        "Forwarding committed reducer call to SpacetimeDB"
-                    );
-
-                    if let Some(ref tx) = forwarder {
-                        let _ = tx.send((request.origin_node_id, request.raw_message.clone()));
-                    }
-                }
-
-                {
-                    let mut inner = self.inner.lock().unwrap();
-                    inner.applied_count += 1;
-                }
-
-                metrics::ENTRIES_APPLIED.inc();
-            }
-
-            // openraft requires one response per entry (including Membership and Blank)
-            results.push(ReducerCallResponse { success: true });
+        let mut batch_entries = Vec::new();
+        let mut responders = Vec::new();
+        while let Some(item) = entries.next().await {
+            let (entry, responder) = item?;
+            batch_entries.push(entry);
+            responders.push(responder);
         }
 
-        Ok(results)
+        let mut resp_iter = responders.into_iter();
+        self.apply_entries_with_hook(batch_entries, |resp| {
+            if let Some(Some(tx)) = resp_iter.next() {
+                tx.send(resp);
+            }
+        })
+        .await
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         self.clone()
     }
 
-    async fn begin_receiving_snapshot(
-        &mut self,
-    ) -> Result<Box<Cursor<Vec<u8>>>, StorageError<u64>> {
-        Ok(Box::new(Cursor::new(Vec::new())))
-    }
-
     async fn install_snapshot(
         &mut self,
-        meta: &SnapshotMeta<u64, BasicNode>,
-        snapshot: Box<Cursor<Vec<u8>>>,
-    ) -> Result<(), StorageError<u64>> {
-        let data: SnapshotData = serde_json::from_slice(snapshot.get_ref()).map_err(|e| {
-            StorageError::from_io_error(
-                ErrorSubject::StateMachine,
-                ErrorVerb::Read,
-                Error::other(e),
-            )
-        })?;
+        meta: &RaftSnapshotMeta,
+        snapshot: Self::SnapshotData,
+    ) -> Result<(), io::Error> {
+        let bytes = snapshot.into_inner();
+        let data: SnapshotData = bitcode::decode(&bytes).map_err(storage_io_err)?;
 
         {
-            let mut inner = self.inner.lock().unwrap();
-            inner.last_applied = data.last_applied;
-            inner.last_membership = data.last_membership;
-            inner.applied_count = data.applied_count;
+            let mut inner = self.inner.lock();
+            inner.last_applied = meta.last_log_id;
+            inner.last_membership = meta.last_membership.clone();
             inner.shard_routes = data.shard_routes;
             inner.active_shards = data.active_shards;
         }
 
-        // Replay shard config to RaftPool so it materializes shards and routes
-        {
-            let shard_config_tx = self.shard_config_tx.lock().unwrap().clone();
-            if let Some(ref tx) = shard_config_tx {
-                let inner = self.inner.lock().unwrap();
-                for &shard_id in &inner.active_shards {
-                    let _ = tx.send(ShardConfigCommand::CreateShard { shard_id });
-                }
-                for (module_name, &shard_id) in &inner.shard_routes {
-                    let _ = tx.send(ShardConfigCommand::AddRoute {
-                        module_name: module_name.clone(),
+        let shard_config_tx = self.shard_config_tx.lock().clone();
+        if let Some(tx) = shard_config_tx {
+            let (active_shards, shard_routes) = self.persisted_topology();
+            for shard_id in active_shards {
+                let _ = tx.send(ShardConfigCommand::CreateShard { shard_id }).await;
+            }
+            for (module_name, shard_id) in shard_routes {
+                let _ = tx
+                    .send(ShardConfigCommand::AddRoute {
+                        module_name,
                         shard_id,
-                    });
-                }
+                    })
+                    .await;
             }
         }
 
-        // Cache the installed snapshot for future retrieval
-        let inner = self.inner.lock().unwrap();
-        let json = serde_json::to_vec(&SnapshotData {
-            last_applied: inner.last_applied,
-            last_membership: inner.last_membership.clone(),
-            applied_count: inner.applied_count,
-            shard_routes: inner.shard_routes.clone(),
-            active_shards: inner.active_shards.clone(),
-        })
-        .unwrap_or_default();
-        drop(inner);
+        self.persist().map_err(storage_io_err)?;
+        if let Some(log_id) = meta.last_log_id {
+            self.applied.send_replace(log_id.index);
+            self.mark_delivered(log_id.index);
+        }
 
-        *self.cached_snapshot.lock().unwrap() = Some(Snapshot {
+        *self.cached_snapshot.lock() = Some(Snapshot {
             meta: meta.clone(),
-            snapshot: Box::new(Cursor::new(json)),
+            snapshot: Cursor::new(bytes),
         });
 
         Ok(())
     }
 
-    async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot<C>>, StorageError<u64>> {
-        // Return cached snapshot if available
-        let cached = self.cached_snapshot.lock().unwrap();
-        if let Some(ref snap) = *cached {
-            let data = snap.snapshot.get_ref().clone();
+    async fn get_current_snapshot(&mut self) -> Result<Option<RaftSnapshot>, io::Error> {
+        if let Some(snapshot) = self.cached_snapshot.lock().as_ref() {
             return Ok(Some(Snapshot {
-                meta: snap.meta.clone(),
-                snapshot: Box::new(Cursor::new(data)),
+                meta: snapshot.meta.clone(),
+                snapshot: Cursor::new(snapshot.snapshot.get_ref().clone()),
             }));
         }
-        Ok(None)
+
+        if self.inner.lock().last_applied.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(self.build_snapshot().await?))
     }
 }
 
 impl RaftSnapshotBuilder<C> for StateMachineStore {
-    async fn build_snapshot(&mut self) -> Result<Snapshot<C>, StorageError<u64>> {
-        let inner = self.inner.lock().unwrap();
+    type SnapshotData = Cursor<Vec<u8>>;
 
-        let data = SnapshotData {
-            last_applied: inner.last_applied,
-            last_membership: inner.last_membership.clone(),
-            applied_count: inner.applied_count,
-            shard_routes: inner.shard_routes.clone(),
-            active_shards: inner.active_shards.clone(),
+    async fn build_snapshot(&mut self) -> Result<RaftSnapshot, io::Error> {
+        let (encoded, meta) = {
+            let inner = self.inner.lock();
+            let encoded = bitcode::encode(&inner.snapshot_data());
+            let meta = SnapshotMeta {
+                last_log_id: inner.last_applied,
+                last_membership: inner.last_membership.clone(),
+            };
+            (encoded, meta)
         };
 
-        let json = serde_json::to_vec(&data).map_err(|e| {
-            StorageError::from_io_error(
-                ErrorSubject::StateMachine,
-                ErrorVerb::Read,
-                Error::other(e),
-            )
-        })?;
-
-        let snapshot_id = inner
-            .last_applied
-            .map(|id| format!("{}-{}", id.leader_id, id.index))
-            .unwrap_or_else(|| "0-0".to_string());
-
-        let meta = SnapshotMeta {
-            last_log_id: inner.last_applied,
-            last_membership: inner.last_membership.clone(),
-            snapshot_id,
-        };
-
-        let snapshot = Snapshot {
+        *self.cached_snapshot.lock() = Some(Snapshot {
             meta: meta.clone(),
-            snapshot: Box::new(Cursor::new(json.clone())),
-        };
-
-        // Cache the snapshot we just built
-        drop(inner);
-        *self.cached_snapshot.lock().unwrap() = Some(Snapshot {
-            meta,
-            snapshot: Box::new(Cursor::new(json)),
+            snapshot: Cursor::new(encoded.clone()),
         });
 
-        Ok(snapshot)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_new_state_machine_has_no_applied_state() {
-        let sm = StateMachineStore::new();
-        assert!(sm.last_applied().is_none());
-        assert_eq!(sm.applied_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_forwarder_receives_committed_writes() {
-        let sm = StateMachineStore::new();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        sm.set_forwarder(tx);
-
-        {
-            let forwarder = sm.forwarder.lock().unwrap();
-            forwarder
-                .as_ref()
-                .unwrap()
-                .send((1, vec![3, 10, 20]))
-                .unwrap();
-        }
-
-        let (origin, received) = rx.recv().await.unwrap();
-        assert_eq!(origin, 1);
-        assert_eq!(received, vec![3, 10, 20]);
-    }
-
-    #[test]
-    fn test_forwarder_is_none_by_default() {
-        let sm = StateMachineStore::new();
-        let forwarder = sm.forwarder.lock().unwrap();
-        assert!(forwarder.is_none());
-    }
-
-    #[test]
-    fn test_shard_config_tx_is_none_by_default() {
-        let sm = StateMachineStore::new();
-        let tx = sm.shard_config_tx.lock().unwrap();
-        assert!(tx.is_none());
-    }
-
-    #[test]
-    fn test_snapshot_data_roundtrip() {
-        use openraft::CommittedLeaderId;
-        let data = SnapshotData {
-            last_applied: Some(LogId::new(CommittedLeaderId::new(1, 0), 42)),
-            last_membership: StoredMembership::default(),
-            applied_count: 10,
-            shard_routes: HashMap::new(),
-            active_shards: Vec::new(),
-        };
-        let json = serde_json::to_vec(&data).unwrap();
-        let restored: SnapshotData = serde_json::from_slice(&json).unwrap();
-        assert_eq!(restored.last_applied, data.last_applied);
-        assert_eq!(restored.applied_count, data.applied_count);
-    }
-
-    #[test]
-    fn test_snapshot_data_backwards_compat() {
-        // Old snapshot format without shard fields should deserialize with defaults
-        let old_json = r#"{"last_applied":null,"last_membership":{"log_id":null,"membership":{"configs":[],"nodes":{}}},"applied_count":5}"#;
-        let data: SnapshotData = serde_json::from_str(old_json).unwrap();
-        assert_eq!(data.applied_count, 5);
-        assert!(data.shard_routes.is_empty());
-        assert!(data.active_shards.is_empty());
-    }
-
-    #[test]
-    fn test_snapshot_data_with_shard_config() {
-        use openraft::CommittedLeaderId;
-        let mut routes = HashMap::new();
-        routes.insert("game".to_string(), 1u64);
-        routes.insert("chat".to_string(), 2u64);
-
-        let data = SnapshotData {
-            last_applied: Some(LogId::new(CommittedLeaderId::new(1, 0), 42)),
-            last_membership: StoredMembership::default(),
-            applied_count: 10,
-            shard_routes: routes,
-            active_shards: vec![1, 2],
-        };
-        let json = serde_json::to_vec(&data).unwrap();
-        let restored: SnapshotData = serde_json::from_slice(&json).unwrap();
-        assert_eq!(restored.shard_routes.len(), 2);
-        assert_eq!(restored.shard_routes["game"], 1);
-        assert_eq!(restored.active_shards, vec![1, 2]);
-    }
-
-    #[tokio::test]
-    async fn test_get_current_snapshot_initially_none() {
-        let mut sm = StateMachineStore::new();
-        let snapshot = sm.get_current_snapshot().await.unwrap();
-        assert!(snapshot.is_none());
+        Ok(Snapshot {
+            meta,
+            snapshot: Cursor::new(encoded),
+        })
     }
 }

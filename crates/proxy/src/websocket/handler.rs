@@ -1,21 +1,33 @@
-use std::sync::{Arc, Mutex as StdMutex};
+use std::{
+    rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
-use anyhow::Result;
-use futures_util::{SinkExt, StreamExt};
-use tokio::{
-    net::TcpStream,
-    sync::{Mutex, watch::Receiver},
-};
-use tokio_tungstenite::tungstenite::{
-    Message, http,
-    protocol::{CloseFrame, frame::coding::CloseCode},
-};
+use anyhow::{Context, Result, anyhow};
+use bitcode::{Decode, Encode};
+use bytes::Bytes;
+use compio::runtime::spawn;
+use futures::{FutureExt, select};
 use tracing::{debug, info, warn};
+use zenoh::{Session, bytes::ZBytes, pubsub::Subscriber, sample::Sample};
 
-use crate::{metrics, raft::RaftPool, router};
+use crate::{
+    config::NodeConfig,
+    metrics,
+    raft::{RaftPool, codec::impl_bitcode_via, forwarder::next_stream_id},
+    router::{DEFAULT_SHARD, ShardId, extract_module_name},
+    transport::{
+        CrossfireChannel, CrossfireHandler, close_session, decode_query_payload,
+        open_client_session, reply_bitcode, rpc_once, watch::Receiver,
+    },
+    websocket::ConnectionGuard,
+};
 
-/// SpacetimeDB v2 WebSocket protocol BSATN tag bytes.
-/// These are the first byte of the binary message, indicating the ClientMessage variant.
+/// SpacetimeDB v2 协议中 ClientMessage 的 BSATN 标签字节（消息首字节）。
 pub mod stdb_tags {
     pub const SUBSCRIBE: u8 = 0;
     pub const UNSUBSCRIBE: u8 = 1;
@@ -24,390 +36,389 @@ pub mod stdb_tags {
     pub const CALL_PROCEDURE: u8 = 4;
 }
 
-/// Message classification result for routing decisions.
+/// 关闭码：节点离开/切换 Leader（对应 1001 Away）。
+pub const CLOSE_CODE_AWAY: u16 = 1001;
+
+/// 客户端流单次 RPC 超时。
+const STREAM_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 连接关闭帧（由 `bitcode` 序列化后通过 Zenoh 传输）。
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub struct CloseFrame {
+    pub code: u16,
+    pub reason: String,
+}
+
+/// 代理与 SpacetimeDB 之间传输的帧消息（由 `bitcode` 编码，承载于 Zenoh 明文 QUIC）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Message {
+    Binary(Bytes),
+    Text(String),
+    Ping(Bytes),
+    Pong(Bytes),
+    Close(Option<CloseFrame>),
+}
+
+/// `Message` 的 `bitcode` 原生线格式表示。
+#[derive(Encode, Decode)]
+pub struct WireMessage {
+    kind: WireMessageKind,
+}
+
+#[derive(Encode, Decode)]
+enum WireMessageKind {
+    Binary(Vec<u8>),
+    Text(String),
+    Ping(Vec<u8>),
+    Pong(Vec<u8>),
+    Close(Option<CloseFrame>),
+}
+
+impl From<&Message> for WireMessage {
+    fn from(msg: &Message) -> Self {
+        let kind = match msg {
+            Message::Binary(b) => WireMessageKind::Binary(b.to_vec()),
+            Message::Text(s) => WireMessageKind::Text(s.clone()),
+            Message::Ping(b) => WireMessageKind::Ping(b.to_vec()),
+            Message::Pong(b) => WireMessageKind::Pong(b.to_vec()),
+            Message::Close(c) => WireMessageKind::Close(c.clone()),
+        };
+        Self { kind }
+    }
+}
+
+impl From<WireMessage> for Message {
+    fn from(w: WireMessage) -> Self {
+        match w.kind {
+            WireMessageKind::Binary(b) => Self::Binary(Bytes::from(b)),
+            WireMessageKind::Text(s) => Self::Text(s),
+            WireMessageKind::Ping(b) => Self::Ping(Bytes::from(b)),
+            WireMessageKind::Pong(b) => Self::Pong(Bytes::from(b)),
+            WireMessageKind::Close(c) => Self::Close(c),
+        }
+    }
+}
+
+impl_bitcode_via!(Message, WireMessage);
+
+/// Zenoh 会话握手请求。
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct StdbConnectRequest {
+    /// 客户端预先订阅的 `stdb/s2c/{stream_id}` 流标识。
+    pub stream_id: u64,
+    /// 请求数据库路径，如 `/database/subscribe/testdb`。
+    pub db_path: String,
+}
+
+/// Zenoh 会话握手响应。
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct StdbConnectResponse {
+    /// 服务端分配的会话连接 ID，客户端后续向 `stdb/c2s/{conn_id}` 发送消息。
+    pub conn_id: u64,
+}
+
+/// 消息分类结果，决定后续走哪条路径。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageKind {
-    /// Write operation — must go through Raft consensus before forwarding.
+    /// 写操作：必须先过 Raft 共识。
     Write,
-    /// Read operation — forward directly to local SpacetimeDB.
+    /// 读操作：直接转发给本地 SpacetimeDB。
     Read,
-    /// Not a binary message or empty — forward as-is.
+    /// 非二进制或空消息：原样透传。
     PassThrough,
 }
 
-/// Classify a WebSocket message by reading the BSATN tag byte.
-///
-/// This is the core routing decision: one byte determines the entire path.
-/// - Tag 3 (CallReducer) and 4 (CallProcedure) are writes -> Raft consensus
-/// - Tags 0-2 (Subscribe, Unsubscribe, OneOffQuery) are reads -> direct forward
-/// - Everything else (ping/pong/close/text/empty) -> pass through
+/// 标签字节的全部取值个数。
+const TAG_COUNT: usize = u8::MAX as usize + 1;
+
+/// 编译期生成的分类表：一次查表完成分流，无分支、无函数调用开销。
+/// 未知标签按读处理直接转发，交给 SpacetimeDB 自行判定。
+static TAG_KINDS: [MessageKind; TAG_COUNT] = {
+    let mut table = [MessageKind::Read; TAG_COUNT];
+    table[stdb_tags::SUBSCRIBE as usize] = MessageKind::Read;
+    table[stdb_tags::UNSUBSCRIBE as usize] = MessageKind::Read;
+    table[stdb_tags::ONE_OFF_QUERY as usize] = MessageKind::Read;
+    table[stdb_tags::CALL_REDUCER as usize] = MessageKind::Write;
+    table[stdb_tags::CALL_PROCEDURE as usize] = MessageKind::Write;
+    table
+};
+
+/// 按 BSATN 标签字节分类一条消息。
 pub fn classify_message(msg: &Message) -> MessageKind {
     match msg {
-        Message::Binary(data) if !data.is_empty() => {
-            let tag = data[0];
-            if is_write_tag(tag) {
-                MessageKind::Write
-            } else {
-                MessageKind::Read
-            }
-        }
+        Message::Binary(data) => match data.first() {
+            Some(&tag) => TAG_KINDS[tag as usize],
+            None => MessageKind::PassThrough,
+        },
         _ => MessageKind::PassThrough,
     }
 }
 
-/// Returns true if the BSATN tag byte indicates a write operation.
-pub fn is_write_tag(tag: u8) -> bool {
-    matches!(tag, stdb_tags::CALL_REDUCER | stdb_tags::CALL_PROCEDURE)
+/// 客户端连接发送端（可跨任务轻量克隆，无锁）。
+#[derive(Clone)]
+pub struct ZenohStdbSender {
+    session: Session,
+    c2s_key: String,
 }
 
-/// Returns true if the BSATN tag byte indicates a known read operation.
-pub fn is_read_tag(tag: u8) -> bool {
-    matches!(
-        tag,
-        stdb_tags::SUBSCRIBE | stdb_tags::UNSUBSCRIBE | stdb_tags::ONE_OFF_QUERY
-    )
+impl ZenohStdbSender {
+    /// 向服务端发送一条帧消息。
+    pub async fn send(&self, msg: Message) -> Result<()> {
+        rpc_once::<Message, ()>(&self.session, &self.c2s_key, &msg, STREAM_RPC_TIMEOUT).await
+    }
 }
 
-/// Returns true if the BSATN tag byte is a known SpacetimeDB v2 client message.
-pub fn is_known_tag(tag: u8) -> bool {
-    tag <= stdb_tags::CALL_PROCEDURE
+/// 客户端连接封装（基于 Zenoh 明文 QUIC + `bitcode` + `crossfire`），供客户端与测试使用。
+pub struct ZenohStdbStream {
+    sender: ZenohStdbSender,
+    s2c_sub: Subscriber<CrossfireHandler<Sample>>,
 }
 
-/// Build a close frame with leader hint for client reconnection.
-async fn leader_close_frame(pool: &RaftPool, shard_id: u64) -> Option<CloseFrame> {
-    let (leader_id, leader_addr) = pool.current_leader(shard_id).await?;
-    Some(CloseFrame {
-        code: CloseCode::Away,
-        reason: format!("leader={}:{}", leader_id, leader_addr).into(),
-    })
+impl ZenohStdbStream {
+    /// 连接到代理或 SpacetimeDB 的指定数据库路径。
+    pub async fn connect(addr: &str, db_path: &str) -> Result<Self> {
+        let stream_id = next_stream_id();
+        let session = open_client_session(addr).await?;
+        let s2c_key = format!("stdb/s2c/{stream_id}");
+        let s2c_sub = session
+            .declare_subscriber(&s2c_key)
+            .with(CrossfireChannel::new())
+            .await
+            .map_err(|e| anyhow!("Failed to declare s2c subscriber: {e}"))?;
+
+        let req = StdbConnectRequest {
+            stream_id,
+            db_path: db_path.to_owned(),
+        };
+        let resp: StdbConnectResponse =
+            rpc_once(&session, "stdb/connect", &req, STREAM_RPC_TIMEOUT).await?;
+
+        Ok(Self {
+            sender: ZenohStdbSender {
+                session,
+                c2s_key: format!("stdb/c2s/{}", resp.conn_id),
+            },
+            s2c_sub,
+        })
+    }
+
+    /// 拆分为发送端与订阅接收端，便于读写任务独立持有而无需 `Arc` 共享 `!Sync` 的 `AsyncRx`。
+    pub fn split(self) -> (ZenohStdbSender, Subscriber<CrossfireHandler<Sample>>) {
+        (self.sender, self.s2c_sub)
+    }
+
+    /// 向服务端发送一条帧消息。
+    pub async fn send(&self, msg: Message) -> Result<()> {
+        self.sender.send(msg).await
+    }
+
+    /// 接收服务端推送的下一条帧消息。
+    pub async fn recv(&self) -> Result<Option<Message>> {
+        recv_s2c_message(&self.s2c_sub).await
+    }
+
+    /// 关闭客户端会话。
+    pub async fn close(self) {
+        let _ = self.sender.send(Message::Close(None)).await;
+        close_session(&self.sender.session);
+    }
 }
 
-/// Handle a single client WebSocket connection.
+/// 从 `s2c` 订阅通道接收并解码下一条帧消息。
+async fn recv_s2c_message(
+    s2c_sub: &Subscriber<CrossfireHandler<Sample>>,
+) -> Result<Option<Message>> {
+    let Ok(sample) = s2c_sub.recv().await else {
+        return Ok(None);
+    };
+    let bytes = sample.payload().to_bytes();
+    let msg: Message =
+        bitcode::decode(&bytes).context("Failed to decode s2c Message via bitcode")?;
+    Ok(Some(msg))
+}
+
+/// 服务端单连接会话计数器。
+static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
+
+/// 处理单个客户端 Zenoh 会话连接。
 ///
-/// 1. Accept the client's WebSocket upgrade, extracting the request path
-/// 2. Extract module name from path to determine shard routing
-/// 3. Open a corresponding connection to the local SpacetimeDB using the same path
-/// 4. For each message from the client:
-///    - Classify via `classify_message` (reads one byte)
-///    - Write -> propose through Raft (routed to correct shard), then forward
-///    - Read/PassThrough -> forward directly
-/// 5. Relay all SpacetimeDB responses back to the client
-pub async fn handle_client(
-    stream: TcpStream,
-    pool: Arc<RaftPool>,
-    stdb_url: &str,
-    shutdown: Receiver<bool>,
-) -> Result<()> {
-    metrics::CONNECTIONS_ACTIVE.inc();
-
-    let result = handle_client_inner(stream, pool.clone(), stdb_url, shutdown).await;
-
-    metrics::CONNECTIONS_ACTIVE.dec();
-    result
-}
-
-async fn handle_client_inner(
-    stream: TcpStream,
-    pool: Arc<RaftPool>,
-    stdb_url: &str,
+/// 1. 解析请求路径对应的模块名与目标分片；
+/// 2. 与本地 SpacetimeDB 建立独立上游 Zenoh 会话；
+/// 3. 注册 `stdb/c2s/{conn_id}` 处理客户端上行消息：
+///    - 写请求走 Raft 共识 -> 等待本地 apply -> 按 `log_index` 全局保序投递上游 -> 更新 `last_delivered`；
+///    - 读请求等待本地因果应用水位 -> 转发上游；
+/// 4. 将上游 `stdb/s2c` 消息实时转发回客户端 `stdb/s2c/{client_stream_id}`；
+/// 5. 收到关闭信号时向客户端推送包含 leader 提示的 `CloseFrame`。
+pub async fn spawn_client_session(
+    server_session: Session,
+    req: StdbConnectRequest,
+    pool: Rc<RaftPool>,
+    config: Arc<NodeConfig>,
     mut shutdown: Receiver<bool>,
-) -> Result<()> {
-    // Extract the request URI path during the WebSocket handshake.
-    // SpacetimeDB requires a path like /database/subscribe/MODULE_NAME.
-    let path_holder: Arc<StdMutex<String>> = Arc::new(StdMutex::new(String::new()));
-    let path_for_cb = path_holder.clone();
-
-    let client_ws = tokio_tungstenite::accept_hdr_async(
-        stream,
-        move |req: &http::Request<()>,
-              resp: http::Response<()>|
-              -> Result<http::Response<()>, http::Response<Option<String>>> {
-            let uri_path = req
-                .uri()
-                .path_and_query()
-                .map(|pq| pq.as_str().to_string())
-                .unwrap_or_else(|| "/".to_string());
-            *path_for_cb.lock().unwrap() = uri_path;
-            Ok(resp)
-        },
-    )
-    .await?;
-
-    let request_path = path_holder.lock().unwrap().clone();
-    let upstream_url = format!("{}{}", stdb_url, request_path);
-    info!(path = %request_path, upstream = %upstream_url, "Client connected, opening upstream");
-
-    // Extract module name from path and determine shard
-    let module_name = router::extract_module_name(&request_path);
-    let shard_id = if let Some(name) = module_name {
-        pool.route_module(name).await
+) -> Result<StdbConnectResponse> {
+    let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+    let request_path = if req.db_path.is_empty() {
+        "/".to_owned()
     } else {
-        0 // default shard
+        req.db_path
     };
 
-    // Broadcast the database path to the shard's forwarder
-    pool.send_db_path(shard_id, request_path).await;
+    let shard_id = match extract_module_name(&request_path) {
+        Some(module_name) => pool.route_module(module_name),
+        None => DEFAULT_SHARD,
+    };
 
-    let (client_tx, mut client_rx) = client_ws.split();
-    let client_tx = Arc::new(Mutex::new(client_tx));
+    // 先建立到上游 SpacetimeDB 的连接，确保握手返回后即可收发
+    let upstream = ZenohStdbStream::connect(&config.stdb_url, &request_path)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to connect upstream SpacetimeDB at {}{}",
+                config.stdb_url, request_path
+            )
+        })?;
+    let (upstream_tx, upstream_rx) = upstream.split();
 
-    let (upstream_ws, _) = tokio_tungstenite::connect_async(&upstream_url).await?;
-    let (upstream_tx, mut upstream_rx) = upstream_ws.split();
-    let upstream_tx = Arc::new(Mutex::new(upstream_tx));
+    let c2s_key = format!("stdb/c2s/{conn_id}");
+    let c2s_queryable = server_session
+        .declare_queryable(&c2s_key)
+        .with(CrossfireChannel::new())
+        .await
+        .map_err(|e| anyhow!("Failed to declare c2s queryable {c2s_key}: {e}"))?;
 
-    // Client -> Proxy -> (Raft | direct) -> SpacetimeDB
-    let pool_clone = pool.clone();
-    let upstream_tx_clone = upstream_tx.clone();
-    let inbound = tokio::spawn(async move {
-        while let Some(msg) = client_rx.next().await {
-            let msg = match msg {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!(error = %e, "Client read error");
-                    break;
-                }
-            };
+    let client_s2c_key = format!("stdb/s2c/{}", req.stream_id);
+    info!(
+        conn_id,
+        path = %request_path,
+        shard_id,
+        "Client session established over Zenoh QUIC"
+    );
 
-            let kind = classify_message(&msg);
+    spawn(async move {
+        let _guard = ConnectionGuard::new();
+        let pool_for_in = Rc::clone(&pool);
+        let path_for_in = request_path;
 
-            match kind {
-                MessageKind::Write => {
-                    if let Message::Binary(data) = &msg {
-                        debug!(
-                            tag = data[0],
-                            len = data.len(),
-                            shard_id,
-                            "Write -> Raft consensus"
-                        );
-                    }
-                    if let Message::Binary(data) = &msg
-                        && let Err(e) = pool_clone.propose_write(shard_id, data.to_vec()).await
-                    {
-                        warn!(error = %e, "Raft propose failed");
+        let mut inbound = spawn(async move {
+            while let Ok(query) = c2s_queryable.recv().await {
+                let msg: Message = match decode_query_payload(&query) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        reply_bitcode::<()>(&query, Err(e.to_string())).await;
                         continue;
                     }
-                    if let Err(e) = upstream_tx_clone.lock().await.send(msg).await {
-                        warn!(error = %e, "Upstream send failed");
-                        break;
+                };
+
+                if matches!(msg, Message::Close(_)) {
+                    let _ = upstream_tx.send(msg).await;
+                    reply_bitcode(&query, Ok(())).await;
+                    return;
+                }
+
+                let res =
+                    handle_client_message(msg, &upstream_tx, &pool_for_in, shard_id, &path_for_in)
+                        .await;
+
+                match res {
+                    Ok(()) => reply_bitcode(&query, Ok(())).await,
+                    Err(e) => {
+                        warn!(error = %e, shard_id, "Client message processing failed");
+                        reply_bitcode::<()>(&query, Err(e.to_string())).await;
                     }
                 }
-                MessageKind::Read => {
-                    metrics::READS_TOTAL.inc();
-                    if let Err(e) = upstream_tx_clone.lock().await.send(msg).await {
-                        warn!(error = %e, "Upstream send failed");
-                        break;
-                    }
+            }
+        });
+
+        let server_for_out = server_session.clone();
+        let s2c_key_for_out = client_s2c_key.clone();
+        let mut outbound = spawn(async move {
+            while let Ok(Some(msg)) = recv_s2c_message(&upstream_rx).await {
+                let is_close = matches!(msg, Message::Close(_));
+                let bytes = bitcode::encode(&msg);
+                if server_for_out
+                    .put(&s2c_key_for_out, ZBytes::from(bytes))
+                    .await
+                    .is_err()
+                {
+                    return;
                 }
-                MessageKind::PassThrough => {
-                    if let Err(e) = upstream_tx_clone.lock().await.send(msg).await {
-                        warn!(error = %e, "Upstream send failed");
-                        break;
-                    }
+                if is_close {
+                    return;
+                }
+            }
+        });
+
+        select! {
+            _ = (&mut inbound).fuse() => {},
+            _ = (&mut outbound).fuse() => {},
+            _ = shutdown.changed().fuse() => {
+                info!(conn_id, "Shutdown signal received, closing client Zenoh session");
+                if let Some(close_frame) = leader_close_frame(&pool, shard_id) {
+                    let bytes = bitcode::encode(&Message::Close(Some(close_frame)));
+                    let _ = server_session.put(&client_s2c_key, ZBytes::from(bytes)).await;
                 }
             }
         }
-    });
 
-    // SpacetimeDB -> Proxy -> Client
-    let client_tx_clone = client_tx.clone();
-    let outbound = tokio::spawn(async move {
-        while let Some(msg) = upstream_rx.next().await {
-            let msg = match msg {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!(error = %e, "Upstream read error");
-                    break;
-                }
-            };
-            if let Err(e) = client_tx_clone.lock().await.send(msg).await {
-                warn!(error = %e, "Client send failed");
-                break;
-            }
-        }
-    });
+        // compio::runtime::JoinHandle 在 Drop 时会自动取消未完成的任务
+        drop(inbound);
+        drop(outbound);
+    })
+    .detach();
 
-    // Wait for either direction to end or a shutdown signal
-    tokio::select! {
-        _ = inbound => {},
-        _ = outbound => {},
-        _ = shutdown.changed() => {
-            info!("Shutdown signal received, closing client connection");
-            // Send close frame with leader hint for reconnection
-            if let Some(close_frame) = leader_close_frame(&pool, shard_id).await {
-                let _ = client_tx.lock().await
-                    .send(Message::Close(Some(close_frame)))
-                    .await;
-            }
-        },
-    }
-
-    Ok(())
+    Ok(StdbConnectResponse { conn_id })
 }
 
-// ============================================================================
-// Unit Tests
-// ============================================================================
+/// 单条客户端消息处理：写走 Raft 并按全局日志顺序投递，读经因果栅栏后直投。
+async fn handle_client_message(
+    msg: Message,
+    upstream: &ZenohStdbSender,
+    pool: &RaftPool,
+    shard_id: ShardId,
+    db_path: &str,
+) -> Result<()> {
+    match classify_message(&msg) {
+        MessageKind::Write => {
+            if let Message::Binary(data) = &msg {
+                debug!(
+                    tag = data[0],
+                    len = data.len(),
+                    shard_id,
+                    "Write -> Raft consensus"
+                );
+                let log_id = pool
+                    .propose_write(shard_id, data.clone(), db_path.to_owned())
+                    .await?;
+                pool.wait_applied(shard_id, log_id.index).await?;
 
-#[cfg(test)]
-mod tests {
-    use tokio_tungstenite::tungstenite::Message;
+                // 修复 P0-1：等待前置日志索引投递完毕，保证同节点跨连接写的上游投递顺序严格等于 Raft 日志顺序
+                pool.wait_delivered(shard_id, log_id.index.saturating_sub(1))
+                    .await;
 
-    use super::*;
-
-    // -- Tag classification tests --
-
-    #[test]
-    fn test_call_reducer_is_write() {
-        assert!(is_write_tag(stdb_tags::CALL_REDUCER));
-    }
-
-    #[test]
-    fn test_call_procedure_is_write() {
-        assert!(is_write_tag(stdb_tags::CALL_PROCEDURE));
-    }
-
-    #[test]
-    fn test_subscribe_is_not_write() {
-        assert!(!is_write_tag(stdb_tags::SUBSCRIBE));
-    }
-
-    #[test]
-    fn test_unsubscribe_is_not_write() {
-        assert!(!is_write_tag(stdb_tags::UNSUBSCRIBE));
-    }
-
-    #[test]
-    fn test_one_off_query_is_not_write() {
-        assert!(!is_write_tag(stdb_tags::ONE_OFF_QUERY));
-    }
-
-    #[test]
-    fn test_read_tags() {
-        assert!(is_read_tag(stdb_tags::SUBSCRIBE));
-        assert!(is_read_tag(stdb_tags::UNSUBSCRIBE));
-        assert!(is_read_tag(stdb_tags::ONE_OFF_QUERY));
-        assert!(!is_read_tag(stdb_tags::CALL_REDUCER));
-        assert!(!is_read_tag(stdb_tags::CALL_PROCEDURE));
-    }
-
-    #[test]
-    fn test_known_tags() {
-        for tag in 0..=4u8 {
-            assert!(is_known_tag(tag), "tag {tag} should be known");
-        }
-        for tag in 5..=255u8 {
-            assert!(!is_known_tag(tag), "tag {tag} should be unknown");
-        }
-    }
-
-    #[test]
-    fn test_unknown_tags_are_not_writes() {
-        for tag in 5..=255u8 {
-            assert!(!is_write_tag(tag), "tag {tag} should not be a write");
-        }
-    }
-
-    // -- Message classification tests --
-
-    #[test]
-    fn test_classify_call_reducer_message() {
-        // Tag 3 = CallReducer, followed by dummy payload
-        let msg = Message::Binary(vec![3, 0, 1, 2, 3].into());
-        assert_eq!(classify_message(&msg), MessageKind::Write);
-    }
-
-    #[test]
-    fn test_classify_call_procedure_message() {
-        let msg = Message::Binary(vec![4, 10, 20].into());
-        assert_eq!(classify_message(&msg), MessageKind::Write);
-    }
-
-    #[test]
-    fn test_classify_subscribe_message() {
-        let msg = Message::Binary(vec![0, 5, 6, 7].into());
-        assert_eq!(classify_message(&msg), MessageKind::Read);
-    }
-
-    #[test]
-    fn test_classify_unsubscribe_message() {
-        let msg = Message::Binary(vec![1, 99].into());
-        assert_eq!(classify_message(&msg), MessageKind::Read);
-    }
-
-    #[test]
-    fn test_classify_one_off_query_message() {
-        let msg = Message::Binary(vec![2, 0, 0, 0].into());
-        assert_eq!(classify_message(&msg), MessageKind::Read);
-    }
-
-    #[test]
-    fn test_classify_empty_binary_is_passthrough() {
-        let msg = Message::Binary(vec![].into());
-        assert_eq!(classify_message(&msg), MessageKind::PassThrough);
-    }
-
-    #[test]
-    fn test_classify_text_is_passthrough() {
-        let msg = Message::Text("hello".into());
-        assert_eq!(classify_message(&msg), MessageKind::PassThrough);
-    }
-
-    #[test]
-    fn test_classify_ping_is_passthrough() {
-        let msg = Message::Ping(vec![].into());
-        assert_eq!(classify_message(&msg), MessageKind::PassThrough);
-    }
-
-    #[test]
-    fn test_classify_pong_is_passthrough() {
-        let msg = Message::Pong(vec![].into());
-        assert_eq!(classify_message(&msg), MessageKind::PassThrough);
-    }
-
-    #[test]
-    fn test_classify_close_is_passthrough() {
-        let msg = Message::Close(None);
-        assert_eq!(classify_message(&msg), MessageKind::PassThrough);
-    }
-
-    #[test]
-    fn test_classify_unknown_tag_is_read() {
-        // Unknown tags (>4) are treated as reads (forwarded directly, not replicated).
-        // This is safe because SpacetimeDB will handle or reject them.
-        let msg = Message::Binary(vec![255, 0, 0].into());
-        assert_eq!(classify_message(&msg), MessageKind::Read);
-    }
-
-    #[test]
-    fn test_classify_single_byte_write() {
-        // Minimal valid write message: just the tag byte
-        let msg = Message::Binary(vec![3].into());
-        assert_eq!(classify_message(&msg), MessageKind::Write);
-    }
-
-    // -- Property: writes and reads are mutually exclusive --
-
-    #[test]
-    fn test_write_and_read_tags_are_disjoint() {
-        for tag in 0..=255u8 {
-            assert!(
-                !(is_write_tag(tag) && is_read_tag(tag)),
-                "tag {tag} classified as both read and write"
-            );
-        }
-    }
-
-    // -- Fuzz-like: every possible tag byte --
-
-    #[test]
-    fn test_all_256_tags_classify_without_panic() {
-        for tag in 0..=255u8 {
-            let msg = Message::Binary(vec![tag, 0, 0, 0].into());
-            let kind = classify_message(&msg);
-            // Should never panic, and should return a valid enum
-            match kind {
-                MessageKind::Write | MessageKind::Read | MessageKind::PassThrough => {}
+                let send_res = upstream.send(msg).await;
+                // 修复 P0-2：投递完成后推进并持久化 delivered 水位
+                if send_res.is_ok() {
+                    pool.mark_delivered(shard_id, log_id.index);
+                }
+                return send_res;
             }
         }
+        MessageKind::Read => {
+            // 修复 P0-4：等待本节点状态机追平已知提交水位
+            pool.wait_read_ready(shard_id).await;
+            metrics::READS_TOTAL.inc();
+        }
+        MessageKind::PassThrough => {}
     }
+
+    upstream.send(msg).await
+}
+
+/// 构造带 leader 提示的关闭帧，方便客户端重连到新 leader。
+fn leader_close_frame(pool: &RaftPool, shard_id: ShardId) -> Option<CloseFrame> {
+    let (leader_id, leader_addr) = pool.current_leader(shard_id)?;
+    Some(CloseFrame {
+        code: CLOSE_CODE_AWAY,
+        reason: format!("leader={leader_id}:{leader_addr}"),
+    })
 }

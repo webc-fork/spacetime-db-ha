@@ -1,142 +1,134 @@
+use std::{
+    future::Future,
+    io::{self, Cursor},
+};
+
+use bitcode::{DecodeOwned, Encode};
 use openraft::{
-    BasicNode,
-    error::{InstallSnapshotError, RPCError, RaftError, RemoteError, Unreachable},
-    network::{RPCOption, RaftNetwork, RaftNetworkFactory},
+    BasicNode, OptionalSend,
+    errors::{RPCError, ReplicationClosed, StreamingError, Unreachable},
+    network::{RPCOption, RaftNetworkFactory, v2::RaftNetworkV2},
     raft::{
-        AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
-        InstallSnapshotResponse, VoteRequest, VoteResponse,
+        AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, VoteRequest, VoteResponse,
     },
 };
-use reqwest::{Certificate, Client};
 
-use crate::raft::types::TypeConfig;
+use crate::{
+    raft::{
+        codec::{
+            WireAppendEntriesRequest, WireAppendEntriesResponse, WireFatal,
+            WireFullSnapshotRequest, WireSnapshotMeta, WireSnapshotResponse, WireVote,
+            WireVoteRequest, WireVoteResponse,
+        },
+        types::{RaftSnapshot, RaftVote, TypeConfig},
+    },
+    transport::ZenohClientPool,
+};
 
 type C = TypeConfig;
 
-/// Network transport for Raft inter-node communication via HTTP(S).
-/// Each shard's Raft instance gets its own NetworkFactory with its shard_id,
-/// producing URLs like `/raft/{shard_id}/append`.
+/// Raft RPC 的 Zenoh 键表达式前缀。
+const RAFT_KEY_PREFIX: &str = "raft";
+
+/// Raft 节点间网络层：每个分片一套工厂，RPC 落到 `raft/{shard_id}/{rpc}`。
 pub struct NetworkFactory {
-    client: reqwest::Client,
-    use_tls: bool,
+    pool: ZenohClientPool,
     shard_id: u64,
 }
 
 impl NetworkFactory {
-    pub fn new(use_tls: bool, ca_cert_pem: Option<&[u8]>, shard_id: u64) -> Self {
-        let mut builder = Client::builder();
-
-        if let Some(ca_pem) = ca_cert_pem
-            && let Ok(cert) = Certificate::from_pem(ca_pem)
-        {
-            builder = builder.add_root_certificate(cert);
-        }
-
-        Self {
-            client: builder.build().unwrap_or_else(|_| Client::new()),
-            use_tls,
-            shard_id,
-        }
+    pub fn new(pool: ZenohClientPool, shard_id: u64) -> Self {
+        Self { pool, shard_id }
     }
 }
 
-impl Default for NetworkFactory {
-    fn default() -> Self {
-        Self::new(false, None, 0)
-    }
-}
-
+/// 指向某个对端节点的 Zenoh 明文 QUIC 连接。
 pub struct NetworkConnection {
-    target: u64,
     addr: String,
-    client: reqwest::Client,
-    use_tls: bool,
+    pool: ZenohClientPool,
     shard_id: u64,
 }
 
 impl NetworkConnection {
-    /// Build a URL for a Raft RPC: `{scheme}://{addr}/raft/{shard_id}/{rpc}`
-    fn raft_url(&self, rpc: &str) -> String {
-        let scheme = if self.use_tls { "https" } else { "http" };
-        format!("{}://{}/raft/{}/{}", scheme, self.addr, self.shard_id, rpc)
+    /// 拼出 Raft RPC 的 Zenoh 键表达式。
+    fn raft_key(&self, rpc: &str) -> String {
+        format!("{RAFT_KEY_PREFIX}/{}/{rpc}", self.shard_id)
+    }
+
+    /// 通过 Zenoh 发送 `bitcode` 编码的 RPC 请求并反序列化响应体。
+    async fn call_rpc<P, T>(&self, rpc: &str, payload: &P) -> Result<T, Unreachable<C>>
+    where
+        P: Encode,
+        T: DecodeOwned,
+    {
+        self.pool
+            .rpc(&self.addr, &self.raft_key(rpc), payload)
+            .await
+            .map_err(|e| {
+                let io_err = io::Error::other(e.to_string());
+                Unreachable::new(&io_err)
+            })
     }
 }
 
 impl RaftNetworkFactory<C> for NetworkFactory {
     type Network = NetworkConnection;
 
-    async fn new_client(&mut self, target: u64, node: &BasicNode) -> Self::Network {
+    async fn new_client(&mut self, _target: u64, node: &BasicNode) -> Self::Network {
         NetworkConnection {
-            target,
             addr: node.addr.clone(),
-            client: self.client.clone(),
-            use_tls: self.use_tls,
+            pool: self.pool.clone(),
             shard_id: self.shard_id,
         }
     }
 }
 
-impl RaftNetwork<C> for NetworkConnection {
+impl RaftNetworkV2<C> for NetworkConnection {
+    type SnapshotData = Cursor<Vec<u8>>;
+
     async fn append_entries(
         &mut self,
         rpc: AppendEntriesRequest<C>,
         _option: RPCOption,
-    ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
-        let url = self.raft_url("append");
-        let resp: Result<AppendEntriesResponse<u64>, RaftError<u64>> = self
-            .client
-            .post(&url)
-            .json(&rpc)
-            .send()
-            .await
-            .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?
-            .json()
-            .await
-            .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
-
-        resp.map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
+    ) -> Result<AppendEntriesResponse<C>, RPCError<C>> {
+        let req = WireAppendEntriesRequest::from(rpc);
+        let result: Result<WireAppendEntriesResponse, WireFatal> =
+            self.call_rpc("append", &req).await?;
+        result
+            .map(AppendEntriesResponse::from)
+            .map_err(|e| RPCError::Unreachable(Unreachable::from_string(format!("{e:?}"))))
     }
 
     async fn vote(
         &mut self,
-        rpc: VoteRequest<u64>,
+        rpc: VoteRequest<C>,
         _option: RPCOption,
-    ) -> Result<VoteResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
-        let url = self.raft_url("vote");
-        let resp: Result<VoteResponse<u64>, RaftError<u64>> = self
-            .client
-            .post(&url)
-            .json(&rpc)
-            .send()
-            .await
-            .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?
-            .json()
-            .await
-            .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
-
-        resp.map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
+    ) -> Result<VoteResponse<C>, RPCError<C>> {
+        let req = WireVoteRequest::from(rpc);
+        let result: Result<WireVoteResponse, WireFatal> = self.call_rpc("vote", &req).await?;
+        result
+            .map(VoteResponse::from)
+            .map_err(|e| RPCError::Unreachable(Unreachable::from_string(format!("{e:?}"))))
     }
 
-    async fn install_snapshot(
+    async fn full_snapshot(
         &mut self,
-        rpc: InstallSnapshotRequest<C>,
+        vote: RaftVote,
+        snapshot: RaftSnapshot,
+        _cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
         _option: RPCOption,
-    ) -> Result<
-        InstallSnapshotResponse<u64>,
-        RPCError<u64, BasicNode, RaftError<u64, InstallSnapshotError>>,
-    > {
-        let url = self.raft_url("snapshot");
-        let resp: Result<InstallSnapshotResponse<u64>, RaftError<u64, InstallSnapshotError>> = self
-            .client
-            .post(&url)
-            .json(&rpc)
-            .send()
+    ) -> Result<SnapshotResponse<C>, StreamingError<C>> {
+        let req = WireFullSnapshotRequest {
+            vote: WireVote::from(vote),
+            meta: WireSnapshotMeta::from(snapshot.meta),
+            data: snapshot.snapshot.into_inner(),
+        };
+        let result: Result<WireSnapshotResponse, WireFatal> = self
+            .call_rpc("snapshot", &req)
             .await
-            .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?
-            .json()
-            .await
-            .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
-
-        resp.map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
+            .map_err(StreamingError::Unreachable)?;
+        result
+            .map(SnapshotResponse::from)
+            .map_err(|e| StreamingError::Unreachable(Unreachable::from_string(format!("{e:?}"))))
     }
 }

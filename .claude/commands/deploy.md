@@ -1,6 +1,6 @@
 # /deploy — Deploy a SpacetimeDB Module to the Cluster
 
-Build and publish a SpacetimeDB module to all nodes in the RaftTimeDB cluster.
+Build and publish a SpacetimeDB module to all nodes in the spacetime-db-ha cluster.
 
 ## Usage
 
@@ -24,11 +24,11 @@ curl -s http://localhost:4001/cluster/status
 If this fails, tell the user to run `/cluster up` and `/cluster bootstrap` first.
 
 ### 3. Publish to all SpacetimeDB instances
-Use the `rtdb deploy` CLI if available, otherwise use `spacetime publish` directly:
+Use the `sdha deploy` CLI if available, otherwise use `spacetime publish` directly:
 
 ```bash
-# Option A: rtdb CLI
-cargo run -p rtdb -- deploy --module <module_path> --name <db_name>
+# Option A: sdha CLI
+cargo run -p sdha -- deploy --module <module_path> --name <db_name>
 
 # Option B: Direct spacetime CLI
 spacetime publish --server http://localhost:5001 <module_path> <db_name>

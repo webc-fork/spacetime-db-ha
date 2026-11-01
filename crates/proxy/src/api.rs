@@ -1,465 +1,646 @@
-use std::{
-    collections::{BTreeMap, HashMap},
-    sync::Arc,
-};
+//! 基于 Zenoh Queryable + `bitcode` 的 Raft RPC 与集群管理端点，
+//! 以及基于 `compio::net::TcpListener` 与 `const &str` 的最小开销 HTTP JSON `/metrics` 端点。
 
-use axum::{
-    Json, Router,
-    extract::{Path, State},
-    http::StatusCode,
-    response::IntoResponse,
-    routing::{delete, get, post},
+use std::{collections::BTreeMap, fmt::Display, io::Cursor, rc::Rc};
+
+use anyhow::{Result, anyhow};
+use bitcode::{Decode, DecodeOwned, Encode};
+use compio::{
+    BufResult,
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    net::TcpListener,
+    runtime::spawn,
 };
+use futures::{FutureExt, select};
+use gxhash::HashMap;
+use itoa::Buffer as ItoaBuffer;
 use openraft::{
-    BasicNode, Raft,
-    error::{InstallSnapshotError, RaftError},
-    raft::{
-        AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
-        InstallSnapshotResponse, VoteRequest, VoteResponse,
-    },
+    BasicNode, ReadPolicy, ServerState, Snapshot,
+    async_runtime::watch::WatchReceiver,
+    raft::{AppendEntriesRequest, VoteRequest},
 };
-use serde::{Deserialize, Serialize};
+use zenoh::{Session, query::Query};
 
 use crate::{
     metrics,
     raft::{
-        RaftPool,
-        types::{ReducerCallRequest, TypeConfig},
+        RaftPool, ShardRaft,
+        codec::{
+            WireAppendEntriesRequest, WireAppendEntriesResponse, WireFatal,
+            WireFullSnapshotRequest, WireSnapshotResponse, WireVoteRequest, WireVoteResponse,
+        },
+        types::{RaftSnapshotMeta, RaftVote, ReducerCallRequest, WriteAck, leader_term},
     },
-    router::{self, ShardId},
+    router::{DEFAULT_SHARD, ShardConfigCommand, ShardId, encode_shard_config},
+    transport::{
+        CrossfireChannel, RpcEnvelope, close_session, decode_query_payload, reply_bitcode,
+        watch::Receiver,
+    },
 };
 
-/// Shared application state for the HTTP management API.
-pub struct AppState {
-    pub pool: Arc<RaftPool>,
+/// 把错误格式化为字符串。
+fn err_str(err: impl Display) -> String {
+    err.to_string()
 }
 
-/// Build the axum router with all Raft RPC and cluster management endpoints.
-pub fn router(state: Arc<AppState>) -> Router {
-    Router::new()
-        // Shard-aware Raft RPC endpoints: /raft/{shard_id}/{rpc}
-        .route("/raft/{shard_id}/append", post(raft_shard_append))
-        .route("/raft/{shard_id}/vote", post(raft_shard_vote))
-        .route("/raft/{shard_id}/snapshot", post(raft_shard_snapshot))
-        // Legacy Raft RPC endpoints — alias to shard 0 (backwards compat)
-        .route("/raft/append", post(raft_append))
-        .route("/raft/vote", post(raft_vote))
-        .route("/raft/snapshot", post(raft_snapshot))
-        // Shard-aware write forwarding
-        .route("/cluster/{shard_id}/write", post(cluster_shard_write))
-        // Legacy write forwarding — alias to shard 0
-        .route("/cluster/write", post(cluster_write))
-        // Cluster management endpoints
-        .route("/cluster/status", get(cluster_status))
-        .route("/cluster/init", post(cluster_init))
-        .route("/cluster/add-node", post(cluster_add_node))
-        .route("/cluster/remove-node", post(cluster_remove_node))
-        // Discovery / monitoring endpoints
-        .route("/cluster/leader", get(cluster_leader))
-        .route("/cluster/health", get(cluster_health))
-        .route("/metrics", get(prometheus_metrics))
-        // Shard management endpoints
-        .route("/cluster/shards/create", post(shard_create))
-        .route("/cluster/shards/route", post(shard_add_route))
-        .route("/cluster/shards/route", delete(shard_remove_route))
-        .route("/cluster/shards", get(shard_list))
-        .route("/cluster/shards/{shard_id}/status", get(shard_status))
-        .with_state(state)
+/// 原生 TCP `/metrics` 请求读取缓冲区大小。
+const METRICS_REQ_BUF_SIZE: usize = 1024;
+
+/// 编译期静态 HTTP 200 JSON 响应头前缀。
+const HTTP_200_JSON_PREFIX: &str =
+    "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: ";
+/// 编译期静态 HTTP 503 JSON 响应头前缀。
+const HTTP_503_JSON_PREFIX: &str = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: ";
+/// 编译期静态 HTTP 响应头尾部。
+const HTTP_HEADER_END: &str = "\r\nConnection: close\r\n\r\n";
+/// 编译期静态健康检查 200 JSON 完整响应报文（零堆内存分配）。
+const HTTP_200_HEALTH_RESP: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: 20\r\nConnection: close\r\n\r\n{\"status\":\"healthy\"}";
+/// 编译期静态健康检查 503 JSON 响应体前缀与后缀。
+const HEALTH_ERR_PREFIX: &str = r#"{"status":"unhealthy","error":""#;
+const HEALTH_ERR_SUFFIX: &str = r#""}"#;
+/// 编译期静态 404 JSON 完整响应报文（零堆内存分配）。
+const HTTP_404_JSON_RESP: &[u8] = b"HTTP/1.1 404 Not Found\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: 21\r\nConnection: close\r\n\r\n{\"error\":\"not found\"}";
+
+/// 取指定分片的 Raft 实例。
+fn get_shard_raft(pool: &RaftPool, shard_id: ShardId) -> Result<ShardRaft, String> {
+    pool.get_raft(shard_id)
+        .ok_or_else(|| format!("shard {shard_id} not found"))
+}
+
+/// 取分片 0 的 Raft 实例。
+fn get_default_raft(pool: &RaftPool) -> Result<ShardRaft, String> {
+    get_shard_raft(pool, DEFAULT_SHARD)
 }
 
 // ============================================================================
-// Helper: get raft for a shard, returning 404 if missing
+// 公共管理协议数据结构（bitcode 序列化，供代理与 CLI 共享）
 // ============================================================================
 
-async fn get_shard_raft(
+/// 集群整体状态响应。
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct ClusterStatus {
+    pub node_id: u64,
+    pub state: String,
+    pub current_leader: Option<u64>,
+    pub current_term: u64,
+    pub last_applied: Option<String>,
+    pub membership: String,
+    pub active_shards: Vec<ShardId>,
+}
+
+/// 扩容节点请求。
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct AddNodeRequest {
+    pub node_id: u64,
+    pub addr: String,
+}
+
+/// 缩容节点请求。
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct RemoveNodeRequest {
+    pub node_id: u64,
+}
+
+/// 当前 Leader 信息。
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct LeaderInfo {
+    pub leader_id: Option<u64>,
+    pub leader_addr: Option<String>,
+    pub this_node_is_leader: bool,
+}
+
+/// 创建分片请求。
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct CreateShardRequest {
+    pub shard_id: ShardId,
+}
+
+/// 删除分片请求（修复 P1-6）。
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct RemoveShardRequest {
+    pub shard_id: ShardId,
+}
+
+/// 添加模块路由请求。
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct AddRouteRequest {
+    pub module_name: String,
+    pub shard_id: ShardId,
+}
+
+/// 删除模块路由请求。
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct RemoveRouteRequest {
+    pub module_name: String,
+}
+
+/// 分片与路由列表响应。
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct ShardListResponse {
+    pub shards: Vec<ShardId>,
+    pub routes: HashMap<String, ShardId>,
+}
+
+/// 单个分片状态响应。
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct ShardStatusResponse {
+    pub shard_id: ShardId,
+    pub state: String,
+    pub current_leader: Option<u64>,
+    pub current_term: u64,
+    pub last_applied: Option<String>,
+    pub membership: String,
+}
+
+// ============================================================================
+// Zenoh RPC 路由与分发
+// ============================================================================
+
+/// 在指定的 Zenoh 服务端会话上注册 `raft/**` 与 `cluster/**` 查询处理器并运行至收到关闭信号。
+pub async fn serve_zenoh(
+    session: Session,
+    pool: Rc<RaftPool>,
+    mut shutdown: Receiver<bool>,
+) -> Result<()> {
+    let raft_qabl = session
+        .declare_queryable("raft/**")
+        .with(CrossfireChannel::new())
+        .await
+        .map_err(|e| anyhow!("declare raft/** queryable: {e}"))?;
+    let cluster_qabl = session
+        .declare_queryable("cluster/**")
+        .with(CrossfireChannel::new())
+        .await
+        .map_err(|e| anyhow!("declare cluster/** queryable: {e}"))?;
+    let metrics_qabl = session
+        .declare_queryable("metrics")
+        .with(CrossfireChannel::new())
+        .await
+        .map_err(|e| anyhow!("declare metrics queryable: {e}"))?;
+
+    loop {
+        select! {
+            q = raft_qabl.recv().fuse() => {
+                let Ok(query) = q else { break };
+                let pool = Rc::clone(&pool);
+                spawn(async move {
+                    dispatch_raft_query(&pool, query).await;
+                })
+                .detach();
+            }
+            q = cluster_qabl.recv().fuse() => {
+                let Ok(query) = q else { break };
+                let pool = Rc::clone(&pool);
+                spawn(async move {
+                    dispatch_cluster_query(&pool, query).await;
+                })
+                .detach();
+            }
+            q = metrics_qabl.recv().fuse() => {
+                let Ok(query) = q else { break };
+                let pool = Rc::clone(&pool);
+                spawn(async move {
+                    pool.update_metrics();
+                    reply_bitcode(&query, Ok(metrics::encode_metrics())).await;
+                })
+                .detach();
+            }
+            _ = shutdown.changed().fuse() => {
+                break;
+            }
+        }
+    }
+
+    drop(raft_qabl);
+    drop(cluster_qabl);
+    drop(metrics_qabl);
+    close_session(&session);
+    Ok(())
+}
+
+/// 解码查询负载的辅助函数。
+fn decode_req<T: DecodeOwned>(query: &Query) -> Result<T, String> {
+    decode_query_payload(query).map_err(err_str)
+}
+
+/// 分发 `raft/**` 命名空间下的 Raft 节点间共识 RPC。
+async fn dispatch_raft_query(pool: &RaftPool, query: Query) {
+    let key = query.key_expr().as_str();
+    let rest = key.strip_prefix("raft/").unwrap_or("");
+
+    let (shard_id, rpc) = match rest.split_once('/') {
+        Some((sid_str, rpc_name)) => match sid_str.parse::<ShardId>() {
+            Ok(sid) => (sid, rpc_name),
+            Err(_) => {
+                reply_bitcode::<()>(&query, Err(format!("invalid shard id in {key}"))).await;
+                return;
+            }
+        },
+        None => (DEFAULT_SHARD, rest),
+    };
+
+    match rpc {
+        "append" => {
+            let res: RpcEnvelope<Result<WireAppendEntriesResponse, WireFatal>> = async {
+                let req: WireAppendEntriesRequest = decode_req(&query)?;
+                let raft = get_shard_raft(pool, shard_id)?;
+                Ok(raft
+                    .append_entries(AppendEntriesRequest::from(req))
+                    .await
+                    .map(WireAppendEntriesResponse::from)
+                    .map_err(WireFatal::from))
+            }
+            .await;
+            reply_bitcode(&query, res).await;
+        }
+        "vote" => {
+            let res: RpcEnvelope<Result<WireVoteResponse, WireFatal>> = async {
+                let req: WireVoteRequest = decode_req(&query)?;
+                let raft = get_shard_raft(pool, shard_id)?;
+                Ok(raft
+                    .vote(VoteRequest::from(req))
+                    .await
+                    .map(WireVoteResponse::from)
+                    .map_err(WireFatal::from))
+            }
+            .await;
+            reply_bitcode(&query, res).await;
+        }
+        "snapshot" => {
+            let res: RpcEnvelope<Result<WireSnapshotResponse, WireFatal>> = async {
+                let req: WireFullSnapshotRequest = decode_req(&query)?;
+                let raft = get_shard_raft(pool, shard_id)?;
+                let vote = RaftVote::from(req.vote);
+                let snapshot = Snapshot {
+                    meta: RaftSnapshotMeta::from(req.meta),
+                    snapshot: Cursor::new(req.data),
+                };
+                Ok(raft
+                    .install_full_snapshot(vote, snapshot)
+                    .await
+                    .map(WireSnapshotResponse::from)
+                    .map_err(WireFatal::from))
+            }
+            .await;
+            reply_bitcode(&query, res).await;
+        }
+        _ => {
+            reply_bitcode::<()>(&query, Err(format!("unknown raft rpc: {key}"))).await;
+        }
+    }
+}
+
+/// 分发 `cluster/**` 命名空间下的管理与写转发请求。
+async fn dispatch_cluster_query(pool: &RaftPool, query: Query) {
+    let key = query.key_expr().as_str();
+    let rest = key.strip_prefix("cluster/").unwrap_or("");
+
+    match rest {
+        "status" => {
+            reply_bitcode(&query, handle_cluster_status(pool)).await;
+        }
+        "init" => {
+            let res = async {
+                let nodes: BTreeMap<u64, String> = decode_req(&query)?;
+                let members: BTreeMap<u64, BasicNode> = nodes
+                    .into_iter()
+                    .map(|(id, addr)| (id, BasicNode { addr }))
+                    .collect();
+                let raft = get_default_raft(pool)?;
+                raft.initialize(members).await.map_err(err_str)?;
+                Ok("Cluster initialized".to_owned())
+            }
+            .await;
+            reply_bitcode(&query, res).await;
+        }
+        "add-node" => {
+            let res = async {
+                let req: AddNodeRequest = decode_req(&query)?;
+                pool.add_node_all_shards(req.node_id, req.addr)
+                    .await
+                    .map_err(err_str)?;
+                Ok(format!("Node {} added to all shards", req.node_id))
+            }
+            .await;
+            reply_bitcode(&query, res).await;
+        }
+        "remove-node" => {
+            let res = async {
+                let req: RemoveNodeRequest = decode_req(&query)?;
+                pool.remove_node_all_shards(req.node_id)
+                    .await
+                    .map_err(err_str)?;
+                Ok(format!("Node {} removed from all shards", req.node_id))
+            }
+            .await;
+            reply_bitcode(&query, res).await;
+        }
+        "leader" => {
+            reply_bitcode(&query, handle_cluster_leader(pool)).await;
+        }
+        "health" => {
+            reply_bitcode(&query, handle_cluster_health(pool).await).await;
+        }
+        "write" => {
+            let res = async {
+                let req: ReducerCallRequest = decode_req(&query)?;
+                write_to_shard(pool, DEFAULT_SHARD, req).await
+            }
+            .await;
+            reply_bitcode(&query, res).await;
+        }
+        "shards" => {
+            let resp = ShardListResponse {
+                shards: pool.list_shards(),
+                routes: pool.get_routes(),
+            };
+            reply_bitcode(&query, Ok(resp)).await;
+        }
+        "shards/create" => {
+            let res = async {
+                let req: CreateShardRequest = decode_req(&query)?;
+                if req.shard_id == DEFAULT_SHARD {
+                    return Err("shard 0 always exists".to_owned());
+                }
+                propose_config(
+                    pool,
+                    ShardConfigCommand::CreateShard {
+                        shard_id: req.shard_id,
+                    },
+                )
+                .await?;
+                Ok(format!("Shard {} created", req.shard_id))
+            }
+            .await;
+            reply_bitcode(&query, res).await;
+        }
+        "shards/remove" => {
+            let res = async {
+                let req: RemoveShardRequest = decode_req(&query)?;
+                if req.shard_id == DEFAULT_SHARD {
+                    return Err("cannot remove default shard 0".to_owned());
+                }
+                propose_config(
+                    pool,
+                    ShardConfigCommand::RemoveShard {
+                        shard_id: req.shard_id,
+                    },
+                )
+                .await?;
+                Ok(format!("Shard {} removed", req.shard_id))
+            }
+            .await;
+            reply_bitcode(&query, res).await;
+        }
+        "shards/route" | "shards/route/add" => {
+            let res = async {
+                let req: AddRouteRequest = decode_req(&query)?;
+                if !pool.has_shard(req.shard_id) {
+                    return Err(format!("shard {} does not exist", req.shard_id));
+                }
+                let msg = format!("Route {} -> shard {} added", req.module_name, req.shard_id);
+                propose_config(
+                    pool,
+                    ShardConfigCommand::AddRoute {
+                        module_name: req.module_name,
+                        shard_id: req.shard_id,
+                    },
+                )
+                .await?;
+                Ok(msg)
+            }
+            .await;
+            reply_bitcode(&query, res).await;
+        }
+        "shards/route/remove" => {
+            let res = async {
+                let req: RemoveRouteRequest = decode_req(&query)?;
+                let msg = format!("Route for {} removed", req.module_name);
+                propose_config(
+                    pool,
+                    ShardConfigCommand::RemoveRoute {
+                        module_name: req.module_name,
+                    },
+                )
+                .await?;
+                Ok(msg)
+            }
+            .await;
+            reply_bitcode(&query, res).await;
+        }
+        _ => {
+            // 处理动态路径：cluster/{shard_id}/write 或 cluster/shards/{shard_id}/status
+            if let Some(sid_str) = rest.strip_suffix("/write")
+                && let Ok(shard_id) = sid_str.parse::<ShardId>()
+            {
+                let res = async {
+                    let req: ReducerCallRequest = decode_req(&query)?;
+                    write_to_shard(pool, shard_id, req).await
+                }
+                .await;
+                reply_bitcode(&query, res).await;
+                return;
+            }
+
+            if let Some(mid) = rest.strip_prefix("shards/")
+                && let Some(sid_str) = mid.strip_suffix("/status")
+                && let Ok(shard_id) = sid_str.parse::<ShardId>()
+            {
+                reply_bitcode(&query, handle_shard_status(pool, shard_id)).await;
+                return;
+            }
+
+            reply_bitcode::<()>(&query, Err(format!("unknown cluster endpoint: {key}"))).await;
+        }
+    }
+}
+
+/// 提交一次转发来的写，并把日志位置回给 follower。
+async fn write_to_shard(
     pool: &RaftPool,
     shard_id: ShardId,
-) -> Result<Raft<TypeConfig>, (StatusCode, String)> {
-    pool.get_raft(shard_id).await.ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            format!("shard {} not found", shard_id),
-        )
+    req: ReducerCallRequest,
+) -> Result<WriteAck, String> {
+    let raft = get_shard_raft(pool, shard_id)?;
+    let resp = raft.client_write(req).await.map_err(err_str)?;
+    Ok(WriteAck {
+        log_id: resp.log_id,
     })
 }
 
-// ============================================================================
-// Shard-aware Raft RPC Endpoints
-// ============================================================================
+/// 本节点视角的集群状态（以分片 0 为准）。
+pub fn handle_cluster_status(pool: &RaftPool) -> Result<ClusterStatus, String> {
+    let raft = get_default_raft(pool)?;
+    let active_shards = pool.list_shards();
+    let metrics_rx = raft.metrics();
+    let status = metrics_rx.borrow_watched();
 
-async fn raft_shard_append(
-    State(state): State<Arc<AppState>>,
-    Path(shard_id): Path<u64>,
-    Json(req): Json<AppendEntriesRequest<TypeConfig>>,
-) -> Result<Json<Result<AppendEntriesResponse<u64>, RaftError<u64>>>, (StatusCode, String)> {
-    let raft = get_shard_raft(&state.pool, shard_id).await?;
-    Ok(Json(raft.append_entries(req).await))
-}
-
-async fn raft_shard_vote(
-    State(state): State<Arc<AppState>>,
-    Path(shard_id): Path<u64>,
-    Json(req): Json<VoteRequest<u64>>,
-) -> Result<Json<Result<VoteResponse<u64>, RaftError<u64>>>, (StatusCode, String)> {
-    let raft = get_shard_raft(&state.pool, shard_id).await?;
-    Ok(Json(raft.vote(req).await))
-}
-
-async fn raft_shard_snapshot(
-    State(state): State<Arc<AppState>>,
-    Path(shard_id): Path<u64>,
-    Json(req): Json<InstallSnapshotRequest<TypeConfig>>,
-) -> Result<
-    Json<Result<InstallSnapshotResponse<u64>, RaftError<u64, InstallSnapshotError>>>,
-    (StatusCode, String),
-> {
-    let raft = get_shard_raft(&state.pool, shard_id).await?;
-    Ok(Json(raft.install_snapshot(req).await))
-}
-
-// ============================================================================
-// Legacy Raft RPC Endpoints (alias to shard 0)
-// ============================================================================
-
-async fn raft_append(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<AppendEntriesRequest<TypeConfig>>,
-) -> Json<Result<AppendEntriesResponse<u64>, RaftError<u64>>> {
-    let raft = state.pool.get_raft(0).await.expect("shard 0 must exist");
-    Json(raft.append_entries(req).await)
-}
-
-async fn raft_vote(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<VoteRequest<u64>>,
-) -> Json<Result<VoteResponse<u64>, RaftError<u64>>> {
-    let raft = state.pool.get_raft(0).await.expect("shard 0 must exist");
-    Json(raft.vote(req).await)
-}
-
-async fn raft_snapshot(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<InstallSnapshotRequest<TypeConfig>>,
-) -> Json<Result<InstallSnapshotResponse<u64>, RaftError<u64, InstallSnapshotError>>> {
-    let raft = state.pool.get_raft(0).await.expect("shard 0 must exist");
-    Json(raft.install_snapshot(req).await)
-}
-
-// ============================================================================
-// Cluster Management Endpoints
-// ============================================================================
-
-#[derive(Serialize)]
-struct ClusterStatus {
-    node_id: u64,
-    state: String,
-    current_leader: Option<u64>,
-    current_term: u64,
-    last_applied: Option<String>,
-    membership: String,
-    active_shards: Vec<ShardId>,
-}
-
-/// Return cluster status for this node (based on shard 0).
-async fn cluster_status(State(state): State<Arc<AppState>>) -> Json<ClusterStatus> {
-    let raft = state.pool.get_raft(0).await.expect("shard 0 must exist");
-    let metrics = raft.metrics().borrow().clone();
-    let active_shards = state.pool.list_shards().await;
-
-    Json(ClusterStatus {
-        node_id: state.pool.node_config.node_id,
-        state: format!("{:?}", metrics.state),
-        current_leader: metrics.current_leader,
-        current_term: metrics.vote.leader_id().term,
-        last_applied: metrics.last_applied.map(|id| format!("{}", id)),
-        membership: format!("{:?}", metrics.membership_config),
+    Ok(ClusterStatus {
+        node_id: pool.node_config.node_id,
+        state: format!("{:?}", status.state),
+        current_leader: status.current_leader,
+        current_term: leader_term(&status.vote),
+        last_applied: status.last_applied.map(|id| id.to_string()),
+        membership: format!("{:?}", status.membership_config),
         active_shards,
     })
 }
 
-/// Initialize the Raft cluster with the given set of members.
-/// This must be called exactly once on one node to bootstrap the cluster.
-/// Only initializes shard 0 — new shards inherit membership from shard 0.
-async fn cluster_init(
-    State(state): State<Arc<AppState>>,
-    Json(members): Json<BTreeMap<u64, BasicNode>>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let raft = state.pool.get_raft(0).await.expect("shard 0 must exist");
-    raft.initialize(members)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok((StatusCode::OK, "Cluster initialized".to_string()))
-}
-
-#[derive(Deserialize)]
-struct AddNodeRequest {
-    node_id: u64,
-    addr: String,
-}
-
-/// Add a new node to the cluster (all shards).
-async fn cluster_add_node(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<AddNodeRequest>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    state
-        .pool
-        .add_node_all_shards(req.node_id, req.addr)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
-    Ok((
-        StatusCode::OK,
-        format!("Node {} added to all shards", req.node_id),
-    ))
-}
-
-#[derive(Deserialize)]
-struct RemoveNodeRequest {
-    node_id: u64,
-}
-
-/// Remove a node from the cluster (all shards).
-async fn cluster_remove_node(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<RemoveNodeRequest>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    state
-        .pool
-        .remove_node_all_shards(req.node_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
-    Ok((
-        StatusCode::OK,
-        format!("Node {} removed from all shards", req.node_id),
-    ))
-}
-
-// ============================================================================
-// Write Forwarding (shard-aware + legacy)
-// ============================================================================
-
-/// Handle a write forwarded from a follower node (shard-specific).
-async fn cluster_shard_write(
-    State(state): State<Arc<AppState>>,
-    Path(shard_id): Path<u64>,
-    Json(req): Json<ReducerCallRequest>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let raft = get_shard_raft(&state.pool, shard_id).await?;
-    raft.client_write(req)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok((StatusCode::OK, "Write committed".to_string()))
-}
-
-/// Handle a write forwarded from a follower node (legacy, shard 0).
-async fn cluster_write(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<ReducerCallRequest>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let raft = state.pool.get_raft(0).await.expect("shard 0 must exist");
-    raft.client_write(req)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok((StatusCode::OK, "Write committed".to_string()))
-}
-
-// ============================================================================
-// Discovery & Monitoring Endpoints
-// ============================================================================
-
-#[derive(Serialize)]
-struct LeaderInfo {
-    leader_id: Option<u64>,
-    leader_addr: Option<String>,
-    this_node_is_leader: bool,
-}
-
-/// Return the current Raft leader's address (shard 0).
-async fn cluster_leader(State(state): State<Arc<AppState>>) -> Json<LeaderInfo> {
-    let raft = state.pool.get_raft(0).await.expect("shard 0 must exist");
-    let metrics = raft.metrics().borrow().clone();
+/// 当前 leader（分片 0）。
+pub fn handle_cluster_leader(pool: &RaftPool) -> Result<LeaderInfo, String> {
+    let raft = get_default_raft(pool)?;
+    let metrics_rx = raft.metrics();
+    let metrics = metrics_rx.borrow_watched();
     let leader_id = metrics.current_leader;
-    let node_id = state.pool.node_config.node_id;
-    let this_node_is_leader = leader_id == Some(node_id);
-
-    let leader_addr = leader_id.and_then(|id| {
-        if id == node_id {
-            None // Return None for self — client is already connected here
-        } else {
-            state.pool.peers.get(&id).map(|n| n.addr.clone())
-        }
+    let node_id = pool.node_config.node_id;
+    let leader_addr = leader_id.filter(|&id| id != node_id).and_then(|id| {
+        metrics
+            .membership_config
+            .membership()
+            .get_node(&id)
+            .map(|n| n.addr.clone())
+            .or_else(|| pool.peers.get(&id).map(|node| node.addr.clone()))
     });
 
-    Json(LeaderInfo {
+    Ok(LeaderInfo {
         leader_id,
         leader_addr,
-        this_node_is_leader,
+        this_node_is_leader: leader_id == Some(node_id),
     })
 }
 
-/// Health check endpoint. Returns 200 if the node is healthy, 503 if not.
-async fn cluster_health(
-    State(state): State<Arc<AppState>>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let raft = state.pool.get_raft(0).await.expect("shard 0 must exist");
-    let metrics = raft.metrics().borrow().clone();
-
-    if metrics.current_leader.is_some() {
-        Ok((StatusCode::OK, "healthy".to_string()))
-    } else {
-        Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no leader elected".to_string(),
-        ))
+/// 健康检查（修复 P3-16：若本节点自称 leader，必须通过线性化多数派校验，防止少数派分区误报健康）。
+pub async fn handle_cluster_health(pool: &RaftPool) -> Result<String, String> {
+    let raft = get_default_raft(pool)?;
+    let (state, current_leader) = {
+        let metrics_rx = raft.metrics();
+        let metrics = metrics_rx.borrow_watched();
+        (metrics.state, metrics.current_leader)
+    };
+    if matches!(state, ServerState::Shutdown) {
+        return Err("raft node is shut down".to_owned());
     }
-}
-
-/// Prometheus metrics endpoint.
-async fn prometheus_metrics() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
-        metrics::encode_metrics(),
-    )
-}
-
-// ============================================================================
-// Shard Management Endpoints
-// ============================================================================
-
-#[derive(Deserialize)]
-struct CreateShardRequest {
-    shard_id: ShardId,
-}
-
-/// Create a new shard by proposing a ShardConfigCommand through shard 0's Raft.
-async fn shard_create(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<CreateShardRequest>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    if req.shard_id == 0 {
-        return Err((StatusCode::BAD_REQUEST, "shard 0 always exists".to_string()));
+    let Some(leader_id) = current_leader else {
+        return Err("no leader elected".to_owned());
+    };
+    if leader_id == pool.node_config.node_id
+        && raft
+            .ensure_linearizable(ReadPolicy::ReadIndex)
+            .await
+            .is_err()
+    {
+        return Err("leader lost quorum".to_owned());
     }
-
-    let cmd = router::ShardConfigCommand::CreateShard {
-        shard_id: req.shard_id,
-    };
-    let data = router::encode_shard_config(&cmd);
-
-    let raft = state.pool.get_raft(0).await.expect("shard 0 must exist");
-    let request = ReducerCallRequest {
-        raw_message: data,
-        origin_node_id: state.pool.node_config.node_id,
-    };
-    raft.client_write(request)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    Ok((StatusCode::OK, format!("Shard {} created", req.shard_id)))
+    Ok("healthy".to_owned())
 }
 
-#[derive(Deserialize)]
-struct AddRouteRequest {
-    module_name: String,
+/// 单个分片状态查询。
+pub fn handle_shard_status(
+    pool: &RaftPool,
     shard_id: ShardId,
-}
+) -> Result<ShardStatusResponse, String> {
+    let raft = get_shard_raft(pool, shard_id)?;
+    let metrics_rx = raft.metrics();
+    let status = metrics_rx.borrow_watched();
 
-/// Add a module -> shard route by proposing through shard 0's Raft.
-async fn shard_add_route(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<AddRouteRequest>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let cmd = router::ShardConfigCommand::AddRoute {
-        module_name: req.module_name.clone(),
-        shard_id: req.shard_id,
-    };
-    let data = router::encode_shard_config(&cmd);
-
-    let raft = state.pool.get_raft(0).await.expect("shard 0 must exist");
-    let request = ReducerCallRequest {
-        raw_message: data,
-        origin_node_id: state.pool.node_config.node_id,
-    };
-    raft.client_write(request)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    Ok((
-        StatusCode::OK,
-        format!("Route {} -> shard {} added", req.module_name, req.shard_id),
-    ))
-}
-
-#[derive(Deserialize)]
-struct RemoveRouteRequest {
-    module_name: String,
-}
-
-/// Remove a module route by proposing through shard 0's Raft.
-async fn shard_remove_route(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<RemoveRouteRequest>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let cmd = router::ShardConfigCommand::RemoveRoute {
-        module_name: req.module_name.clone(),
-    };
-    let data = router::encode_shard_config(&cmd);
-
-    let raft = state.pool.get_raft(0).await.expect("shard 0 must exist");
-    let request = ReducerCallRequest {
-        raw_message: data,
-        origin_node_id: state.pool.node_config.node_id,
-    };
-    raft.client_write(request)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    Ok((
-        StatusCode::OK,
-        format!("Route for {} removed", req.module_name),
-    ))
-}
-
-#[derive(Serialize)]
-struct ShardListResponse {
-    shards: Vec<ShardId>,
-    routes: HashMap<String, ShardId>,
-}
-
-/// List all active shards and routes.
-async fn shard_list(State(state): State<Arc<AppState>>) -> Json<ShardListResponse> {
-    let shards = state.pool.list_shards().await;
-    let routes = state.pool.get_routes().await;
-
-    Json(ShardListResponse { shards, routes })
-}
-
-#[derive(Serialize)]
-struct ShardStatusResponse {
-    shard_id: ShardId,
-    state: String,
-    current_leader: Option<u64>,
-    current_term: u64,
-    last_applied: Option<String>,
-    membership: String,
-}
-
-/// Get status for a specific shard.
-async fn shard_status(
-    State(state): State<Arc<AppState>>,
-    Path(shard_id): Path<u64>,
-) -> Result<Json<ShardStatusResponse>, (StatusCode, String)> {
-    let raft = get_shard_raft(&state.pool, shard_id).await?;
-    let metrics = raft.metrics().borrow().clone();
-
-    Ok(Json(ShardStatusResponse {
+    Ok(ShardStatusResponse {
         shard_id,
-        state: format!("{:?}", metrics.state),
-        current_leader: metrics.current_leader,
-        current_term: metrics.vote.leader_id().term,
-        last_applied: metrics.last_applied.map(|id| format!("{}", id)),
-        membership: format!("{:?}", metrics.membership_config),
-    }))
+        state: format!("{:?}", status.state),
+        current_leader: status.current_leader,
+        current_term: leader_term(&status.vote),
+        last_applied: status.last_applied.map(|id| id.to_string()),
+        membership: format!("{:?}", status.membership_config),
+    })
+}
+
+/// 通过分片 0 的 Raft 提交一条分片配置命令并等待本节点应用。
+async fn propose_config(pool: &RaftPool, cmd: ShardConfigCommand) -> Result<(), String> {
+    let raw_message = encode_shard_config(&cmd);
+    let log_id = pool
+        .propose_write(DEFAULT_SHARD, raw_message.into(), String::new())
+        .await
+        .map_err(err_str)?;
+    pool.wait_applied(DEFAULT_SHARD, log_id.index)
+        .await
+        .map_err(err_str)?;
+    Ok(())
+}
+
+// ============================================================================
+// 基于 compio + const &str 的最小开销 HTTP JSON `/metrics` 响应器
+// ============================================================================
+
+/// 用编译期 `const &str` HTTP 头前缀与 `itoa` 栈缓冲拼装完整 HTTP JSON 响应帧。
+fn build_http_json_response(header_prefix: &str, json_body: &str) -> Vec<u8> {
+    let mut ibuf = ItoaBuffer::new();
+    let len_str = ibuf.format(json_body.len());
+    let mut resp = Vec::with_capacity(
+        header_prefix.len() + len_str.len() + HTTP_HEADER_END.len() + json_body.len(),
+    );
+    resp.extend_from_slice(header_prefix.as_bytes());
+    resp.extend_from_slice(len_str.as_bytes());
+    resp.extend_from_slice(HTTP_HEADER_END.as_bytes());
+    resp.extend_from_slice(json_body.as_bytes());
+    resp
+}
+
+/// 单次预分配拼装 503 健康检查错误 JSON 响应帧（消除中间 `String` 分配）。
+fn build_http_503_health_response(msg: &str) -> Vec<u8> {
+    let body_len = HEALTH_ERR_PREFIX.len() + msg.len() + HEALTH_ERR_SUFFIX.len();
+    let mut ibuf = ItoaBuffer::new();
+    let len_str = ibuf.format(body_len);
+    let mut resp = Vec::with_capacity(
+        HTTP_503_JSON_PREFIX.len() + len_str.len() + HTTP_HEADER_END.len() + body_len,
+    );
+    resp.extend_from_slice(HTTP_503_JSON_PREFIX.as_bytes());
+    resp.extend_from_slice(len_str.as_bytes());
+    resp.extend_from_slice(HTTP_HEADER_END.as_bytes());
+    resp.extend_from_slice(HEALTH_ERR_PREFIX.as_bytes());
+    resp.extend_from_slice(msg.as_bytes());
+    resp.extend_from_slice(HEALTH_ERR_SUFFIX.as_bytes());
+    resp
+}
+
+/// 在给定 `compio::net::TcpListener` 上响应 HTTP JSON `GET /metrics` 与 `GET /cluster/health`。
+pub async fn serve_metrics_tcp(
+    listener: TcpListener,
+    pool: Rc<RaftPool>,
+    mut shutdown: Receiver<bool>,
+) {
+    loop {
+        select! {
+            accepted = listener.accept().fuse() => {
+                let Ok((mut stream, _)) = accepted else { continue };
+                let pool = Rc::clone(&pool);
+                spawn(async move {
+                    let BufResult(Ok(n), buf) = stream.read(Vec::with_capacity(METRICS_REQ_BUF_SIZE)).await else {
+                        return;
+                    };
+                    let head = &buf[..n];
+
+                    if head.starts_with(b"GET /metrics") {
+                        pool.update_metrics();
+                        let body = metrics::encode_metrics();
+                        let resp = build_http_json_response(HTTP_200_JSON_PREFIX, &body);
+                        let _ = stream.write_all(resp).await;
+                    } else if head.starts_with(b"GET /cluster/health") {
+                        match handle_cluster_health(&pool).await {
+                            Ok(_) => {
+                                let _ = stream.write_all(HTTP_200_HEALTH_RESP).await;
+                            }
+                            Err(msg) => {
+                                let resp = build_http_503_health_response(&msg);
+                                let _ = stream.write_all(resp).await;
+                            }
+                        }
+                    } else {
+                        let _ = stream.write_all(HTTP_404_JSON_RESP).await;
+                    }
+                    let _ = stream.shutdown().await;
+                })
+                .detach();
+            }
+            _ = shutdown.changed().fuse() => return,
+        }
+    }
 }

@@ -1,9 +1,9 @@
-# Default values for RaftTimeDB Helm chart
+# Default values for spacetime-db-ha Helm chart
 
 replicas: 3
 
 image:
-  repository: ghcr.io/nodenestor/rafttimedb
+  repository: ghcr.io/webc-fork/spacetime-db-ha
   tag: latest
   pullPolicy: IfNotPresent
 
@@ -19,7 +19,7 @@ spacetimedb:
       cpu: "2"
       memory: 4Gi
 
-rafttimedb:
+spacetime-db-ha:
   clientPort: 3001
   raftPort: 4001
   storage: 1Gi
@@ -39,11 +39,11 @@ service:
 tls:
   enabled: false
   # Paths inside the container (mount certs via a Secret volume)
-  certPath: /etc/rafttimedb/certs/node.crt
-  keyPath: /etc/rafttimedb/certs/node.key
-  caPath: /etc/rafttimedb/certs/ca.crt
+  certPath: /etc/spacetime-db-ha/certs/node.crt
+  keyPath: /etc/spacetime-db-ha/certs/node.key
+  caPath: /etc/spacetime-db-ha/certs/ca.crt
   # Name of the Kubernetes Secret containing the TLS certificates
-  secretName: rafttimedb-tls
+  secretName: spacetime-db-ha-tls
 
 # Prometheus metrics
 metrics:

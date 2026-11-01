@@ -2,7 +2,7 @@
 # ============================================================================
 # Publish a SpacetimeDB module to ALL nodes in the cluster.
 #
-# RaftTimeDB replicates reducer calls, not module deployments. This script
+# spacetime-db-ha replicates reducer calls, not module deployments. This script
 # publishes the same module to every SpacetimeDB instance so they all have
 # identical schemas and reducers.
 #
@@ -69,7 +69,7 @@ echo ""
 if [ "$FAILED" -eq 0 ]; then
     echo -e "${GREEN}Module '${DB_NAME}' published to all nodes successfully!${NC}"
     echo ""
-    echo "Your app can now connect to any RaftTimeDB node:"
+    echo "Your app can now connect to any spacetime-db-ha node:"
     echo "  ws://localhost:3001  ws://localhost:3002  ws://localhost:3003"
 else
     echo -e "${RED}${FAILED} node(s) failed. All nodes must have the same module for replication to work.${NC}"

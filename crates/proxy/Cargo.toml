@@ -1,46 +1,35 @@
 [package]
-name = "rafttimedb"
+name = "spacetime-db-ha"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Distributed fault-tolerant proxy for SpacetimeDB using Raft consensus"
-default-run = "rafttimedb"
-
+repository.workspace = true
 [[bin]]
-name = "rafttimedb"
+name = "spacetime-db-ha"
 path = "src/main.rs"
 
 [dependencies]
-tokio.workspace = true
-futures-util.workspace = true
-tokio-tungstenite.workspace = true
-openraft.workspace = true
-serde.workspace = true
-serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
-clap.workspace = true
-
-# HTTP client for SpacetimeDB HTTP API
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
-
-# HTTP server for Raft RPCs and management API
-axum.workspace = true
-redb = "4.4.0"
-
-# TLS for inter-node and client communication
-tokio-rustls = "0.26"
-rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
-rustls-pemfile = "2"
-
-# Low-level HTTP serving (for TLS mode)
-hyper = { version = "1", features = ["server"] }
-hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1"] }
-tower = { version = "0.5", features = ["util"] }
-
-# Prometheus metrics
-prometheus = "0.14"
+clap = { workspace = true, features = ["derive", "env"] }
+parking_lot = "0.13.0"
+thiserror.workspace = true
+zenoh = { version = "1.10.2", default-features = false, features = ["transport_udp", "transport_quic", "transport_quic_datagram"] }
+gxhash = "3.5.0"
+fjall = "3.1.13"
+crossfire = "3.1.22"
+zmij = "1.0.23"
+itoa = "1.0.18"
+bitcode = { version = "0.6.9", default-features = false, features = ["std", "derive"] }
+bytes = "1"
+openraft = { version = "0.10.0-alpha.37", default-features = false, features = ["single-threaded"] }
+openraft-rt-compio = "0.10.0-alpha.37"
+compio = { version = "0.19", features = ["macros", "time", "net", "io", "signal"] }
+futures = "0.3"
+see = "0.1"
+rimalloc = { git = "https://github.com/moggedhedien/rimalloc.git", version = "0.1.0" }
 
 [dev-dependencies]
 tempfile = "3.27.0"

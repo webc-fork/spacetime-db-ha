@@ -1,6 +1,6 @@
 # End-to-End Tests
 
-These tests verify RaftTimeDB works as a complete system.
+These tests verify spacetime-db-ha works as a complete system.
 
 ## Prerequisites
 

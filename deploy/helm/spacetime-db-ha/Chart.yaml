@@ -1,5 +1,5 @@
 apiVersion: v2
-name: rafttimedb
+name: spacetime-db-ha
 description: Distributed fault-tolerant clustering for SpacetimeDB
 type: application
 version: 0.1.0
@@ -10,6 +10,6 @@ keywords:
   - distributed
   - database
   - clustering
-home: https://github.com/NodeNestor/RaftimeDB
+home: https://github.com/webc-fork/spacetime-db-ha
 sources:
-  - https://github.com/NodeNestor/RaftimeDB
+  - https://github.com/webc-fork/spacetime-db-ha

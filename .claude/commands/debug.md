@@ -1,4 +1,4 @@
-# /debug — Diagnose RaftTimeDB Cluster Issues
+# /debug — Diagnose spacetime-db-ha Cluster Issues
 
 Comprehensive cluster diagnostics when something isn't working.
 
