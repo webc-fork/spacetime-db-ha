@@ -3292,6 +3292,7 @@ dependencies = [
  "const-str",
  "crossfire",
  "gxhash",
+ "itoa",
  "rimalloc",
  "zenoh",
 ]

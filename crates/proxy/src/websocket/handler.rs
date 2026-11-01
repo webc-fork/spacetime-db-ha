@@ -60,14 +60,32 @@ pub enum Message {
     Close(Option<CloseFrame>),
 }
 
-/// `Message` 的 `bitcode` 原生线格式表示。
-#[derive(Encode, Decode)]
-pub struct WireMessage {
-    kind: WireMessageKind,
+/// `Message` 的零拷贝借用编码视图（消除编码时 `b.to_vec()` 与 `s.clone()` 临时堆分配）。
+#[derive(Encode)]
+pub enum WireMessageRef<'a> {
+    Binary(&'a [u8]),
+    Text(&'a str),
+    Ping(&'a [u8]),
+    Pong(&'a [u8]),
+    Close(&'a Option<CloseFrame>),
 }
 
-#[derive(Encode, Decode)]
-enum WireMessageKind {
+impl<'a> From<&'a Message> for WireMessageRef<'a> {
+    #[inline(always)]
+    fn from(msg: &'a Message) -> Self {
+        match msg {
+            Message::Binary(b) => Self::Binary(b),
+            Message::Text(s) => Self::Text(s),
+            Message::Ping(b) => Self::Ping(b),
+            Message::Pong(b) => Self::Pong(b),
+            Message::Close(c) => Self::Close(c),
+        }
+    }
+}
+
+/// `Message` 的 `bitcode` 原生解码表示。
+#[derive(Decode)]
+pub enum WireMessage {
     Binary(Vec<u8>),
     Text(String),
     Ping(Vec<u8>),
@@ -75,32 +93,20 @@ enum WireMessageKind {
     Close(Option<CloseFrame>),
 }
 
-impl From<&Message> for WireMessage {
-    fn from(msg: &Message) -> Self {
-        let kind = match msg {
-            Message::Binary(b) => WireMessageKind::Binary(b.to_vec()),
-            Message::Text(s) => WireMessageKind::Text(s.clone()),
-            Message::Ping(b) => WireMessageKind::Ping(b.to_vec()),
-            Message::Pong(b) => WireMessageKind::Pong(b.to_vec()),
-            Message::Close(c) => WireMessageKind::Close(c.clone()),
-        };
-        Self { kind }
-    }
-}
-
 impl From<WireMessage> for Message {
+    #[inline(always)]
     fn from(w: WireMessage) -> Self {
-        match w.kind {
-            WireMessageKind::Binary(b) => Self::Binary(Bytes::from(b)),
-            WireMessageKind::Text(s) => Self::Text(s),
-            WireMessageKind::Ping(b) => Self::Ping(Bytes::from(b)),
-            WireMessageKind::Pong(b) => Self::Pong(Bytes::from(b)),
-            WireMessageKind::Close(c) => Self::Close(c),
+        match w {
+            WireMessage::Binary(b) => Self::Binary(Bytes::from(b)),
+            WireMessage::Text(s) => Self::Text(s),
+            WireMessage::Ping(b) => Self::Ping(Bytes::from(b)),
+            WireMessage::Pong(b) => Self::Pong(Bytes::from(b)),
+            WireMessage::Close(c) => Self::Close(c),
         }
     }
 }
 
-impl_bitcode_via!(Message, WireMessage);
+impl_bitcode_via!(Message, WireMessageRef, WireMessage);
 
 /// Zenoh 会话握手请求。
 #[derive(Debug, Clone, Encode, Decode)]
