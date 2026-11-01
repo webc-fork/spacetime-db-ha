@@ -804,24 +804,147 @@ fn resolve_peer_addr(
     }
 }
 
-/// 若当前分片已知远端 leader（非本节点），返回其可路由地址；用于 Follower 直投快路径，跳过本地 `ForwardToLeader` 报错往返。
-fn current_remote_leader(
-    raft: &ShardRaft,
-    node_config: &NodeConfig,
-    peers: &BTreeMap<u64, BasicNode>,
-) -> Option<String> {
-    let metrics_rx = raft.metrics();
-    let metrics = metrics_rx.borrow_watched();
-    let leader_id = metrics.current_leader?;
-    if leader_id == node_config.node_id {
-        return None;
+/// 分片微批写提案器上下文（预计算分片级转发键表达式，消除热路径字符串分配）。
+struct ShardBatcherCtx {
+    raft: ShardRaft,
+    zenoh_pool: ZenohClientPool,
+    node_config: Arc<NodeConfig>,
+    peers: Arc<BTreeMap<u64, BasicNode>>,
+    shard_id: ShardId,
+    write_key: String,
+    write_batch_key: String,
+}
+
+impl ShardBatcherCtx {
+    /// 若当前分片已知远端 leader（非本节点），返回其可路由地址；用于 Follower 直投快路径，跳过本地 `ForwardToLeader` 报错往返。
+    fn current_remote_leader(&self) -> Option<String> {
+        let metrics_rx = self.raft.metrics();
+        let metrics = metrics_rx.borrow_watched();
+        let leader_id = metrics.current_leader?;
+        if leader_id == self.node_config.node_id {
+            return None;
+        }
+        resolve_peer_addr(
+            &self.node_config,
+            &self.peers,
+            metrics.membership_config.membership(),
+            leader_id,
+        )
     }
-    resolve_peer_addr(
-        node_config,
-        peers,
-        metrics.membership_config.membership(),
-        leader_id,
-    )
+
+    /// 将一批写请求转发给远端 Leader（单条走 `/write`，多条自动合并走 `/write-batch` 单次 RPC）。
+    async fn forward_write_jobs(
+        &self,
+        leader_addr: &str,
+        jobs: &[BatchWriteJob],
+    ) -> Result<Vec<RaftLogId>> {
+        if let [single] = jobs {
+            let ack: WriteAck = self
+                .zenoh_pool
+                .rpc(leader_addr, &self.write_key, &single.request)
+                .await
+                .with_context(|| format!("forward write to {leader_addr} on {}", self.write_key))?;
+            return Ok(vec![ack.log_id]);
+        }
+
+        let requests: Vec<ReducerCallRequest> = jobs.iter().map(|j| j.request.clone()).collect();
+        let acks: Vec<WriteAck> = self
+            .zenoh_pool
+            .rpc(leader_addr, &self.write_batch_key, &requests)
+            .await
+            .with_context(|| {
+                format!(
+                    "forward write batch to {leader_addr} on {}",
+                    self.write_batch_key
+                )
+            })?;
+        Ok(acks.into_iter().map(|ack| ack.log_id).collect())
+    }
+
+    /// 执行单批写作业：
+    /// 1. 若本节点是已知 Follower，直接走 Zenoh 单次或批量 RPC 转发给远端 Leader；
+    /// 2. 若本节点是 Leader（或远端转发失败），通过 `join_all` 在同一 tick 并发入队 `RaftCore`，触发底层单次 `fjall` 批量落盘与单次 `AppendEntries` 复制。
+    async fn execute_write_batch(&self, batch: &mut Vec<BatchWriteJob>) {
+        if let Some(leader_addr) = self.current_remote_leader()
+            && let Ok(log_ids) = self.forward_write_jobs(&leader_addr, batch).await
+            && log_ids.len() == batch.len()
+        {
+            for (job, log_id) in batch.drain(..).zip(log_ids) {
+                let _ = job.reply_tx.send(Ok(log_id));
+            }
+            return;
+        }
+
+        let results = join_all(
+            batch
+                .iter()
+                .map(|job| self.raft.client_write(job.request.clone())),
+        )
+        .await;
+        let mut to_forward = Vec::new();
+        let mut forwarded_leader_addr: Option<String> = None;
+
+        for (job, res) in batch.drain(..).zip(results) {
+            match res {
+                Ok(resp) => {
+                    let _ = job.reply_tx.send(Ok(resp.log_id));
+                }
+                Err(RaftError::APIError(ClientWriteError::ForwardToLeader(forward))) => {
+                    if forwarded_leader_addr.is_none()
+                        && let Some(node) = forward.leader_node
+                    {
+                        forwarded_leader_addr = Some(node.addr);
+                    }
+                    to_forward.push(job);
+                }
+                Err(e) => {
+                    let _ = job.reply_tx.send(Err(e.into()));
+                }
+            }
+        }
+
+        if to_forward.is_empty() {
+            return;
+        }
+
+        let shard_id = self.shard_id;
+        let Some(leader_addr) = forwarded_leader_addr.or_else(|| self.current_remote_leader())
+        else {
+            for job in to_forward {
+                let _ = job
+                    .reply_tx
+                    .send(Err(anyhow!("shard {shard_id} has no leader yet")));
+            }
+            return;
+        };
+
+        info!(
+            leader_addr = %leader_addr,
+            shard_id,
+            batch_size = to_forward.len(),
+            "Forwarding write batch to leader over Zenoh"
+        );
+        match self.forward_write_jobs(&leader_addr, &to_forward).await {
+            Ok(log_ids) if log_ids.len() == to_forward.len() => {
+                for (job, log_id) in to_forward.into_iter().zip(log_ids) {
+                    let _ = job.reply_tx.send(Ok(log_id));
+                }
+            }
+            Ok(_) => {
+                for job in to_forward {
+                    let _ = job
+                        .reply_tx
+                        .send(Err(anyhow!("leader returned mismatched batch ack count")));
+                }
+            }
+            Err(e) => {
+                let err_msg = e.to_string();
+                for job in to_forward {
+                    let _ = job.reply_tx.send(Err(anyhow!("{err_msg}")));
+                }
+            }
+        }
+    }
 }
 
 /// 启动分片的微批写提案后台协程：零延迟接收首条写并立即排空当前就绪队列，合并提交。
@@ -834,8 +957,15 @@ fn spawn_write_batcher(
     batch_rx: BatchWriteReceiver,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
-    let write_key = mid_u64_key(CLUSTER_PREFIX, shard_id, SUFFIX_WRITE);
-    let write_batch_key = mid_u64_key(CLUSTER_PREFIX, shard_id, SUFFIX_WRITE_BATCH);
+    let ctx = ShardBatcherCtx {
+        raft,
+        zenoh_pool,
+        node_config,
+        peers,
+        shard_id,
+        write_key: mid_u64_key(CLUSTER_PREFIX, shard_id, SUFFIX_WRITE),
+        write_batch_key: mid_u64_key(CLUSTER_PREFIX, shard_id, SUFFIX_WRITE_BATCH),
+    };
 
     spawn(async move {
         let mut batch = Vec::with_capacity(MAX_WRITE_BATCH_SIZE);
@@ -853,146 +983,8 @@ fn spawn_write_batcher(
             {
                 batch.push(job);
             }
-            execute_write_batch(
-                &raft,
-                &zenoh_pool,
-                &node_config,
-                &peers,
-                shard_id,
-                &write_key,
-                &write_batch_key,
-                &mut batch,
-            )
-            .await;
+            ctx.execute_write_batch(&mut batch).await;
         }
     })
     .detach();
-}
-
-/// 执行单批写作业：
-/// 1. 若本节点是已知 Follower，直接走 Zenoh 单次或批量 RPC 转发给远端 Leader；
-/// 2. 若本节点是 Leader（或远端转发失败），通过 `join_all` 在同一 tick 并发入队 `RaftCore`，触发底层单次 `fjall` 批量落盘与单次 `AppendEntries` 复制。
-#[allow(clippy::too_many_arguments)]
-async fn execute_write_batch(
-    raft: &ShardRaft,
-    zenoh_pool: &ZenohClientPool,
-    node_config: &NodeConfig,
-    peers: &BTreeMap<u64, BasicNode>,
-    shard_id: ShardId,
-    write_key: &str,
-    write_batch_key: &str,
-    batch: &mut Vec<BatchWriteJob>,
-) {
-    if let Some(leader_addr) = current_remote_leader(raft, node_config, peers)
-        && let Ok(log_ids) =
-            forward_write_jobs(zenoh_pool, write_key, write_batch_key, &leader_addr, batch).await
-        && log_ids.len() == batch.len()
-    {
-        for (job, log_id) in batch.drain(..).zip(log_ids) {
-            let _ = job.reply_tx.send(Ok(log_id));
-        }
-        return;
-    }
-
-    let results = join_all(
-        batch
-            .iter()
-            .map(|job| raft.client_write(job.request.clone())),
-    )
-    .await;
-    let mut to_forward = Vec::new();
-    let mut forwarded_leader_addr: Option<String> = None;
-
-    for (job, res) in batch.drain(..).zip(results) {
-        match res {
-            Ok(resp) => {
-                let _ = job.reply_tx.send(Ok(resp.log_id));
-            }
-            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(forward))) => {
-                if forwarded_leader_addr.is_none()
-                    && let Some(node) = forward.leader_node
-                {
-                    forwarded_leader_addr = Some(node.addr);
-                }
-                to_forward.push(job);
-            }
-            Err(e) => {
-                let _ = job.reply_tx.send(Err(e.into()));
-            }
-        }
-    }
-
-    if to_forward.is_empty() {
-        return;
-    }
-
-    let Some(leader_addr) =
-        forwarded_leader_addr.or_else(|| current_remote_leader(raft, node_config, peers))
-    else {
-        for job in to_forward {
-            let _ = job
-                .reply_tx
-                .send(Err(anyhow!("shard {shard_id} has no leader yet")));
-        }
-        return;
-    };
-
-    info!(
-        leader_addr = %leader_addr,
-        shard_id,
-        batch_size = to_forward.len(),
-        "Forwarding write batch to leader over Zenoh"
-    );
-    match forward_write_jobs(
-        zenoh_pool,
-        write_key,
-        write_batch_key,
-        &leader_addr,
-        &to_forward,
-    )
-    .await
-    {
-        Ok(log_ids) if log_ids.len() == to_forward.len() => {
-            for (job, log_id) in to_forward.into_iter().zip(log_ids) {
-                let _ = job.reply_tx.send(Ok(log_id));
-            }
-        }
-        Ok(_) => {
-            for job in to_forward {
-                let _ = job
-                    .reply_tx
-                    .send(Err(anyhow!("leader returned mismatched batch ack count")));
-            }
-        }
-        Err(e) => {
-            let err_msg = e.to_string();
-            for job in to_forward {
-                let _ = job.reply_tx.send(Err(anyhow!("{err_msg}")));
-            }
-        }
-    }
-}
-
-/// 将一批写请求转发给远端 Leader（单条走 `/write`，多条自动合并走 `/write-batch` 单次 RPC）。
-async fn forward_write_jobs(
-    zenoh_pool: &ZenohClientPool,
-    write_key: &str,
-    write_batch_key: &str,
-    leader_addr: &str,
-    jobs: &[BatchWriteJob],
-) -> Result<Vec<RaftLogId>> {
-    if let [single] = jobs {
-        let ack: WriteAck = zenoh_pool
-            .rpc(leader_addr, write_key, &single.request)
-            .await
-            .with_context(|| format!("forward write to {leader_addr} on {write_key}"))?;
-        return Ok(vec![ack.log_id]);
-    }
-
-    let requests: Vec<ReducerCallRequest> = jobs.iter().map(|j| j.request.clone()).collect();
-    let acks: Vec<WriteAck> = zenoh_pool
-        .rpc(leader_addr, write_batch_key, &requests)
-        .await
-        .with_context(|| format!("forward write batch to {leader_addr} on {write_batch_key}"))?;
-    Ok(acks.into_iter().map(|ack| ack.log_id).collect())
 }
