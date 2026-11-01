@@ -1,6 +1,6 @@
 //! 基于 Zenoh + 明文 QUIC (`udp/<addr>#rel=1`) 与 `bitcode` 的传输层。
 
-use std::{marker::PhantomData, ops::Deref, result, sync::Arc, time::Duration};
+use std::{borrow::Cow, marker::PhantomData, ops::Deref, result, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bitcode::{DecodeOwned, Encode};
@@ -51,6 +51,8 @@ pub const ZENOH_FALSE: &str = "false";
 pub const ZENOH_EMPTY_ARRAY: &str = "[]";
 const JSON_ARRAY_PREFIX: &str = "[\"";
 const JSON_ARRAY_SUFFIX: &str = "\"]";
+const JSON_QUIC_PREFIX: &str = const_str::concat!(JSON_ARRAY_PREFIX, QUIC_SCHEME_PREFIX);
+const JSON_QUIC_SUFFIX: &str = const_str::concat!(QUIC_REL_SUFFIX, JSON_ARRAY_SUFFIX);
 
 /// Raft 共识 RPC 命名空间与子命令。
 pub const RAFT_NS: &str = "raft";
@@ -83,20 +85,12 @@ pub const SUB_SHARDS_ROUTE_REMOVE: &str = const_str::concat!(SUB_SHARDS_ROUTE, "
 pub const SUFFIX_WRITE: &str = const_str::concat!(KEY_SEP, SUB_WRITE);
 pub const SUFFIX_STATUS: &str = const_str::concat!(KEY_SEP, SUB_STATUS);
 
-pub const KEY_CLUSTER_STATUS: &str = const_str::concat!(CLUSTER_PREFIX, SUB_STATUS);
 pub const KEY_CLUSTER_INIT: &str = const_str::concat!(CLUSTER_PREFIX, SUB_INIT);
-pub const KEY_CLUSTER_ADD_NODE: &str = const_str::concat!(CLUSTER_PREFIX, SUB_ADD_NODE);
-pub const KEY_CLUSTER_REMOVE_NODE: &str = const_str::concat!(CLUSTER_PREFIX, SUB_REMOVE_NODE);
-pub const KEY_CLUSTER_LEADER: &str = const_str::concat!(CLUSTER_PREFIX, SUB_LEADER);
 pub const KEY_CLUSTER_HEALTH: &str = const_str::concat!(CLUSTER_PREFIX, SUB_HEALTH);
-pub const KEY_CLUSTER_WRITE: &str = const_str::concat!(CLUSTER_PREFIX, SUB_WRITE);
 pub const KEY_CLUSTER_SHARDS: &str = const_str::concat!(CLUSTER_PREFIX, SUB_SHARDS);
-pub const KEY_CLUSTER_SHARDS_PREFIX: &str = const_str::concat!(CLUSTER_PREFIX, SUB_SHARDS_PREFIX);
 pub const KEY_SHARDS_CREATE: &str = const_str::concat!(CLUSTER_PREFIX, SUB_SHARDS_CREATE);
 pub const KEY_SHARDS_REMOVE: &str = const_str::concat!(CLUSTER_PREFIX, SUB_SHARDS_REMOVE);
 pub const KEY_SHARDS_ROUTE_ADD: &str = const_str::concat!(CLUSTER_PREFIX, SUB_SHARDS_ROUTE_ADD);
-pub const KEY_SHARDS_ROUTE_REMOVE: &str =
-    const_str::concat!(CLUSTER_PREFIX, SUB_SHARDS_ROUTE_REMOVE);
 
 /// 指标查询键表达式。
 pub const KEY_METRICS: &str = "metrics";
@@ -292,23 +286,29 @@ pub fn strip_addr_parts(addr: &str) -> &str {
     s
 }
 
-/// 剥离 URL 协议前缀、路径与 `#` 参数，规范化为 `host:port`（单次预分配，无 `format!` 开销）。
-///
-/// 若 `for_connect` 为 `true`，将 `0.0.0.0:port` 替换为 `127.0.0.1:port`，
-/// 防止节点向未指定监听地址发起连接。
-pub fn normalize_addr(addr: &str, for_connect: bool) -> String {
+/// 剥离 URL 协议前缀、路径与 `#` 参数，规范化为 `Cow<'_, str>`（非 `0.0.0.0` 地址零堆分配借用）。
+#[inline]
+pub fn normalize_addr_cow(addr: &str, for_connect: bool) -> Cow<'_, str> {
     let s = strip_addr_parts(addr);
     if for_connect && let Some(port) = s.strip_prefix(UNSPECIFIED_IPV4_PREFIX) {
         let mut out = String::with_capacity(LOOPBACK_IPV4_PREFIX.len() + port.len());
         out.push_str(LOOPBACK_IPV4_PREFIX);
         out.push_str(port);
-        return out;
+        return Cow::Owned(out);
     }
-    s.to_owned()
+    Cow::Borrowed(s)
 }
 
-/// 生成 Zenoh 明文 QUIC (`LinkUnicastQuicUnsecure`) 端点定位符：`udp/<host:port>#rel=1`（单次预分配，消除双重 `format!`）。
-pub fn quic_locator(addr: &str, for_connect: bool) -> String {
+/// 剥离 URL 协议前缀、路径与 `#` 参数，规范化为 `host:port`（单次预分配，无 `format!` 开销）。
+///
+/// 若 `for_connect` 为 `true`，将 `0.0.0.0:port` 替换为 `127.0.0.1:port`，
+/// 防止节点向未指定监听地址发起连接。
+pub fn normalize_addr(addr: &str, for_connect: bool) -> String {
+    normalize_addr_cow(addr, for_connect).into_owned()
+}
+
+/// 单次预分配生成 Zenoh 明文 QUIC (`LinkUnicastQuicUnsecure`) JSON 端点数组：`["udp/<host:port>#rel=1"]`。
+fn json_quic_endpoint(addr: &str, for_connect: bool) -> String {
     let s = strip_addr_parts(addr);
     let (host_prefix, host_rest) =
         if for_connect && let Some(port) = s.strip_prefix(UNSPECIFIED_IPV4_PREFIX) {
@@ -317,23 +317,12 @@ pub fn quic_locator(addr: &str, for_connect: bool) -> String {
             ("", s)
         };
     let mut out = String::with_capacity(
-        QUIC_SCHEME_PREFIX.len() + host_prefix.len() + host_rest.len() + QUIC_REL_SUFFIX.len(),
+        JSON_QUIC_PREFIX.len() + host_prefix.len() + host_rest.len() + JSON_QUIC_SUFFIX.len(),
     );
-    out.push_str(QUIC_SCHEME_PREFIX);
+    out.push_str(JSON_QUIC_PREFIX);
     out.push_str(host_prefix);
     out.push_str(host_rest);
-    out.push_str(QUIC_REL_SUFFIX);
-    out
-}
-
-/// 拼装单元素 JSON 字符串数组 `["<locator>"]`（单次预分配，零 `format!` 开销）。
-#[inline]
-pub fn json_single_endpoint(locator: &str) -> String {
-    let mut out =
-        String::with_capacity(JSON_ARRAY_PREFIX.len() + locator.len() + JSON_ARRAY_SUFFIX.len());
-    out.push_str(JSON_ARRAY_PREFIX);
-    out.push_str(locator);
-    out.push_str(JSON_ARRAY_SUFFIX);
+    out.push_str(JSON_QUIC_SUFFIX);
     out
 }
 
@@ -351,28 +340,28 @@ fn base_zenoh_config(quoted_mode: &str) -> Result<Config> {
 
 /// 打开监听指定明文 QUIC 地址的服务端 Zenoh 会话。
 pub async fn open_server_session(listen_addr: &str) -> Result<Session> {
-    let locator = quic_locator(listen_addr, false);
+    let endpoint_json = json_quic_endpoint(listen_addr, false);
     let mut cfg = base_zenoh_config(ZENOH_MODE_PEER)?;
-    cfg.insert_json5(ZENOH_LISTEN_KEY, &json_single_endpoint(&locator))
+    cfg.insert_json5(ZENOH_LISTEN_KEY, &endpoint_json)
         .map_err(|e| anyhow!("zenoh listen config: {e}"))?;
     cfg.insert_json5(ZENOH_CONNECT_KEY, ZENOH_EMPTY_ARRAY)
         .map_err(|e| anyhow!("zenoh connect config: {e}"))?;
     zenoh::open(cfg)
         .await
-        .map_err(|e| anyhow!("Failed to open Zenoh server session on {locator}: {e}"))
+        .map_err(|e| anyhow!("Failed to open Zenoh server session on {endpoint_json}: {e}"))
 }
 
 /// 打开连接到指定明文 QUIC 地址的客户端 Zenoh 会话。
 pub async fn open_client_session(target_addr: &str) -> Result<Session> {
-    let locator = quic_locator(target_addr, true);
+    let endpoint_json = json_quic_endpoint(target_addr, true);
     let mut cfg = base_zenoh_config(ZENOH_MODE_CLIENT)?;
     cfg.insert_json5(ZENOH_LISTEN_KEY, ZENOH_EMPTY_ARRAY)
         .map_err(|e| anyhow!("zenoh listen config: {e}"))?;
-    cfg.insert_json5(ZENOH_CONNECT_KEY, &json_single_endpoint(&locator))
+    cfg.insert_json5(ZENOH_CONNECT_KEY, &endpoint_json)
         .map_err(|e| anyhow!("zenoh connect config: {e}"))?;
     zenoh::open(cfg)
         .await
-        .map_err(|e| anyhow!("Failed to connect Zenoh client session to {locator}: {e}"))
+        .map_err(|e| anyhow!("Failed to connect Zenoh client session to {endpoint_json}: {e}"))
 }
 
 /// 在非 Tokio 运行时（如 `compio`）上安全关闭 Zenoh 会话（委托给 Zenoh 内部 `ZRuntime::Net`）。
@@ -449,24 +438,24 @@ impl ZenohClientPool {
         }
     }
 
-    /// 获取或建立到目标地址的客户端会话。
+    /// 获取或建立到目标地址的客户端会话（命中连接池时借用 `&str` 查找，零堆分配）。
     pub async fn get_or_connect(&self, target_addr: &str) -> Result<Session> {
-        let key = normalize_addr(target_addr, true);
-        if let Some(existing) = self.sessions.lock().get(&key)
+        let key = normalize_addr_cow(target_addr, true);
+        if let Some(existing) = self.sessions.lock().get(key.as_ref())
             && !existing.is_closed()
         {
             return Ok(existing.clone());
         }
 
-        let session = open_client_session(&key).await?;
+        let session = open_client_session(key.as_ref()).await?;
         let duplicate = {
             let mut guard = self.sessions.lock();
-            if let Some(existing) = guard.get(&key)
+            if let Some(existing) = guard.get(key.as_ref())
                 && !existing.is_closed()
             {
                 Some(existing.clone())
             } else {
-                guard.insert(key, session.clone());
+                guard.insert(key.into_owned(), session.clone());
                 None
             }
         };
@@ -477,10 +466,10 @@ impl ZenohClientPool {
         Ok(session)
     }
 
-    /// 驱逐失效的目标会话。
+    /// 驱逐失效的目标会话（零堆分配查找）。
     pub fn evict(&self, target_addr: &str) {
-        let key = normalize_addr(target_addr, true);
-        let removed = self.sessions.lock().remove(&key);
+        let key = normalize_addr_cow(target_addr, true);
+        let removed = self.sessions.lock().remove(key.as_ref());
         if let Some(s) = removed {
             close_session(&s);
         }

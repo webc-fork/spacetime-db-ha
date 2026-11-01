@@ -3286,15 +3286,11 @@ name = "spacetime-db-ha-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bitcode",
  "clap_args",
  "compio",
  "const-str",
- "crossfire",
- "gxhash",
- "itoa",
  "rimalloc",
- "zenoh",
+ "spacetime-db-ha",
 ]
 
 [[package]]

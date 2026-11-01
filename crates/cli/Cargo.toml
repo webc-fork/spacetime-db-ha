@@ -12,12 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
-zenoh = { version = "1.10.2", default-features = false, features = ["transport_udp", "transport_quic", "transport_quic_datagram"] }
-gxhash = "3.5.0"
-crossfire = "3.1.22"
-bitcode = { version = "0.6.9", default-features = false, features = ["std", "derive"] }
 compio = { version = "0.19", features = ["macros"] }
 rimalloc = { git = "https://github.com/moggedhedien/rimalloc.git", version = "0.1.0" }
 const-str = "1.1.0"
 clap_args = { version = "0.1.9", features = ["macro"] }
-itoa = "1.0.18"
+spacetime-db-ha = { version = "0.1.0", path = "../proxy" }

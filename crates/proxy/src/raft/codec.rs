@@ -363,17 +363,7 @@ impl From<Payload> for WireEntryPayload {
         match p {
             EntryPayload::Blank => Self::Blank,
             EntryPayload::Normal(req) => Self::Normal(req),
-            EntryPayload::Membership(m) => Self::Membership(WireMembership::from(m)),
-        }
-    }
-}
-
-impl From<&Payload> for WireEntryPayload {
-    fn from(p: &Payload) -> Self {
-        match p {
-            EntryPayload::Blank => Self::Blank,
-            EntryPayload::Normal(req) => Self::Normal(req.clone()),
-            EntryPayload::Membership(m) => Self::Membership(WireMembership::from(m)),
+            EntryPayload::Membership(m) => Self::Membership(WireMembership::from(&m)),
         }
     }
 }
@@ -393,15 +383,6 @@ impl From<WireEntryPayload> for Payload {
 pub struct WireEntry {
     pub log_id: WireLogId,
     pub payload: WireEntryPayload,
-}
-
-impl From<&RaftEntry> for WireEntry {
-    fn from(e: &RaftEntry) -> Self {
-        Self {
-            log_id: WireLogId::from(e.log_id),
-            payload: WireEntryPayload::from(&e.payload),
-        }
-    }
 }
 
 impl From<RaftEntry> for WireEntry {

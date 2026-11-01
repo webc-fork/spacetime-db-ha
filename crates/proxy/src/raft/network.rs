@@ -1,6 +1,7 @@
 use std::{
     future::Future,
     io::{self, Cursor},
+    rc::Rc,
 };
 
 use bitcode::{DecodeOwned, Encode};
@@ -24,25 +25,46 @@ use crate::{
     },
     transport::{
         KEY_SEP, RAFT_PREFIX, RPC_APPEND, RPC_SNAPSHOT, RPC_VOTE, ZenohClientPool, mid_u64_key,
+        normalize_addr,
     },
 };
 
 type C = TypeConfig;
 
-/// Raft RPC 子命令带前导 `/` 的编译期常量后缀（消除运行时二次拼接）。
+/// Raft RPC 子命令带前导 `/` 的编译期常量后缀。
 const SUFFIX_APPEND: &str = const_str::concat!(KEY_SEP, RPC_APPEND);
 const SUFFIX_VOTE: &str = const_str::concat!(KEY_SEP, RPC_VOTE);
 const SUFFIX_SNAPSHOT: &str = const_str::concat!(KEY_SEP, RPC_SNAPSHOT);
 
+/// 分片级预计算的 Raft RPC Zenoh 键表达式（在分片创建时一次性拼装，消除每次心跳/追加 RPC 的 `String` 分配）。
+struct ShardRpcKeys {
+    append: String,
+    vote: String,
+    snapshot: String,
+}
+
+impl ShardRpcKeys {
+    fn new(shard_id: u64) -> Self {
+        Self {
+            append: mid_u64_key(RAFT_PREFIX, shard_id, SUFFIX_APPEND),
+            vote: mid_u64_key(RAFT_PREFIX, shard_id, SUFFIX_VOTE),
+            snapshot: mid_u64_key(RAFT_PREFIX, shard_id, SUFFIX_SNAPSHOT),
+        }
+    }
+}
+
 /// Raft 节点间网络层：每个分片一套工厂，RPC 落到 `raft/{shard_id}/{rpc}`。
 pub struct NetworkFactory {
     pool: ZenohClientPool,
-    shard_id: u64,
+    keys: Rc<ShardRpcKeys>,
 }
 
 impl NetworkFactory {
-    pub const fn new(pool: ZenohClientPool, shard_id: u64) -> Self {
-        Self { pool, shard_id }
+    pub fn new(pool: ZenohClientPool, shard_id: u64) -> Self {
+        Self {
+            pool,
+            keys: Rc::new(ShardRpcKeys::new(shard_id)),
+        }
     }
 }
 
@@ -50,24 +72,18 @@ impl NetworkFactory {
 pub struct NetworkConnection {
     addr: String,
     pool: ZenohClientPool,
-    shard_id: u64,
+    keys: Rc<ShardRpcKeys>,
 }
 
 impl NetworkConnection {
-    /// 拼出 Raft RPC 的 Zenoh 键表达式（基于编译期前缀/后缀 + `itoa` 栈缓冲，无 `format!` 开销）。
-    #[inline]
-    fn raft_key(&self, rpc_suffix: &str) -> String {
-        mid_u64_key(RAFT_PREFIX, self.shard_id, rpc_suffix)
-    }
-
     /// 通过 Zenoh 发送 `bitcode` 编码的 RPC 请求并反序列化响应体。
-    async fn call_rpc<P, T>(&self, rpc_suffix: &str, payload: &P) -> Result<T, Unreachable<C>>
+    async fn call_rpc<P, T>(&self, key_expr: &str, payload: &P) -> Result<T, Unreachable<C>>
     where
         P: Encode,
         T: DecodeOwned,
     {
         self.pool
-            .rpc(&self.addr, &self.raft_key(rpc_suffix), payload)
+            .rpc(&self.addr, key_expr, payload)
             .await
             .map_err(|e| {
                 let io_err = io::Error::other(e.to_string());
@@ -81,9 +97,9 @@ impl RaftNetworkFactory<C> for NetworkFactory {
 
     async fn new_client(&mut self, _target: u64, node: &BasicNode) -> Self::Network {
         NetworkConnection {
-            addr: node.addr.clone(),
+            addr: normalize_addr(&node.addr, true),
             pool: self.pool.clone(),
-            shard_id: self.shard_id,
+            keys: Rc::clone(&self.keys),
         }
     }
 }
@@ -98,7 +114,7 @@ impl RaftNetworkV2<C> for NetworkConnection {
     ) -> Result<AppendEntriesResponse<C>, RPCError<C>> {
         let req = WireAppendEntriesRequest::from(rpc);
         let result: Result<WireAppendEntriesResponse, WireFatal> =
-            self.call_rpc(SUFFIX_APPEND, &req).await?;
+            self.call_rpc(&self.keys.append, &req).await?;
         result
             .map(AppendEntriesResponse::from)
             .map_err(|e| RPCError::Unreachable(Unreachable::from_string(format!("{e:?}"))))
@@ -110,7 +126,8 @@ impl RaftNetworkV2<C> for NetworkConnection {
         _option: RPCOption,
     ) -> Result<VoteResponse<C>, RPCError<C>> {
         let req = WireVoteRequest::from(rpc);
-        let result: Result<WireVoteResponse, WireFatal> = self.call_rpc(SUFFIX_VOTE, &req).await?;
+        let result: Result<WireVoteResponse, WireFatal> =
+            self.call_rpc(&self.keys.vote, &req).await?;
         result
             .map(VoteResponse::from)
             .map_err(|e| RPCError::Unreachable(Unreachable::from_string(format!("{e:?}"))))
@@ -129,7 +146,7 @@ impl RaftNetworkV2<C> for NetworkConnection {
             data: snapshot.snapshot.into_inner(),
         };
         let result: Result<WireSnapshotResponse, WireFatal> = self
-            .call_rpc(SUFFIX_SNAPSHOT, &req)
+            .call_rpc(&self.keys.snapshot, &req)
             .await
             .map_err(StreamingError::Unreachable)?;
         result
