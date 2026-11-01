@@ -342,6 +342,40 @@ async fn three_node_cluster_replicates_writes_and_manages_shards_over_zenoh_quic
             payload
         );
 
+        // 验证 Follower 批量写合并提案（propose_write_batch -> write-batch 单次跨节点 RPC）
+        let follower_pool = if leader != 2 { &pool2 } else { &pool3 };
+        let batch_items = vec![
+            (
+                Bytes::from_static(&[3, 0x10]),
+                "/database/subscribe/testdb".to_owned(),
+            ),
+            (
+                Bytes::from_static(&[3, 0x20]),
+                "/database/subscribe/testdb".to_owned(),
+            ),
+            (
+                Bytes::from_static(&[3, 0x30]),
+                "/database/subscribe/testdb".to_owned(),
+            ),
+        ];
+        let batch_log_ids = follower_pool
+            .propose_write_batch(0, batch_items)
+            .await
+            .unwrap();
+        assert_eq!(batch_log_ids.len(), 3);
+        assert!(batch_log_ids[0].index < batch_log_ids[1].index);
+        assert!(batch_log_ids[1].index < batch_log_ids[2].index);
+        for expected in [&[3u8, 0x10][..], &[3u8, 0x20][..], &[3u8, 0x30][..]] {
+            assert_eq!(
+                timeout(MESSAGE_TIMEOUT, rx1.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .as_ref(),
+                expected
+            );
+        }
+
         // 验证分片创建、路由绑定与分片级联删除（P1-6 & P1-7）
         let _: String = zclient
             .rpc(

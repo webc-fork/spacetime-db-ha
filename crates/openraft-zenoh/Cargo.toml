@@ -1,0 +1,21 @@
+[package]
+name = "openraft-zenoh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bitcode = { version = "0.6.9", default-features = false, features = ["std", "derive"] }
+bytes = "1.12.1"
+compio = { version = "0.19", features = ["time"] }
+const-str = "1.1.0"
+crossfire = "3.1.22"
+futures = "0.3.34"
+gxhash = "3.5.0"
+itoa = "1.0.18"
+openraft = { version = "0.10.0-alpha.37", default-features = false, features = ["single-threaded"] }
+parking_lot = "0.13.0"
+see = "0.1.2"
+zenoh = { version = "1.10.2", default-features = false, features = ["transport_udp", "transport_quic", "transport_quic_datagram"] }

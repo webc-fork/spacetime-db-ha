@@ -2151,6 +2151,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "openraft-zenoh"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bitcode",
+ "bytes",
+ "compio",
+ "const-str",
+ "crossfire",
+ "futures",
+ "gxhash",
+ "itoa",
+ "openraft",
+ "parking_lot 0.13.0",
+ "see",
+ "zenoh",
+]
+
+[[package]]
 name = "openssl-probe"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3321,12 +3340,11 @@ dependencies = [
  "fjall",
  "futures",
  "gxhash",
- "itoa",
  "openraft",
  "openraft-rt-compio",
+ "openraft-zenoh",
  "parking_lot 0.13.0",
  "rimalloc",
- "see",
  "tempfile",
  "thiserror",
  "tracing",

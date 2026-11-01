@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/proxy", "crates/cli"]
+members = ["crates/proxy", "crates/cli", "crates/openraft-zenoh"]
 
 [workspace.package]
 version = "0.1.0"

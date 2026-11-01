@@ -20,18 +20,17 @@ gxhash = "3.5.0"
 fjall = "3.1.13"
 crossfire = "3.1.22"
 zmij = "1.0.23"
-itoa = "1.0.18"
 bitcode = { version = "0.6.9", default-features = false, features = ["std", "derive"] }
 bytes = "1"
 openraft = { version = "0.10.0-alpha.37", default-features = false, features = ["single-threaded"] }
 openraft-rt-compio = "0.10.0-alpha.37"
 compio = { version = "0.19", features = ["macros", "time", "net", "io", "signal"] }
 futures = "0.3"
-see = "0.1"
 rimalloc = { git = "https://github.com/moggedhedien/rimalloc.git", version = "0.1.0" }
 const-str = "1.1.0"
 clap_args = { version = "0.1.9", features = ["macro"] }
 askama = { version = "0.16.1", default-features = false, features = ["derive", "std"] }
+openraft-zenoh = { version = "0.1.0", path = "../openraft-zenoh" }
 
 [dev-dependencies]
 tempfile = "3.27.0"

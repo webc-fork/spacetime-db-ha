@@ -1,39 +1,13 @@
-use std::{fmt, io::Cursor};
+use std::fmt;
 
 use bitcode::{Decode, Encode};
 use bytes::Bytes;
-use openraft::{
-    BasicNode, Entry, EntryPayload, LogId, Snapshot, SnapshotMeta, StoredMembership, Vote,
-    impls::leader_id_adv,
-};
+use openraft::{BasicNode, Entry, EntryPayload};
 use openraft_rt_compio::CompioRuntime;
-
-/// Raft 选主标识类型（支持同任期多选主对比）。
-pub type LeaderId = leader_id_adv::LeaderId<u64, u64>;
-
-/// Raft 已提交选主标识类型。
-pub type CommittedLeaderId = LeaderId;
-
-/// Raft 日志条目唯一标识类型。
-pub type RaftLogId = LogId<LeaderId>;
-
-/// Raft 选票类型。
-pub type RaftVote = Vote<LeaderId>;
-
-/// 提取选票的任期号（编译期与运行期通用 `const fn`）。
-#[inline]
-pub const fn leader_term(vote: &RaftVote) -> u64 {
-    vote.leader_id.term
-}
-
-/// Raft 持久化成员配置类型。
-pub type RaftStoredMembership = StoredMembership<LeaderId, u64, BasicNode>;
-
-/// Raft 快照元数据类型。
-pub type RaftSnapshotMeta = SnapshotMeta<LeaderId, u64, BasicNode>;
-
-/// Raft 快照类型。
-pub type RaftSnapshot = Snapshot<LeaderId, u64, BasicNode, Cursor<Vec<u8>>>;
+pub use openraft_zenoh::codec::{
+    CommittedLeaderId, LeaderId, RaftLogId, RaftSnapshot, RaftSnapshotMeta, RaftStoredMembership,
+    RaftVote, leader_term,
+};
 
 /// Raft 日志条目类型。
 pub type RaftEntry = Entry<LeaderId, EntryPayload<ReducerCallRequest, u64, BasicNode>>;

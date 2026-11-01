@@ -1,11 +1,11 @@
 //! 基于 Zenoh Queryable + `bitcode` 的 Raft RPC 与集群管理端点，
 //! 以及基于 `compio::net::TcpListener` 与 `const &str` 的最小开销 HTTP JSON `/metrics` 端点。
 
-use std::{collections::BTreeMap, fmt::Display, io::Cursor, rc::Rc};
+use std::{collections::BTreeMap, fmt::Display, rc::Rc};
 
 use anyhow::{Result, anyhow};
 use askama::Template;
-use bitcode::{Decode, DecodeOwned, Encode};
+use bitcode::{Decode, Encode};
 use compio::{
     BufResult,
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
@@ -14,32 +14,23 @@ use compio::{
 };
 use futures::{FutureExt, future::try_join_all, select};
 use gxhash::HashMap;
-use openraft::{
-    BasicNode, ReadPolicy, ServerState, Snapshot,
-    async_runtime::watch::WatchReceiver,
-    raft::{AppendEntriesRequest, VoteRequest},
-};
+use openraft::{BasicNode, ReadPolicy, ServerState, async_runtime::watch::WatchReceiver};
 use zenoh::{Session, query::Query};
 
 use crate::{
     metrics,
     raft::{
         RaftPool, ShardRaft,
-        codec::{
-            WireAppendEntriesRequest, WireAppendEntriesResponse, WireFatal,
-            WireFullSnapshotRequest, WireSnapshotResponse, WireVoteRequest, WireVoteResponse,
-        },
-        types::{RaftSnapshotMeta, RaftVote, ReducerCallRequest, WriteAck, leader_term},
+        types::{ReducerCallRequest, WriteAck, leader_term},
     },
     router::{DEFAULT_SHARD, ShardConfigCommand, ShardId, encode_shard_config},
     transport::{
         CLUSTER_PREFIX, CLUSTER_QUERYABLE_ALL, CrossfireChannel, KEY_CLUSTER_HEALTH, KEY_METRICS,
-        RAFT_PREFIX, RAFT_QUERYABLE_ALL, RPC_APPEND, RPC_SNAPSHOT, RPC_VOTE, RpcEnvelope,
-        SUB_ADD_NODE, SUB_HEALTH, SUB_INIT, SUB_LEADER, SUB_REMOVE_NODE, SUB_SHARDS,
-        SUB_SHARDS_CREATE, SUB_SHARDS_PREFIX, SUB_SHARDS_REMOVE, SUB_SHARDS_ROUTE,
+        RAFT_QUERYABLE_ALL, SUB_ADD_NODE, SUB_HEALTH, SUB_INIT, SUB_LEADER, SUB_REMOVE_NODE,
+        SUB_SHARDS, SUB_SHARDS_CREATE, SUB_SHARDS_PREFIX, SUB_SHARDS_REMOVE, SUB_SHARDS_ROUTE,
         SUB_SHARDS_ROUTE_ADD, SUB_SHARDS_ROUTE_REMOVE, SUB_STATUS, SUB_WRITE, SUB_WRITE_BATCH,
-        SUFFIX_STATUS, SUFFIX_WRITE, SUFFIX_WRITE_BATCH, close_session, decode_query_payload,
-        mid_u64_key, reply_bitcode, watch::Receiver,
+        SUFFIX_STATUS, SUFFIX_WRITE, SUFFIX_WRITE_BATCH, close_session, decode_req, mid_u64_key,
+        reply_bitcode, watch::Receiver,
     },
 };
 
@@ -267,76 +258,12 @@ pub async fn serve_zenoh(
     Ok(())
 }
 
-/// 解码查询负载的辅助函数。
-fn decode_req<T: DecodeOwned>(query: &Query) -> Result<T, String> {
-    decode_query_payload(query).map_err(err_str)
-}
-
-/// 分发 `raft/**` 命名空间下的 Raft 节点间共识 RPC。
+/// 分发 `raft/**` 命名空间下的 Raft 节点间共识 RPC（直接委托 `openraft_zenoh`）。
 async fn dispatch_raft_query(pool: &RaftPool, query: Query) {
-    let key = query.key_expr().as_str();
-    let rest = key.strip_prefix(RAFT_PREFIX).unwrap_or("");
-
-    let (shard_id, rpc) = match rest.split_once('/') {
-        Some((sid_str, rpc_name)) => match sid_str.parse::<ShardId>() {
-            Ok(sid) => (sid, rpc_name),
-            Err(_) => {
-                reply_bitcode::<()>(&query, Err(format!("invalid shard id in {key}"))).await;
-                return;
-            }
-        },
-        None => (DEFAULT_SHARD, rest),
-    };
-
-    match rpc {
-        RPC_APPEND => {
-            let res: RpcEnvelope<Result<WireAppendEntriesResponse, WireFatal>> = async {
-                let req: WireAppendEntriesRequest = decode_req(&query)?;
-                let raft = get_shard_raft(pool, shard_id)?;
-                Ok(raft
-                    .append_entries(AppendEntriesRequest::from(req))
-                    .await
-                    .map(WireAppendEntriesResponse::from)
-                    .map_err(WireFatal::from))
-            }
-            .await;
-            reply_bitcode(&query, res).await;
-        }
-        RPC_VOTE => {
-            let res: RpcEnvelope<Result<WireVoteResponse, WireFatal>> = async {
-                let req: WireVoteRequest = decode_req(&query)?;
-                let raft = get_shard_raft(pool, shard_id)?;
-                Ok(raft
-                    .vote(VoteRequest::from(req))
-                    .await
-                    .map(WireVoteResponse::from)
-                    .map_err(WireFatal::from))
-            }
-            .await;
-            reply_bitcode(&query, res).await;
-        }
-        RPC_SNAPSHOT => {
-            let res: RpcEnvelope<Result<WireSnapshotResponse, WireFatal>> = async {
-                let req: WireFullSnapshotRequest = decode_req(&query)?;
-                let raft = get_shard_raft(pool, shard_id)?;
-                let vote = RaftVote::from(req.vote);
-                let snapshot = Snapshot {
-                    meta: RaftSnapshotMeta::from(req.meta),
-                    snapshot: Cursor::new(req.data),
-                };
-                Ok(raft
-                    .install_full_snapshot(vote, snapshot)
-                    .await
-                    .map(WireSnapshotResponse::from)
-                    .map_err(WireFatal::from))
-            }
-            .await;
-            reply_bitcode(&query, res).await;
-        }
-        _ => {
-            reply_bitcode::<()>(&query, Err(format!("unknown raft rpc: {key}"))).await;
-        }
-    }
+    openraft_zenoh::dispatch_raft_query(query, DEFAULT_SHARD, |shard_id| {
+        get_shard_raft(pool, shard_id)
+    })
+    .await;
 }
 
 /// 分发 `cluster/**` 命名空间下的管理与写转发请求。
