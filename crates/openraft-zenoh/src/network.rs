@@ -135,7 +135,7 @@ impl<C: RaftTypeConfig> NetworkConnection<C> {
         priority: Priority,
     ) -> Result<T, Unreachable<C>>
     where
-        P: Encode,
+        P: Encode + ?Sized,
         T: DecodeOwned,
     {
         self.pool

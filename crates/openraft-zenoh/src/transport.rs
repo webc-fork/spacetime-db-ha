@@ -334,7 +334,7 @@ pub async fn oneshot_rpc<Req, Resp>(
     timeout: Duration,
 ) -> Result<Resp>
 where
-    Req: Encode,
+    Req: Encode + ?Sized,
     Resp: DecodeOwned,
 {
     let session = open_client_session(target_addr).await?;
@@ -372,11 +372,18 @@ pub async fn rpc_once<Req, Resp>(
     timeout: Duration,
 ) -> Result<Resp>
 where
-    Req: Encode,
+    Req: Encode + ?Sized,
     Resp: DecodeOwned,
 {
     let payload = bitcode::encode(req);
-    rpc_payload_once_with_qos(session, key_expr, &payload, timeout, Priority::InteractiveHigh).await
+    rpc_payload_once_with_qos(
+        session,
+        key_expr,
+        &payload,
+        timeout,
+        Priority::InteractiveHigh,
+    )
+    .await
 }
 
 /// 使用已编码的 `bitcode` 字节切片在客户端会话上发起查询：
@@ -475,7 +482,7 @@ impl ZenohClientPool {
     /// 向目标地址发送 `bitcode` RPC 请求；若缓存连接断开则自动重连一次。
     pub async fn rpc<Req, Resp>(&self, target_addr: &str, key_expr: &str, req: &Req) -> Result<Resp>
     where
-        Req: Encode,
+        Req: Encode + ?Sized,
         Resp: DecodeOwned,
     {
         self.rpc_with_qos(
@@ -498,7 +505,7 @@ impl ZenohClientPool {
         priority: Priority,
     ) -> Result<Resp>
     where
-        Req: Encode,
+        Req: Encode + ?Sized,
         Resp: DecodeOwned,
     {
         let payload = bitcode::encode(req);

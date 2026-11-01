@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs::create_dir_all,
     io::{self, Cursor},
     path::Path,
@@ -113,6 +114,8 @@ struct StateMachineInner {
     last_membership: RaftStoredMembership,
     shard_routes: HashMap<String, ShardId>,
     active_shards: Vec<ShardId>,
+    /// 已应用但因前置写条目尚未投递完成而暂缓推进 `delivered` 水位的非写日志索引集合。
+    pending_non_writes: BTreeSet<u64>,
     /// 缓存最近一次快照；当状态推进时自动失效，避免返回陈旧快照。
     cached_snapshot: Option<RaftSnapshot>,
 }
@@ -194,6 +197,7 @@ impl StateMachineStore {
                     last_membership,
                     shard_routes: meta.shard_routes,
                     active_shards: meta.active_shards,
+                    pending_non_writes: BTreeSet::new(),
                     cached_snapshot: None,
                 }),
                 forwarder: Mutex::new(None),
@@ -258,12 +262,24 @@ impl StateMachineStore {
         self.shared.delivered.subscribe()
     }
 
-    /// 推进并持久化 `last_delivered` 水位（栈上 8 字节小端序直写，零堆分配，修复 P0-2）。
+    /// 推进并持久化 `last_delivered` 水位（自动跨越后续连续已应用的非写条目，栈上 8 字节小端序直写，零堆分配，修复 P0-2）。
     pub fn mark_delivered(&self, index: u64) {
+        let mut target = index;
+        {
+            let mut inner = self.shared.inner.lock();
+            if !inner.pending_non_writes.is_empty() {
+                let cur = (*self.shared.delivered.borrow()).max(index);
+                inner.pending_non_writes.retain(|&idx| idx > cur);
+                target = cur;
+                while inner.pending_non_writes.remove(&(target + 1)) {
+                    target += 1;
+                }
+            }
+        }
         let mut updated = false;
         self.shared.delivered.send_if_modified(|cur| {
-            if index > *cur {
-                *cur = index;
+            if target > *cur {
+                *cur = target;
                 updated = true;
                 true
             } else {
@@ -274,7 +290,7 @@ impl StateMachineStore {
             let _ = self
                 .shared
                 .state_ks
-                .insert(META_DELIVERED, index.to_le_bytes());
+                .insert(META_DELIVERED, target.to_le_bytes());
         }
     }
 
@@ -382,6 +398,7 @@ impl StateMachineStore {
             for command in &pending_commands {
                 inner.apply_command(command);
             }
+            inner.pending_non_writes.extend(&non_write_indices);
             inner.snapshot_data()
         };
 
@@ -402,19 +419,10 @@ impl StateMachineStore {
             }
         }
 
-        // 非业务写条目（Blank / Membership / 配置命令）无需投递上游，若无前置未投递写则合并推进一次 delivered 水位
-        let initial_delivered = self.last_delivered_index();
-        let mut delivered_target = initial_delivered;
-        for idx in non_write_indices {
-            if delivered_target + 1 == idx {
-                delivered_target = idx;
-            }
-        }
-        if delivered_target > initial_delivered {
-            self.mark_delivered(delivered_target);
-        }
-
         if let Some(tx) = &forwarder {
+            if !non_write_indices.is_empty() {
+                self.mark_delivered(self.last_delivered_index());
+            }
             for write in pending_writes {
                 debug!(
                     log_index = write.log_index,
@@ -424,9 +432,9 @@ impl StateMachineStore {
                 );
                 let _ = tx.send(write).await;
             }
-        } else if let Some(last_write) = pending_writes.last() {
-            // 未挂载转发器时（如纯状态机单测），直接推进 delivered 水位
-            self.mark_delivered(last_write.log_index);
+        } else if let Some(log_id) = last_log_id {
+            // 未挂载转发器时（如纯状态机单测），直接推进 delivered 水位至本批末尾
+            self.mark_delivered(log_id.index);
         }
 
         if let Some(log_id) = last_log_id {

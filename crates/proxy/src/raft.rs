@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use bitcode::{__private::Encoder, Encode};
 use bytes::Bytes;
 use compio::{
     runtime::spawn,
@@ -30,6 +31,7 @@ use openraft::{
     entry::EntryPayload,
     error::{ClientWriteError, RaftError},
 };
+use openraft_zenoh::NetworkFactory;
 use parking_lot::RwLock;
 use tracing::{info, warn};
 
@@ -37,6 +39,7 @@ use crate::{
     config::NodeConfig,
     metrics,
     raft::{
+        codec::ReducerCallRequestEncoder,
         persistent_log_store::{PersistentLogStore, shard_dir},
         state_machine::{
             CONFIG_CHANNEL_CAPACITY, ConfigSender, FORWARDER_CHANNEL_CAPACITY, StateMachineStore,
@@ -54,7 +57,6 @@ use crate::{
 pub mod codec;
 pub mod error;
 pub mod forwarder;
-pub mod network;
 pub mod persistent_log_store;
 pub mod state_machine;
 pub mod types;
@@ -143,6 +145,17 @@ struct BatchWriteJob {
     reply_tx: oneshot::Sender<Result<RaftLogId>>,
 }
 
+impl Encoder<BatchWriteJob> for ReducerCallRequestEncoder {
+    #[inline(always)]
+    fn encode(&mut self, job: &BatchWriteJob) {
+        self.encode(&job.request);
+    }
+}
+
+impl Encode for BatchWriteJob {
+    type Encoder = ReducerCallRequestEncoder;
+}
+
 type BatchWriteSender = MAsyncTx<Array<BatchWriteJob>>;
 type BatchWriteReceiver = AsyncRx<Array<BatchWriteJob>>;
 
@@ -163,7 +176,6 @@ pub struct RaftPool {
     pub peers: Arc<BTreeMap<u64, BasicNode>>,
     shards: RwLock<HashMap<ShardId, ShardState>>,
     router: RwLock<ShardRouter>,
-    shutdown_rx: watch::Receiver<bool>,
     /// 节点间 Zenoh 明文 QUIC 连接池。
     zenoh_pool: ZenohClientPool,
 }
@@ -181,7 +193,6 @@ impl RaftPool {
             Arc::clone(&peers),
             zenoh_pool.clone(),
             DEFAULT_SHARD,
-            shutdown_rx.clone(),
             Some(shard_config_tx),
         )
         .await?;
@@ -207,7 +218,6 @@ impl RaftPool {
             peers,
             shards: RwLock::new(shards),
             router: RwLock::new(initial_router),
-            shutdown_rx,
             zenoh_pool,
         });
 
@@ -218,9 +228,9 @@ impl RaftPool {
             }
         }
 
-        // 分片配置监听：把分片 0 提交的配置命令落地成实际分片与路由
+        // 分片配置监听：把分片 0 提交的配置命令落地成实际分片与路由；收到全局停机信号时统一通知全部分片后台协程退出
         let pool_ref = Rc::clone(&pool);
-        let mut listener_shutdown = pool.shutdown_rx.clone();
+        let mut listener_shutdown = shutdown_rx.clone();
         spawn(async move {
             loop {
                 select! {
@@ -228,7 +238,12 @@ impl RaftPool {
                         let Ok(cmd) = cmd else { return };
                         pool_ref.handle_shard_config(cmd).await;
                     }
-                    _ = listener_shutdown.changed().fuse() => return,
+                    _ = listener_shutdown.changed().fuse() => {
+                        for shard in pool_ref.shards.read().values() {
+                            let _ = shard.forwarder_shutdown.send(true);
+                        }
+                        return;
+                    }
                 }
             }
         })
@@ -236,7 +251,7 @@ impl RaftPool {
 
         // 修复 P1-7：启动周期性幂等协调循环，确保 leader 切换或网络抖动期间新建的分片最终完成初始化
         let reconcile_pool = Rc::clone(&pool);
-        let mut reconcile_shutdown = pool.shutdown_rx.clone();
+        let mut reconcile_shutdown = shutdown_rx;
         spawn(async move {
             let mut ticker = interval(SHARD_RECONCILE_INTERVAL);
             loop {
@@ -259,7 +274,6 @@ impl RaftPool {
         peers: Arc<BTreeMap<u64, BasicNode>>,
         zenoh_pool: ZenohClientPool,
         shard_id: ShardId,
-        mut global_shutdown: watch::Receiver<bool>,
         shard_config_tx: Option<ConfigSender>,
     ) -> Result<ShardState> {
         let raft_config = Config {
@@ -282,12 +296,6 @@ impl RaftPool {
         }
 
         let (forwarder_shutdown_tx, forwarder_shutdown_rx) = watch::channel(false);
-        let fwd_tx = forwarder_shutdown_tx.clone();
-        spawn(async move {
-            let _ = global_shutdown.changed().await;
-            let _ = fwd_tx.send(true);
-        })
-        .detach();
 
         let (write_tx, write_rx) = write_channel(FORWARDER_CHANNEL_CAPACITY);
         forwarder::spawn_pooled(
@@ -325,7 +333,7 @@ impl RaftPool {
         }
         state_machine.set_forwarder(write_tx);
 
-        let network = network::NetworkFactory::new(zenoh_pool.clone(), shard_id);
+        let network = NetworkFactory::new(zenoh_pool.clone(), shard_id);
         let raft = Raft::new(
             config.node_id,
             Arc::new(raft_config),
@@ -389,7 +397,6 @@ impl RaftPool {
             Arc::clone(&self.peers),
             self.zenoh_pool.clone(),
             shard_id,
-            self.shutdown_rx.clone(),
             None,
         )
         .await
@@ -762,27 +769,32 @@ impl RaftPool {
         Ok(())
     }
 
-    /// 把节点从所有分片的 Raft 组中移除。
+    /// 把节点从所有分片的 Raft 组中移除，并驱逐其缓存的 QUIC 会话。
     pub async fn remove_node_all_shards(&self, node_id: u64) -> Result<()> {
+        let mut evicted_addr = None;
         for shard_id in self.list_shards() {
             let raft = self
                 .get_raft(shard_id)
                 .ok_or_else(|| anyhow!("shard {shard_id} not found"))?;
 
-            let voters: BTreeSet<u64> = raft
-                .metrics()
-                .borrow_watched()
-                .membership_config
-                .membership()
-                .voter_ids()
-                .filter(|id| *id != node_id)
-                .collect();
+            let voters: BTreeSet<u64> = {
+                let metrics_rx = raft.metrics();
+                let metrics = metrics_rx.borrow_watched();
+                let membership = metrics.membership_config.membership();
+                if evicted_addr.is_none() && node_id != self.node_config.node_id {
+                    evicted_addr = self.resolve_node_addr(membership, node_id);
+                }
+                membership.voter_ids().filter(|id| *id != node_id).collect()
+            };
 
             raft.change_membership(voters, false)
                 .await
                 .with_context(|| format!("change_membership on shard {shard_id}"))?;
 
             info!(shard_id, node_id, "Node removed from shard");
+        }
+        if let Some(addr) = evicted_addr {
+            self.zenoh_pool.evict(&addr);
         }
         Ok(())
     }
@@ -832,33 +844,30 @@ impl ShardBatcherCtx {
         )
     }
 
-    /// 将一批写请求转发给远端 Leader（单条走 `/write`，多条自动合并走 `/write-batch` 单次 RPC）。
+    /// 将一批写请求转发给远端 Leader（单条走 `/write`，多条直接按 `&[BatchWriteJob]` 零克隆序列化走 `/write-batch` 单次 RPC）。
     async fn forward_write_jobs(
         &self,
         leader_addr: &str,
         jobs: &[BatchWriteJob],
-    ) -> Result<Vec<RaftLogId>> {
+    ) -> Result<Vec<WriteAck>> {
         if let [single] = jobs {
             let ack: WriteAck = self
                 .zenoh_pool
                 .rpc(leader_addr, &self.write_key, &single.request)
                 .await
                 .with_context(|| format!("forward write to {leader_addr} on {}", self.write_key))?;
-            return Ok(vec![ack.log_id]);
+            return Ok(vec![ack]);
         }
 
-        let requests: Vec<ReducerCallRequest> = jobs.iter().map(|j| j.request.clone()).collect();
-        let acks: Vec<WriteAck> = self
-            .zenoh_pool
-            .rpc(leader_addr, &self.write_batch_key, &requests)
+        self.zenoh_pool
+            .rpc(leader_addr, &self.write_batch_key, jobs)
             .await
             .with_context(|| {
                 format!(
                     "forward write batch to {leader_addr} on {}",
                     self.write_batch_key
                 )
-            })?;
-        Ok(acks.into_iter().map(|ack| ack.log_id).collect())
+            })
     }
 
     /// 执行单批写作业：
@@ -866,11 +875,11 @@ impl ShardBatcherCtx {
     /// 2. 若本节点是 Leader（或远端转发失败），通过 `join_all` 在同一 tick 并发入队 `RaftCore`，触发底层单次 `fjall` 批量落盘与单次 `AppendEntries` 复制。
     async fn execute_write_batch(&self, batch: &mut Vec<BatchWriteJob>) {
         if let Some(leader_addr) = self.current_remote_leader()
-            && let Ok(log_ids) = self.forward_write_jobs(&leader_addr, batch).await
-            && log_ids.len() == batch.len()
+            && let Ok(acks) = self.forward_write_jobs(&leader_addr, batch).await
+            && acks.len() == batch.len()
         {
-            for (job, log_id) in batch.drain(..).zip(log_ids) {
-                let _ = job.reply_tx.send(Ok(log_id));
+            for (job, ack) in batch.drain(..).zip(acks) {
+                let _ = job.reply_tx.send(Ok(ack.log_id));
             }
             return;
         }
@@ -925,9 +934,9 @@ impl ShardBatcherCtx {
             "Forwarding write batch to leader over Zenoh"
         );
         match self.forward_write_jobs(&leader_addr, &to_forward).await {
-            Ok(log_ids) if log_ids.len() == to_forward.len() => {
-                for (job, log_id) in to_forward.into_iter().zip(log_ids) {
-                    let _ = job.reply_tx.send(Ok(log_id));
+            Ok(acks) if acks.len() == to_forward.len() => {
+                for (job, ack) in to_forward.into_iter().zip(acks) {
+                    let _ = job.reply_tx.send(Ok(ack.log_id));
                 }
             }
             Ok(_) => {
