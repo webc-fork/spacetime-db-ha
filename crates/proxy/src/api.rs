@@ -635,14 +635,13 @@ struct Http200JsonTemplate<'a> {
     body: &'a str,
 }
 
-/// 动态 HTTP 503 健康检查错误 JSON 响应编译期模板（单次渲染完整 HTTP 报文 + JSON 体）。
+/// 动态 HTTP 503 健康检查错误 JSON 响应编译期模板（单次渲染完整 HTTP 报文 + JSON 体，内联计算 Content-Length）。
 #[derive(Template)]
 #[template(
-    source = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {{ body_len }}\r\nConnection: close\r\n\r\n{\"status\":\"unhealthy\",\"error\":\"{{ msg }}\"}",
+    source = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {{ HEALTH_ERR_WRAP_LEN + msg.len() }}\r\nConnection: close\r\n\r\n{\"status\":\"unhealthy\",\"error\":\"{{ msg }}\"}",
     ext = "txt"
 )]
 struct Http503HealthTemplate<'a> {
-    body_len: usize,
     msg: &'a str,
 }
 
@@ -676,12 +675,9 @@ pub async fn serve_metrics_tcp(
                                 let _ = stream.write_all(HTTP_200_HEALTH_RESP).await;
                             }
                             Err(msg) => {
-                                let resp = Http503HealthTemplate {
-                                    body_len: HEALTH_ERR_WRAP_LEN + msg.len(),
-                                    msg: &msg,
-                                }
-                                .render()
-                                .unwrap_or_default();
+                                let resp = Http503HealthTemplate { msg: &msg }
+                                    .render()
+                                    .unwrap_or_default();
                                 let _ = stream.write_all(resp.into_bytes()).await;
                             }
                         }
