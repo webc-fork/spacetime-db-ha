@@ -20,46 +20,92 @@ const NANOS_PER_SEC: f64 = 1_000_000_000.0;
 /// JSON 指标导出预分配容量（字节）。
 const METRICS_BUF_CAPACITY: usize = 512;
 
-/// 写操作延迟直方图桶上界（纳秒，编译期常量，热路径纯整数比较）。
-const LATENCY_BUCKETS_NANOS: [u64; BUCKET_COUNT] = [
-    1_000_000,
-    5_000_000,
-    10_000_000,
-    25_000_000,
-    50_000_000,
-    100_000_000,
-    250_000_000,
-    500_000_000,
-    1_000_000_000,
-];
+/// 写操作延迟直方图桶上界（毫秒）。
+const LATENCY_BUCKETS_MS: [u64; BUCKET_COUNT] = [1, 5, 10, 25, 50, 100, 250, 500, 1_000];
+
+/// 编译期将毫秒数组转换为纳秒数组，保证桶定义单一事实来源且热路径纯整数比较。
+const fn ms_array_to_nanos<const N: usize>(ms: [u64; N]) -> [u64; N] {
+    let mut out = [0u64; N];
+    let mut i = 0;
+    while i < N {
+        out[i] = Duration::from_millis(ms[i]).as_nanos() as u64;
+        i += 1;
+    }
+    out
+}
+
+/// 写操作延迟直方图桶上界（纳秒，编译期由 `ms_array_to_nanos` 计算）。
+const LATENCY_BUCKETS_NANOS: [u64; BUCKET_COUNT] = ms_array_to_nanos(LATENCY_BUCKETS_MS);
+
+// ============================================================================
+// 编译期公共 JSON 指标键名与结构片段（基于 const_str 组合）
+// ============================================================================
+
+/// 指标公共命名空间前缀。
+const METRIC_NS: &str = "spacetime_db_ha_";
+/// JSON 首键定界符。
+const JSON_FIRST_KEY_START: &str = "{\"";
+/// JSON 后续键定界符。
+const JSON_NEXT_KEY_START: &str = ",\"";
+/// JSON 键名结束定界符。
+const JSON_KEY_END: &str = "\":";
 
 /// 编译期静态 JSON 键名前缀片段（零运行时转义或反射开销）。
-const JSON_P0: &str = r#"{"spacetime_db_ha_raft_term":"#;
-const JSON_P1: &str = r#","spacetime_db_ha_raft_is_leader":"#;
-const JSON_P2: &str = r#","spacetime_db_ha_shards_active":"#;
-const JSON_P3: &str = r#","spacetime_db_ha_delivery_lag_entries":"#;
-const JSON_P4: &str = r#","spacetime_db_ha_connections_active":"#;
-const JSON_P5: &str = r#","spacetime_db_ha_writes_total":"#;
-const JSON_P6: &str = r#","spacetime_db_ha_reads_total":"#;
-const JSON_P7: &str = r#","spacetime_db_ha_write_latency_seconds":{"buckets":{"#;
+const JSON_P0: &str = const_str::concat!(JSON_FIRST_KEY_START, METRIC_NS, "raft_term", JSON_KEY_END);
+const JSON_P1: &str =
+    const_str::concat!(JSON_NEXT_KEY_START, METRIC_NS, "raft_is_leader", JSON_KEY_END);
+const JSON_P2: &str =
+    const_str::concat!(JSON_NEXT_KEY_START, METRIC_NS, "shards_active", JSON_KEY_END);
+const JSON_P3: &str = const_str::concat!(
+    JSON_NEXT_KEY_START,
+    METRIC_NS,
+    "delivery_lag_entries",
+    JSON_KEY_END
+);
+const JSON_P4: &str = const_str::concat!(
+    JSON_NEXT_KEY_START,
+    METRIC_NS,
+    "connections_active",
+    JSON_KEY_END
+);
+const JSON_P5: &str =
+    const_str::concat!(JSON_NEXT_KEY_START, METRIC_NS, "writes_total", JSON_KEY_END);
+const JSON_P6: &str =
+    const_str::concat!(JSON_NEXT_KEY_START, METRIC_NS, "reads_total", JSON_KEY_END);
+const JSON_P7: &str = const_str::concat!(
+    JSON_NEXT_KEY_START,
+    METRIC_NS,
+    "write_latency_seconds",
+    JSON_KEY_END,
+    JSON_FIRST_KEY_START,
+    "buckets",
+    JSON_KEY_END,
+    "{"
+);
 
 /// 编译期静态直方图分桶 JSON 键名片段。
 const JSON_BUCKET_PREFIXES: [&str; BUCKET_COUNT] = [
-    r#""0.001":"#,
-    r#","0.005":"#,
-    r#","0.01":"#,
-    r#","0.025":"#,
-    r#","0.05":"#,
-    r#","0.1":"#,
-    r#","0.25":"#,
-    r#","0.5":"#,
-    r#","1.0":"#,
+    const_str::concat!("\"", "0.001", JSON_KEY_END),
+    const_str::concat!(JSON_NEXT_KEY_START, "0.005", JSON_KEY_END),
+    const_str::concat!(JSON_NEXT_KEY_START, "0.01", JSON_KEY_END),
+    const_str::concat!(JSON_NEXT_KEY_START, "0.025", JSON_KEY_END),
+    const_str::concat!(JSON_NEXT_KEY_START, "0.05", JSON_KEY_END),
+    const_str::concat!(JSON_NEXT_KEY_START, "0.1", JSON_KEY_END),
+    const_str::concat!(JSON_NEXT_KEY_START, "0.25", JSON_KEY_END),
+    const_str::concat!(JSON_NEXT_KEY_START, "0.5", JSON_KEY_END),
+    const_str::concat!(JSON_NEXT_KEY_START, "1.0", JSON_KEY_END),
 ];
 
-const JSON_BUCKET_INF: &str = r#","+Inf":"#;
-const JSON_SUM: &str = r#"},"sum":"#;
-const JSON_COUNT: &str = r#","count":"#;
-const JSON_ENTRIES_APPLIED: &str = r#"},"spacetime_db_ha_entries_applied_total":"#;
+const JSON_BUCKET_INF: &str = const_str::concat!(JSON_NEXT_KEY_START, "+Inf", JSON_KEY_END);
+const JSON_SUM: &str = const_str::concat!("}", JSON_NEXT_KEY_START, "sum", JSON_KEY_END);
+const JSON_COUNT: &str = const_str::concat!(JSON_NEXT_KEY_START, "count", JSON_KEY_END);
+const JSON_ENTRIES_APPLIED: &str = const_str::concat!(
+    "}",
+    JSON_NEXT_KEY_START,
+    METRIC_NS,
+    "entries_applied_total",
+    JSON_KEY_END
+);
 const JSON_SUFFIX: &str = "}";
 
 /// 无锁整型 Gauge 指标。

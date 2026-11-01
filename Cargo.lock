@@ -641,6 +641,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "const-str"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "18f12cc9948ed9604230cdddc7c86e270f9401ccbe3c2e98a4378c5e7632212f"
+
+[[package]]
 name = "const_format"
 version = "0.2.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3247,6 +3253,7 @@ dependencies = [
  "bytes",
  "clap",
  "compio",
+ "const-str",
  "crossfire",
  "fjall",
  "futures",
@@ -3273,6 +3280,7 @@ dependencies = [
  "bitcode",
  "clap",
  "compio",
+ "const-str",
  "crossfire",
  "gxhash",
  "rimalloc",

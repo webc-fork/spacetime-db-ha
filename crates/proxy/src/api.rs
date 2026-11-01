@@ -33,8 +33,12 @@ use crate::{
     },
     router::{DEFAULT_SHARD, ShardConfigCommand, ShardId, encode_shard_config},
     transport::{
-        CrossfireChannel, RpcEnvelope, close_session, decode_query_payload, reply_bitcode,
-        watch::Receiver,
+        CLUSTER_PREFIX, CLUSTER_QUERYABLE_ALL, CrossfireChannel, KEY_CLUSTER_HEALTH, KEY_METRICS,
+        RAFT_PREFIX, RAFT_QUERYABLE_ALL, RPC_APPEND, RPC_SNAPSHOT, RPC_VOTE, RpcEnvelope,
+        SUB_ADD_NODE, SUB_HEALTH, SUB_INIT, SUB_LEADER, SUB_REMOVE_NODE, SUB_SHARDS,
+        SUB_SHARDS_CREATE, SUB_SHARDS_PREFIX, SUB_SHARDS_REMOVE, SUB_SHARDS_ROUTE,
+        SUB_SHARDS_ROUTE_ADD, SUB_SHARDS_ROUTE_REMOVE, SUB_STATUS, SUB_WRITE, SUFFIX_STATUS,
+        SUFFIX_WRITE, close_session, decode_query_payload, reply_bitcode, watch::Receiver,
     },
 };
 
@@ -46,20 +50,62 @@ fn err_str(err: impl Display) -> String {
 /// 原生 TCP `/metrics` 请求读取缓冲区大小。
 const METRICS_REQ_BUF_SIZE: usize = 1024;
 
+// ============================================================================
+// 编译期公共 HTTP 与 JSON 静态常量片段（基于 const_str 组合，消除硬编码与重复字面量）
+// ============================================================================
+
+/// HTTP 协议版本前缀。
+const HTTP_VER: &str = "HTTP/1.1 ";
+/// HTTP 行分隔符。
+const CRLF: &str = "\r\n";
+
+/// HTTP 状态码短语。
+const STATUS_200: &str = "200 OK";
+const STATUS_404: &str = "404 Not Found";
+const STATUS_503: &str = "503 Service Unavailable";
+
+/// 公共 HTTP 响应头片段。
+const HDR_CONTENT_TYPE_JSON: &str =
+    const_str::concat!(CRLF, "Content-Type: application/json; charset=utf-8");
+const HDR_CONTENT_LEN: &str = const_str::concat!(CRLF, "Content-Length: ");
+const HTTP_HEADER_END: &str = const_str::concat!(CRLF, "Connection: close", CRLF, CRLF);
+
 /// 编译期静态 HTTP 200 JSON 响应头前缀。
 const HTTP_200_JSON_PREFIX: &str =
-    "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: ";
+    const_str::concat!(HTTP_VER, STATUS_200, HDR_CONTENT_TYPE_JSON, HDR_CONTENT_LEN);
+/// 编译期静态 HTTP 404 JSON 响应头前缀。
+const HTTP_404_JSON_PREFIX: &str =
+    const_str::concat!(HTTP_VER, STATUS_404, HDR_CONTENT_TYPE_JSON, HDR_CONTENT_LEN);
 /// 编译期静态 HTTP 503 JSON 响应头前缀。
-const HTTP_503_JSON_PREFIX: &str = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: ";
-/// 编译期静态 HTTP 响应头尾部。
-const HTTP_HEADER_END: &str = "\r\nConnection: close\r\n\r\n";
-/// 编译期静态健康检查 200 JSON 完整响应报文（零堆内存分配）。
-const HTTP_200_HEALTH_RESP: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: 20\r\nConnection: close\r\n\r\n{\"status\":\"healthy\"}";
+const HTTP_503_JSON_PREFIX: &str =
+    const_str::concat!(HTTP_VER, STATUS_503, HDR_CONTENT_TYPE_JSON, HDR_CONTENT_LEN);
+
+/// 编译期静态健康检查 200 JSON 响应体与完整报文（自动在编译期计算 Content-Length，零堆分配）。
+const HEALTH_OK_BODY: &str = r#"{"status":"healthy"}"#;
+const HTTP_200_HEALTH_RESP: &[u8] = const_str::concat_bytes!(
+    HTTP_200_JSON_PREFIX,
+    const_str::to_str!(HEALTH_OK_BODY.len()),
+    HTTP_HEADER_END,
+    HEALTH_OK_BODY
+);
+
 /// 编译期静态健康检查 503 JSON 响应体前缀与后缀。
 const HEALTH_ERR_PREFIX: &str = r#"{"status":"unhealthy","error":""#;
 const HEALTH_ERR_SUFFIX: &str = r#""}"#;
-/// 编译期静态 404 JSON 完整响应报文（零堆内存分配）。
-const HTTP_404_JSON_RESP: &[u8] = b"HTTP/1.1 404 Not Found\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: 21\r\nConnection: close\r\n\r\n{\"error\":\"not found\"}";
+
+/// 编译期静态 404 JSON 响应体与完整报文（自动在编译期计算 Content-Length，零堆分配）。
+const NOT_FOUND_BODY: &str = r#"{"error":"not found"}"#;
+const HTTP_404_JSON_RESP: &[u8] = const_str::concat_bytes!(
+    HTTP_404_JSON_PREFIX,
+    const_str::to_str!(NOT_FOUND_BODY.len()),
+    HTTP_HEADER_END,
+    NOT_FOUND_BODY
+);
+
+/// HTTP GET 请求行匹配前缀（编译期拼接）。
+const REQ_GET_PREFIX: &str = "GET /";
+const REQ_GET_METRICS: &[u8] = const_str::concat_bytes!(REQ_GET_PREFIX, KEY_METRICS);
+const REQ_GET_HEALTH: &[u8] = const_str::concat_bytes!(REQ_GET_PREFIX, KEY_CLUSTER_HEALTH);
 
 /// 取指定分片的 Raft 实例。
 fn get_shard_raft(pool: &RaftPool, shard_id: ShardId) -> Result<ShardRaft, String> {
@@ -163,20 +209,20 @@ pub async fn serve_zenoh(
     mut shutdown: Receiver<bool>,
 ) -> Result<()> {
     let raft_qabl = session
-        .declare_queryable("raft/**")
+        .declare_queryable(RAFT_QUERYABLE_ALL)
         .with(CrossfireChannel::new())
         .await
-        .map_err(|e| anyhow!("declare raft/** queryable: {e}"))?;
+        .map_err(|e| anyhow!("declare {RAFT_QUERYABLE_ALL} queryable: {e}"))?;
     let cluster_qabl = session
-        .declare_queryable("cluster/**")
+        .declare_queryable(CLUSTER_QUERYABLE_ALL)
         .with(CrossfireChannel::new())
         .await
-        .map_err(|e| anyhow!("declare cluster/** queryable: {e}"))?;
+        .map_err(|e| anyhow!("declare {CLUSTER_QUERYABLE_ALL} queryable: {e}"))?;
     let metrics_qabl = session
-        .declare_queryable("metrics")
+        .declare_queryable(KEY_METRICS)
         .with(CrossfireChannel::new())
         .await
-        .map_err(|e| anyhow!("declare metrics queryable: {e}"))?;
+        .map_err(|e| anyhow!("declare {KEY_METRICS} queryable: {e}"))?;
 
     loop {
         select! {
@@ -226,7 +272,7 @@ fn decode_req<T: DecodeOwned>(query: &Query) -> Result<T, String> {
 /// 分发 `raft/**` 命名空间下的 Raft 节点间共识 RPC。
 async fn dispatch_raft_query(pool: &RaftPool, query: Query) {
     let key = query.key_expr().as_str();
-    let rest = key.strip_prefix("raft/").unwrap_or("");
+    let rest = key.strip_prefix(RAFT_PREFIX).unwrap_or("");
 
     let (shard_id, rpc) = match rest.split_once('/') {
         Some((sid_str, rpc_name)) => match sid_str.parse::<ShardId>() {
@@ -240,7 +286,7 @@ async fn dispatch_raft_query(pool: &RaftPool, query: Query) {
     };
 
     match rpc {
-        "append" => {
+        RPC_APPEND => {
             let res: RpcEnvelope<Result<WireAppendEntriesResponse, WireFatal>> = async {
                 let req: WireAppendEntriesRequest = decode_req(&query)?;
                 let raft = get_shard_raft(pool, shard_id)?;
@@ -253,7 +299,7 @@ async fn dispatch_raft_query(pool: &RaftPool, query: Query) {
             .await;
             reply_bitcode(&query, res).await;
         }
-        "vote" => {
+        RPC_VOTE => {
             let res: RpcEnvelope<Result<WireVoteResponse, WireFatal>> = async {
                 let req: WireVoteRequest = decode_req(&query)?;
                 let raft = get_shard_raft(pool, shard_id)?;
@@ -266,7 +312,7 @@ async fn dispatch_raft_query(pool: &RaftPool, query: Query) {
             .await;
             reply_bitcode(&query, res).await;
         }
-        "snapshot" => {
+        RPC_SNAPSHOT => {
             let res: RpcEnvelope<Result<WireSnapshotResponse, WireFatal>> = async {
                 let req: WireFullSnapshotRequest = decode_req(&query)?;
                 let raft = get_shard_raft(pool, shard_id)?;
@@ -293,13 +339,13 @@ async fn dispatch_raft_query(pool: &RaftPool, query: Query) {
 /// 分发 `cluster/**` 命名空间下的管理与写转发请求。
 async fn dispatch_cluster_query(pool: &RaftPool, query: Query) {
     let key = query.key_expr().as_str();
-    let rest = key.strip_prefix("cluster/").unwrap_or("");
+    let rest = key.strip_prefix(CLUSTER_PREFIX).unwrap_or("");
 
     match rest {
-        "status" => {
+        SUB_STATUS => {
             reply_bitcode(&query, handle_cluster_status(pool)).await;
         }
-        "init" => {
+        SUB_INIT => {
             let res = async {
                 let nodes: BTreeMap<u64, String> = decode_req(&query)?;
                 let members: BTreeMap<u64, BasicNode> = nodes
@@ -313,7 +359,7 @@ async fn dispatch_cluster_query(pool: &RaftPool, query: Query) {
             .await;
             reply_bitcode(&query, res).await;
         }
-        "add-node" => {
+        SUB_ADD_NODE => {
             let res = async {
                 let req: AddNodeRequest = decode_req(&query)?;
                 pool.add_node_all_shards(req.node_id, req.addr)
@@ -324,7 +370,7 @@ async fn dispatch_cluster_query(pool: &RaftPool, query: Query) {
             .await;
             reply_bitcode(&query, res).await;
         }
-        "remove-node" => {
+        SUB_REMOVE_NODE => {
             let res = async {
                 let req: RemoveNodeRequest = decode_req(&query)?;
                 pool.remove_node_all_shards(req.node_id)
@@ -335,13 +381,13 @@ async fn dispatch_cluster_query(pool: &RaftPool, query: Query) {
             .await;
             reply_bitcode(&query, res).await;
         }
-        "leader" => {
+        SUB_LEADER => {
             reply_bitcode(&query, handle_cluster_leader(pool)).await;
         }
-        "health" => {
+        SUB_HEALTH => {
             reply_bitcode(&query, handle_cluster_health(pool).await).await;
         }
-        "write" => {
+        SUB_WRITE => {
             let res = async {
                 let req: ReducerCallRequest = decode_req(&query)?;
                 write_to_shard(pool, DEFAULT_SHARD, req).await
@@ -349,14 +395,14 @@ async fn dispatch_cluster_query(pool: &RaftPool, query: Query) {
             .await;
             reply_bitcode(&query, res).await;
         }
-        "shards" => {
+        SUB_SHARDS => {
             let resp = ShardListResponse {
                 shards: pool.list_shards(),
                 routes: pool.get_routes(),
             };
             reply_bitcode(&query, Ok(resp)).await;
         }
-        "shards/create" => {
+        SUB_SHARDS_CREATE => {
             let res = async {
                 let req: CreateShardRequest = decode_req(&query)?;
                 if req.shard_id == DEFAULT_SHARD {
@@ -374,7 +420,7 @@ async fn dispatch_cluster_query(pool: &RaftPool, query: Query) {
             .await;
             reply_bitcode(&query, res).await;
         }
-        "shards/remove" => {
+        SUB_SHARDS_REMOVE => {
             let res = async {
                 let req: RemoveShardRequest = decode_req(&query)?;
                 if req.shard_id == DEFAULT_SHARD {
@@ -392,7 +438,7 @@ async fn dispatch_cluster_query(pool: &RaftPool, query: Query) {
             .await;
             reply_bitcode(&query, res).await;
         }
-        "shards/route" | "shards/route/add" => {
+        SUB_SHARDS_ROUTE | SUB_SHARDS_ROUTE_ADD => {
             let res = async {
                 let req: AddRouteRequest = decode_req(&query)?;
                 if !pool.has_shard(req.shard_id) {
@@ -412,7 +458,7 @@ async fn dispatch_cluster_query(pool: &RaftPool, query: Query) {
             .await;
             reply_bitcode(&query, res).await;
         }
-        "shards/route/remove" => {
+        SUB_SHARDS_ROUTE_REMOVE => {
             let res = async {
                 let req: RemoveRouteRequest = decode_req(&query)?;
                 let msg = format!("Route for {} removed", req.module_name);
@@ -430,7 +476,7 @@ async fn dispatch_cluster_query(pool: &RaftPool, query: Query) {
         }
         _ => {
             // 处理动态路径：cluster/{shard_id}/write 或 cluster/shards/{shard_id}/status
-            if let Some(sid_str) = rest.strip_suffix("/write")
+            if let Some(sid_str) = rest.strip_suffix(SUFFIX_WRITE)
                 && let Ok(shard_id) = sid_str.parse::<ShardId>()
             {
                 let res = async {
@@ -442,8 +488,8 @@ async fn dispatch_cluster_query(pool: &RaftPool, query: Query) {
                 return;
             }
 
-            if let Some(mid) = rest.strip_prefix("shards/")
-                && let Some(sid_str) = mid.strip_suffix("/status")
+            if let Some(mid) = rest.strip_prefix(SUB_SHARDS_PREFIX)
+                && let Some(sid_str) = mid.strip_suffix(SUFFIX_STATUS)
                 && let Ok(shard_id) = sid_str.parse::<ShardId>()
             {
                 reply_bitcode(&query, handle_shard_status(pool, shard_id)).await;
@@ -618,12 +664,12 @@ pub async fn serve_metrics_tcp(
                     };
                     let head = &buf[..n];
 
-                    if head.starts_with(b"GET /metrics") {
+                    if head.starts_with(REQ_GET_METRICS) {
                         pool.update_metrics();
                         let body = metrics::encode_metrics();
                         let resp = build_http_json_response(HTTP_200_JSON_PREFIX, &body);
                         let _ = stream.write_all(resp).await;
-                    } else if head.starts_with(b"GET /cluster/health") {
+                    } else if head.starts_with(REQ_GET_HEALTH) {
                         match handle_cluster_health(&pool).await {
                             Ok(_) => {
                                 let _ = stream.write_all(HTTP_200_HEALTH_RESP).await;
