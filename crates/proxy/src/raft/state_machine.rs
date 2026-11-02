@@ -599,8 +599,22 @@ impl RaftStateMachine<C> for StateMachineStore {
             .as_ref()
             .map(|_| (data.active_shards.clone(), data.shard_routes.clone()));
 
+        let prev_delivered = self.last_delivered_index();
+        let snapshot_index = meta.last_log_id.map_or(0, |id| id.index);
         let delivered_target = {
             let mut inner = self.shared.inner.lock();
+            if prev_delivered < snapshot_index {
+                error!(
+                    shard_id = self.shared.shard_id,
+                    snapshot_index,
+                    delivered = prev_delivered,
+                    "Local SpacetimeDB is behind the installed snapshot and cannot be repaired from the log"
+                );
+                if !inner.db_stale {
+                    inner.db_stale = true;
+                    metrics::DB_STALE_SHARDS.inc();
+                }
+            }
             inner.last_applied = meta.last_log_id;
             inner.last_membership = meta.last_membership.clone();
             inner.shard_routes = data.shard_routes;

@@ -75,8 +75,8 @@ const ELECTION_TIMEOUT_MIN_MS: u64 = 1_000;
 const ELECTION_TIMEOUT_MAX_MS: u64 = 2_000;
 /// 等待本节点把写应用到状态机的超时。
 pub(crate) const APPLY_TIMEOUT: Duration = Duration::from_secs(30);
-/// 等待前置日志投递完成的超时上限。
-const DELIVER_ORDER_TIMEOUT: Duration = Duration::from_millis(500);
+/// 等待前置日志投递完成的超时上限（需覆盖自愈与上游重连窗口，超时返回错误严禁乱序放行，修复 Point-2）。
+pub(crate) const DELIVER_ORDER_TIMEOUT: Duration = Duration::from_secs(30);
 /// 读请求因果同步栅栏等待上限。
 const READ_BARRIER_TIMEOUT: Duration = Duration::from_millis(200);
 /// 线性一致 Leader 身份确认（`ReadIndex`）超时上限（防止网络分区时健康检查悬挂，修复 P1-3）。
@@ -331,15 +331,18 @@ impl RaftPool {
                     && !is_shard_config_entry(shard_id, &req.db_path, &req.raw_message)
                 {
                     state_machine.register_in_flight_write(idx);
-                    // 重放时设 origin_node_id = 0，确保无论当初由哪个节点提议，本节点恢复后都会补投
-                    let _ = write_tx
-                        .send(CommittedWrite {
+                    // 重放时设 origin_node_id = 0 并使用非阻塞 try_send，避免积压超过通道容量且上游不可达时卡死节点启动（溢出部分由 reclaimer 自动从日志补投，修复 Point-4）
+                    if write_tx
+                        .try_send(CommittedWrite {
                             log_index: idx,
                             origin_node_id: 0,
                             db_path: req.db_path,
                             raw_message: req.raw_message,
                         })
-                        .await;
+                        .is_err()
+                    {
+                        metrics::DELIVERY_BACKPRESSURE.inc();
+                    }
                 }
             }
             state_machine.advance_delivered();
@@ -482,20 +485,17 @@ impl RaftPool {
         }
     }
 
-    /// 扫描所有分片中超过 `max_age` 仍未完成投递的在途写，从 `fjall` 日志读取并交由转发器自愈补投（修复 R2）。
+    /// 扫描所有分片中超过 `max_age` 仍未完成投递的在途写，从 `fjall` 日志读取并交由转发器自愈补投（按分片聚合日志防刷屏，修复 R2/Point-8）。
     pub fn reclaim_stalled_deliveries(&self, max_age: Duration) {
         let shards = self.shards.read();
         for (&shard_id, shard) in shards.iter() {
+            let mut reclaimed_count = 0usize;
             for idx in shard.state_machine.take_stalled_writes(max_age) {
                 if let Ok(Some(entry)) = shard.log_store.get_entry(idx)
                     && let EntryPayload::Normal(req) = entry.payload
                     && !is_shard_config_entry(shard_id, &req.db_path, &req.raw_message)
                 {
-                    warn!(
-                        shard_id,
-                        log_index = idx,
-                        "Reclaiming stalled in-flight write"
-                    );
+                    reclaimed_count += 1;
                     shard.state_machine.requeue_write(CommittedWrite {
                         log_index: idx,
                         origin_node_id: 0,
@@ -504,7 +504,21 @@ impl RaftPool {
                     });
                 }
             }
+            if reclaimed_count > 0 {
+                warn!(
+                    shard_id,
+                    reclaimed_count, "Reclaimed stalled in-flight writes from log"
+                );
+            }
         }
+    }
+
+    /// 检查是否存在因安装快照跳过未投递日志而处于 stale 状态的分片（修复 Point-3）。
+    pub fn has_stale_shard(&self) -> bool {
+        self.shards
+            .read()
+            .values()
+            .any(|shard| shard.state_machine.is_db_stale())
     }
 
     /// 定期检查并初始化所有尚未完成成员初始化的活跃分片（先做本地无锁指标过滤，消除周期性 `ReadIndex` 网络开销，修复 P1-3/P1-7）。
@@ -667,28 +681,26 @@ impl RaftPool {
         bail!("timed out waiting for log index {index} to be applied")
     }
 
-    /// 等待指定日志索引之前的写投递完毕，实现同节点跨连接写的全局保序（修复 P0-1）。
-    pub async fn wait_delivered(&self, shard_id: ShardId, target_index: u64) {
+    /// 等待指定日志索引之前的写投递完毕，实现同节点跨连接写的全局保序（超时返回错误而非静默乱序放行，修复 P0-1/Point-2）。
+    pub async fn wait_delivered(&self, shard_id: ShardId, target_index: u64) -> Result<()> {
         if target_index == 0 {
-            return;
+            return Ok(());
         }
         let delivered = {
             let shards = self.shards.read();
             let Some(shard) = shards.get(&shard_id) else {
-                return;
+                return Ok(());
             };
             if shard.state_machine.last_delivered_index() >= target_index {
-                return;
+                return Ok(());
             }
             shard.state_machine.delivered_rx()
         };
 
-        if !wait_watermark(delivered, target_index, DELIVER_ORDER_TIMEOUT).await {
-            warn!(
-                shard_id,
-                target_index, "Timed out waiting for prior write delivery watermark"
-            );
+        if wait_watermark(delivered, target_index, DELIVER_ORDER_TIMEOUT).await {
+            return Ok(());
         }
+        bail!("timed out waiting for prior write delivery watermark at index {target_index}")
     }
 
     /// 标记指定日志索引的写已投递到上游 SpacetimeDB（修复 P0-2）。
