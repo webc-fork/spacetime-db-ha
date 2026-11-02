@@ -3,6 +3,7 @@ use std::{
     fs::remove_dir_all,
     path::Path,
     rc::Rc,
+    result,
     sync::Arc,
     time::Duration,
 };
@@ -73,13 +74,17 @@ const ELECTION_TIMEOUT_MIN_MS: u64 = 1_000;
 /// 选举超时上界（毫秒）。
 const ELECTION_TIMEOUT_MAX_MS: u64 = 2_000;
 /// 等待本节点把写应用到状态机的超时。
-const APPLY_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const APPLY_TIMEOUT: Duration = Duration::from_secs(30);
 /// 等待前置日志投递完成的超时上限。
 const DELIVER_ORDER_TIMEOUT: Duration = Duration::from_millis(500);
 /// 读请求因果同步栅栏等待上限。
 const READ_BARRIER_TIMEOUT: Duration = Duration::from_millis(200);
+/// 线性一致 Leader 身份确认（`ReadIndex`）超时上限（防止网络分区时健康检查悬挂，修复 P1-3）。
+const LINEARIZABLE_CHECK_TIMEOUT: Duration = Duration::from_secs(1);
 /// 未初始化分片协调重试间隔（修复 P1-7）。
 const SHARD_RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
+/// 在途写投递停滞阈值：超过该时长仍未完成投递的已应用写将由协调循环自动从 `fjall` 日志补投（修复 R2）。
+const STALLED_DELIVERY_TIMEOUT: Duration = Duration::from_secs(2);
 /// 单分片微批写聚合通道容量。
 const WRITE_BATCH_CHANNEL_CAPACITY: usize = 4096;
 /// 单次微批合并提案的最大写条目数（摊薄 Raft 共识落盘与跨节点 RPC 开销）。
@@ -110,8 +115,12 @@ pub fn parse_peers(peers: &[String]) -> BTreeMap<u64, BasicNode> {
         .collect()
 }
 
-/// 等待单调递增水位通道达到 `target`（一处定义，供 `wait_applied` 与 `wait_delivered` 共用）。
-async fn wait_watermark(mut rx: watch::Receiver<u64>, target: u64, timeout_dur: Duration) -> bool {
+/// 等待单调递增水位通道达到 `target`（一处定义，供 `wait_applied`、`wait_delivered` 与 `requeue_write` 共用）。
+pub(crate) async fn wait_watermark(
+    mut rx: watch::Receiver<u64>,
+    target: u64,
+    timeout_dur: Duration,
+) -> bool {
     if *rx.borrow_and_update() >= target {
         return true;
     }
@@ -162,6 +171,7 @@ type BatchWriteReceiver = AsyncRx<Array<BatchWriteJob>>;
 /// 单个分片的运行时状态。
 struct ShardState {
     raft: ShardRaft,
+    log_store: PersistentLogStore,
     state_machine: StateMachineStore,
     write_batch_tx: BatchWriteSender,
     forwarder_shutdown: watch::Sender<bool>,
@@ -249,7 +259,7 @@ impl RaftPool {
         })
         .detach();
 
-        // 修复 P1-7：启动周期性幂等协调循环，确保 leader 切换或网络抖动期间新建的分片最终完成初始化
+        // 修复 P1-7 & R2：启动周期性幂等协调循环，确保新建分片最终完成初始化且停滞在途写自动自愈补投
         let reconcile_pool = Rc::clone(&pool);
         let mut reconcile_shutdown = shutdown_rx;
         spawn(async move {
@@ -257,6 +267,7 @@ impl RaftPool {
             loop {
                 select! {
                     _ = ticker.tick().fuse() => {
+                        reconcile_pool.reclaim_stalled_deliveries(STALLED_DELIVERY_TIMEOUT);
                         reconcile_pool.reconcile_uninitialized_shards().await;
                     }
                     _ = reconcile_shutdown.changed().fuse() => return,
@@ -286,10 +297,11 @@ impl RaftPool {
         .validate()
         .context("invalid raft config")?;
 
-        // 修复 P2-10：日志与状态机共享同一个 fjall::Database 实例，并校验 last_purged 水位
-        let log_store = PersistentLogStore::new(Path::new(&config.data_dir), shard_id)?;
+        // 修复 P2-10 & P1-9：日志与状态机共享同一个 fjall::Database 实例，校验 last_purged 水位并绑定 delivered_rx 防止提前清理未投递日志
+        let mut log_store = PersistentLogStore::new(Path::new(&config.data_dir), shard_id)?;
         let state_machine = StateMachineStore::open_with_db(log_store.db(), shard_id)?;
         state_machine.align_with_purged(log_store.last_purged_log_id()?)?;
+        log_store.set_delivered_rx(state_machine.delivered_rx());
 
         if let Some(cfg_tx) = shard_config_tx {
             state_machine.set_shard_config_tx(cfg_tx);
@@ -307,7 +319,8 @@ impl RaftPool {
             forwarder_shutdown_rx.clone(),
         );
 
-        // 修复 P0-2：启动时重放 (last_delivered, last_applied] 区间内尚未投递到 SpacetimeDB 的日志条目
+        // 修复 P0-1 & P0-2：启动时重放 (last_delivered, last_applied] 区间内尚未投递到 SpacetimeDB 的日志条目；
+        // 先将待补投写登记入 in_flight_writes，防止重放区间内的后续非写条目跨空洞跳变推进 delivered 水位
         let delivered = state_machine.last_delivered_index();
         let applied = state_machine.last_applied_index();
         if delivered < applied {
@@ -317,6 +330,7 @@ impl RaftPool {
                 if let EntryPayload::Normal(req) = entry.payload
                     && !is_shard_config_entry(shard_id, &req.db_path, &req.raw_message)
                 {
+                    state_machine.register_in_flight_write(idx);
                     // 重放时设 origin_node_id = 0，确保无论当初由哪个节点提议，本节点恢复后都会补投
                     let _ = write_tx
                         .send(CommittedWrite {
@@ -326,10 +340,9 @@ impl RaftPool {
                             raw_message: req.raw_message,
                         })
                         .await;
-                    continue;
                 }
-                state_machine.mark_delivered(idx);
             }
+            state_machine.advance_delivered();
         }
         state_machine.set_forwarder(write_tx);
 
@@ -338,26 +351,27 @@ impl RaftPool {
             config.node_id,
             Arc::new(raft_config),
             network,
-            log_store,
+            log_store.clone(),
             state_machine.clone(),
         )
         .await?;
 
         let (write_batch_tx, write_batch_rx) = bounded_async(WRITE_BATCH_CHANNEL_CAPACITY);
-        spawn_write_batcher(
+        ShardBatcherCtx::new(
             raft.clone(),
+            state_machine.clone(),
             zenoh_pool,
             config,
             peers,
             shard_id,
-            write_batch_rx,
-            forwarder_shutdown_rx,
-        );
+        )
+        .spawn(write_batch_rx, forwarder_shutdown_rx);
 
         info!(shard_id, "Raft shard initialized");
 
         Ok(ShardState {
             raft,
+            log_store,
             state_machine,
             write_batch_tx,
             forwarder_shutdown: forwarder_shutdown_tx,
@@ -424,18 +438,24 @@ impl RaftPool {
         if let Some(shard) = removed {
             let _ = shard.forwarder_shutdown.send(true);
             let _ = shard.raft.shutdown().await;
+            // 先释放 ShardState 持有的 fjall 数据库与 Keyspace 句柄，再清理磁盘目录（修复 P1-7）
+            drop(shard);
             let dir = shard_dir(Path::new(&self.node_config.data_dir), shard_id);
             let _ = remove_dir_all(&dir);
             info!(shard_id, "Shard removed and resources cleaned up");
         }
     }
 
-    /// 若本节点是分片 0 的 leader 且目标分片尚未初始化，则使用分片 0 成员表初始化该分片（修复 P1-7）。
-    async fn try_initialize_shard(&self, shard_id: ShardId) {
-        if !self.is_leader(DEFAULT_SHARD).await {
-            return;
-        }
+    /// 检查本节点在本地指标中是否为分片 0 的当前 leader（无网络开销，供分片协调循环快速判定，修复 P1-3）。
+    fn is_local_default_leader(&self) -> bool {
+        let Some(raft) = self.get_raft(DEFAULT_SHARD) else {
+            return false;
+        };
+        raft.metrics().borrow_watched().current_leader == Some(self.node_config.node_id)
+    }
 
+    /// 若目标分片尚未初始化且本节点是分片 0 的 leader，则使用分片 0 成员表初始化该分片（修复 P1-3/P1-7）。
+    async fn try_initialize_shard(&self, shard_id: ShardId) {
         let Some(raft) = self.get_raft(shard_id) else {
             return;
         };
@@ -447,7 +467,7 @@ impl RaftPool {
             .voter_ids()
             .next()
             .is_none();
-        if !is_uninitialized {
+        if !is_uninitialized || !self.is_local_default_leader() {
             return;
         }
 
@@ -455,15 +475,41 @@ impl RaftPool {
         if members.is_empty() {
             return;
         }
-        match raft.initialize(members).await {
-            Ok(()) => info!(shard_id, "New shard initialized with existing membership"),
-            Err(e) => warn!(shard_id, error = %e, "Failed to initialize new shard"),
+        match timeout(LINEARIZABLE_CHECK_TIMEOUT * 3, raft.initialize(members)).await {
+            Ok(Ok(())) => info!(shard_id, "New shard initialized with existing membership"),
+            Ok(Err(e)) => warn!(shard_id, error = %e, "Failed to initialize new shard"),
+            Err(_) => warn!(shard_id, "Timed out initializing new shard"),
         }
     }
 
-    /// 定期检查并初始化所有尚未完成成员初始化的活跃分片（修复 P1-7）。
+    /// 扫描所有分片中超过 `max_age` 仍未完成投递的在途写，从 `fjall` 日志读取并交由转发器自愈补投（修复 R2）。
+    pub fn reclaim_stalled_deliveries(&self, max_age: Duration) {
+        let shards = self.shards.read();
+        for (&shard_id, shard) in shards.iter() {
+            for idx in shard.state_machine.take_stalled_writes(max_age) {
+                if let Ok(Some(entry)) = shard.log_store.get_entry(idx)
+                    && let EntryPayload::Normal(req) = entry.payload
+                    && !is_shard_config_entry(shard_id, &req.db_path, &req.raw_message)
+                {
+                    warn!(
+                        shard_id,
+                        log_index = idx,
+                        "Reclaiming stalled in-flight write"
+                    );
+                    shard.state_machine.requeue_write(CommittedWrite {
+                        log_index: idx,
+                        origin_node_id: 0,
+                        db_path: req.db_path,
+                        raw_message: req.raw_message,
+                    });
+                }
+            }
+        }
+    }
+
+    /// 定期检查并初始化所有尚未完成成员初始化的活跃分片（先做本地无锁指标过滤，消除周期性 `ReadIndex` 网络开销，修复 P1-3/P1-7）。
     async fn reconcile_uninitialized_shards(&self) {
-        if !self.is_leader(DEFAULT_SHARD).await {
+        if !self.is_local_default_leader() {
             return;
         }
         for shard_id in self.list_shards() {
@@ -555,8 +601,9 @@ impl RaftPool {
             .send(job)
             .await
             .map_err(|_| anyhow!("shard {shard_id} write batcher closed"))?;
-        reply_rx
+        timeout(APPLY_TIMEOUT, reply_rx)
             .await
+            .map_err(|_| anyhow!("timed out waiting for write proposal on shard {shard_id}"))?
             .map_err(|_| anyhow!("shard {shard_id} write batcher dropped reply"))?
     }
 
@@ -594,8 +641,9 @@ impl RaftPool {
             receivers.push(reply_rx);
         }
 
-        let results = try_join_all(receivers)
+        let results = timeout(APPLY_TIMEOUT, try_join_all(receivers))
             .await
+            .map_err(|_| anyhow!("timed out waiting for write batch proposal on shard {shard_id}"))?
             .map_err(|_| anyhow!("shard {shard_id} write batcher dropped reply"))?;
         results.into_iter().collect()
     }
@@ -635,7 +683,12 @@ impl RaftPool {
             shard.state_machine.delivered_rx()
         };
 
-        let _ = wait_watermark(delivered, target_index, DELIVER_ORDER_TIMEOUT).await;
+        if !wait_watermark(delivered, target_index, DELIVER_ORDER_TIMEOUT).await {
+            warn!(
+                shard_id,
+                target_index, "Timed out waiting for prior write delivery watermark"
+            );
+        }
     }
 
     /// 标记指定日志索引的写已投递到上游 SpacetimeDB（修复 P0-2）。
@@ -643,6 +696,14 @@ impl RaftPool {
         let shards = self.shards.read();
         if let Some(shard) = shards.get(&shard_id) {
             shard.state_machine.mark_delivered(index);
+        }
+    }
+
+    /// 当源节点客户端在提交后断开连接或直投失败时，将写交还转发器兜底投递（修复 P0-2）。
+    pub fn requeue_write(&self, shard_id: ShardId, write: CommittedWrite) {
+        let shards = self.shards.read();
+        if let Some(shard) = shards.get(&shard_id) {
+            shard.state_machine.requeue_write(write);
         }
     }
 
@@ -667,15 +728,19 @@ impl RaftPool {
         let _ = wait_watermark(applied, target, READ_BARRIER_TIMEOUT).await;
     }
 
-    /// 本节点是否为指定分片的 leader。
+    /// 本节点是否为指定分片的线性一致 leader（带超时保护，防止网络分区时无限挂起，修复 P1-3）。
     pub async fn is_leader(&self, shard_id: ShardId) -> bool {
-        match self.get_raft(shard_id) {
-            Some(raft) => raft
-                .ensure_linearizable(ReadPolicy::ReadIndex)
-                .await
-                .is_ok(),
-            None => false,
-        }
+        let Some(raft) = self.get_raft(shard_id) else {
+            return false;
+        };
+        matches!(
+            timeout(
+                LINEARIZABLE_CHECK_TIMEOUT,
+                raft.ensure_linearizable(ReadPolicy::ReadIndex),
+            )
+            .await,
+            Ok(Ok(_))
+        )
     }
 
     /// 指定分片当前 leader 的 ID 与可路由广播地址（修复 P1-8）。
@@ -819,6 +884,7 @@ fn resolve_peer_addr(
 /// 分片微批写提案器上下文（预计算分片级转发键表达式，消除热路径字符串分配）。
 struct ShardBatcherCtx {
     raft: ShardRaft,
+    state_machine: StateMachineStore,
     zenoh_pool: ZenohClientPool,
     node_config: Arc<NodeConfig>,
     peers: Arc<BTreeMap<u64, BasicNode>>,
@@ -844,23 +910,36 @@ impl ShardBatcherCtx {
         )
     }
 
-    /// 将一批写请求转发给远端 Leader（单条走 `/write`，多条直接按 `&[BatchWriteJob]` 零克隆序列化走 `/write-batch` 单次 RPC）。
+    /// 向调用方回传已提交的 `log_id`；若调用方在等待提案期间已断开连接（`reply_tx` 接收端被丢弃），
+    /// 则在状态机应用到该索引后自动交由转发器兜底投递，防止源节点漏写（修复 P0-2）。
+    fn send_committed_reply(&self, job: BatchWriteJob, log_id: RaftLogId) {
+        if job.reply_tx.send(Ok(log_id)).is_err() {
+            self.state_machine.requeue_write(CommittedWrite {
+                log_index: log_id.index,
+                origin_node_id: 0,
+                db_path: job.request.db_path,
+                raw_message: job.request.raw_message,
+            });
+        }
+    }
+
+    /// 将一批写请求转发给远端 Leader（单条走 `/write`，多条直接按 `&[BatchWriteJob]` 零克隆序列化走 `/write-batch` 单次非幂等 `rpc_once`，修复 R3）。
     async fn forward_write_jobs(
         &self,
         leader_addr: &str,
         jobs: &[BatchWriteJob],
-    ) -> Result<Vec<WriteAck>> {
+    ) -> Result<Vec<result::Result<WriteAck, String>>> {
         if let [single] = jobs {
             let ack: WriteAck = self
                 .zenoh_pool
-                .rpc(leader_addr, &self.write_key, &single.request)
+                .rpc_once(leader_addr, &self.write_key, &single.request)
                 .await
                 .with_context(|| format!("forward write to {leader_addr} on {}", self.write_key))?;
-            return Ok(vec![ack]);
+            return Ok(vec![Ok(ack)]);
         }
 
         self.zenoh_pool
-            .rpc(leader_addr, &self.write_batch_key, jobs)
+            .rpc_once(leader_addr, &self.write_batch_key, jobs)
             .await
             .with_context(|| {
                 format!(
@@ -870,17 +949,48 @@ impl ShardBatcherCtx {
             })
     }
 
-    /// 执行单批写作业：
-    /// 1. 若本节点是已知 Follower，直接走 Zenoh 单次或批量 RPC 转发给远端 Leader；
-    /// 2. 若本节点是 Leader（或远端转发失败），通过 `join_all` 在同一 tick 并发入队 `RaftCore`，触发底层单次 `fjall` 批量落盘与单次 `AppendEntries` 复制。
-    async fn execute_write_batch(&self, batch: &mut Vec<BatchWriteJob>) {
-        if let Some(leader_addr) = self.current_remote_leader()
-            && let Ok(acks) = self.forward_write_jobs(&leader_addr, batch).await
-            && acks.len() == batch.len()
-        {
-            for (job, ack) in batch.drain(..).zip(acks) {
-                let _ = job.reply_tx.send(Ok(ack.log_id));
+    /// 分发远端 Leader 批量写响应。
+    fn dispatch_forwarded_results(
+        &self,
+        jobs: impl IntoIterator<Item = BatchWriteJob>,
+        results: Result<Vec<result::Result<WriteAck, String>>>,
+        expected_len: usize,
+    ) {
+        match results {
+            Ok(acks) if acks.len() == expected_len => {
+                for (job, item) in jobs.into_iter().zip(acks) {
+                    match item {
+                        Ok(ack) => self.send_committed_reply(job, ack.log_id),
+                        Err(msg) => {
+                            let _ = job.reply_tx.send(Err(anyhow!("{msg}")));
+                        }
+                    }
+                }
             }
+            Ok(_) => {
+                for job in jobs {
+                    let _ = job
+                        .reply_tx
+                        .send(Err(anyhow!("leader returned mismatched batch ack count")));
+                }
+            }
+            Err(e) => {
+                let err_msg = e.to_string();
+                for job in jobs {
+                    let _ = job.reply_tx.send(Err(anyhow!("{err_msg}")));
+                }
+            }
+        }
+    }
+
+    /// 执行单批写作业：
+    /// 1. 若本节点是已知 Follower，直接走 Zenoh 单次或批量 RPC 转发给远端 Leader（转发错误直接上报，禁止回落重提以防重复执行，修复 P0-5）；
+    /// 2. 若本节点是 Leader（或未知 Leader），通过 `join_all` 在同一 tick 并发入队 `RaftCore`，触发底层单次 `fjall` 批量落盘与单次 `AppendEntries` 复制。
+    async fn execute_write_batch(&self, batch: &mut Vec<BatchWriteJob>) {
+        if let Some(leader_addr) = self.current_remote_leader() {
+            let len = batch.len();
+            let res = self.forward_write_jobs(&leader_addr, batch).await;
+            self.dispatch_forwarded_results(batch.drain(..), res, len);
             return;
         }
 
@@ -896,7 +1006,7 @@ impl ShardBatcherCtx {
         for (job, res) in batch.drain(..).zip(results) {
             match res {
                 Ok(resp) => {
-                    let _ = job.reply_tx.send(Ok(resp.log_id));
+                    self.send_committed_reply(job, resp.log_id);
                 }
                 Err(RaftError::APIError(ClientWriteError::ForwardToLeader(forward))) => {
                     if forwarded_leader_addr.is_none()
@@ -927,73 +1037,58 @@ impl ShardBatcherCtx {
             return;
         };
 
+        let len = to_forward.len();
         info!(
             leader_addr = %leader_addr,
             shard_id,
-            batch_size = to_forward.len(),
+            batch_size = len,
             "Forwarding write batch to leader over Zenoh"
         );
-        match self.forward_write_jobs(&leader_addr, &to_forward).await {
-            Ok(acks) if acks.len() == to_forward.len() => {
-                for (job, ack) in to_forward.into_iter().zip(acks) {
-                    let _ = job.reply_tx.send(Ok(ack.log_id));
-                }
-            }
-            Ok(_) => {
-                for job in to_forward {
-                    let _ = job
-                        .reply_tx
-                        .send(Err(anyhow!("leader returned mismatched batch ack count")));
-                }
-            }
-            Err(e) => {
-                let err_msg = e.to_string();
-                for job in to_forward {
-                    let _ = job.reply_tx.send(Err(anyhow!("{err_msg}")));
-                }
-            }
+        let res = self.forward_write_jobs(&leader_addr, &to_forward).await;
+        self.dispatch_forwarded_results(to_forward, res, len);
+    }
+
+    fn new(
+        raft: ShardRaft,
+        state_machine: StateMachineStore,
+        zenoh_pool: ZenohClientPool,
+        node_config: Arc<NodeConfig>,
+        peers: Arc<BTreeMap<u64, BasicNode>>,
+        shard_id: ShardId,
+    ) -> Self {
+        Self {
+            raft,
+            state_machine,
+            zenoh_pool,
+            node_config,
+            peers,
+            shard_id,
+            write_key: mid_u64_key(CLUSTER_PREFIX, shard_id, SUFFIX_WRITE),
+            write_batch_key: mid_u64_key(CLUSTER_PREFIX, shard_id, SUFFIX_WRITE_BATCH),
         }
     }
-}
 
-/// 启动分片的微批写提案后台协程：零延迟接收首条写并立即排空当前就绪队列，合并提交。
-fn spawn_write_batcher(
-    raft: ShardRaft,
-    zenoh_pool: ZenohClientPool,
-    node_config: Arc<NodeConfig>,
-    peers: Arc<BTreeMap<u64, BasicNode>>,
-    shard_id: ShardId,
-    batch_rx: BatchWriteReceiver,
-    mut shutdown_rx: watch::Receiver<bool>,
-) {
-    let ctx = ShardBatcherCtx {
-        raft,
-        zenoh_pool,
-        node_config,
-        peers,
-        shard_id,
-        write_key: mid_u64_key(CLUSTER_PREFIX, shard_id, SUFFIX_WRITE),
-        write_batch_key: mid_u64_key(CLUSTER_PREFIX, shard_id, SUFFIX_WRITE_BATCH),
-    };
-
-    spawn(async move {
-        let mut batch = Vec::with_capacity(MAX_WRITE_BATCH_SIZE);
-        loop {
-            let first = select! {
-                item = batch_rx.recv().fuse() => {
-                    let Ok(job) = item else { return };
-                    job
+    /// 启动分片的微批写提案后台协程：零延迟接收首条写并立即排空当前就绪队列，合并提交。
+    fn spawn(self, batch_rx: BatchWriteReceiver, mut shutdown_rx: watch::Receiver<bool>) {
+        spawn(async move {
+            let mut batch = Vec::with_capacity(MAX_WRITE_BATCH_SIZE);
+            loop {
+                let first = select! {
+                    item = batch_rx.recv().fuse() => {
+                        let Ok(job) = item else { return };
+                        job
+                    }
+                    _ = shutdown_rx.changed().fuse() => return,
+                };
+                batch.push(first);
+                while batch.len() < MAX_WRITE_BATCH_SIZE
+                    && let Ok(job) = batch_rx.try_recv()
+                {
+                    batch.push(job);
                 }
-                _ = shutdown_rx.changed().fuse() => return,
-            };
-            batch.push(first);
-            while batch.len() < MAX_WRITE_BATCH_SIZE
-                && let Ok(job) = batch_rx.try_recv()
-            {
-                batch.push(job);
+                self.execute_write_batch(&mut batch).await;
             }
-            ctx.execute_write_batch(&mut batch).await;
-        }
-    })
-    .detach();
+        })
+        .detach();
+    }
 }

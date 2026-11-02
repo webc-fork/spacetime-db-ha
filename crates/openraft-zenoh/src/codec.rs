@@ -117,8 +117,6 @@ macro_rules! impl_bitcode_via {
     };
 }
 
-pub use impl_bitcode_via;
-
 /// `bytes::Bytes` 的零拷贝 `bitcode` 包装器：
 /// - 克隆仅递增 `Bytes` 引用计数（O(1) 零堆分配）；
 /// - 编码直接委托给 `<[u8] as Encode>::Encoder` 写入切片（消除 `.to_vec()` 临时堆分配）；

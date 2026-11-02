@@ -7,11 +7,10 @@ use bitcode::{
     Decode, Encode,
 };
 use bytes::Bytes;
-use openraft_zenoh::codec;
 pub use openraft_zenoh::codec::{
     WireBytes, WireDecoder, WireEncoder, WireLogId, WireStoredMembership, WireVote,
-    impl_bitcode_via,
 };
+use openraft_zenoh::{codec, impl_bitcode_via};
 
 use crate::raft::types::{RaftLogId, ReducerCallRequest, WriteAck};
 

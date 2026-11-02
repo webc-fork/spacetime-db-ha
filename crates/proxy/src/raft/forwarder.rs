@@ -105,7 +105,8 @@ pub async fn run_with_pool(
             write = write_rx.recv().fuse() => {
                 let Ok(write) = write else { return };
 
-                // 源节点由客户端连接自己直投，事务结果才能回到发起方
+                // 源节点由客户端连接自己直投，事务结果才能回到发起方；
+                // 若因客户端连接断开导致源节点未直投，但后续非本节点写已投递推进水位，则此处不再阻塞
                 if write.origin_node_id == node_id {
                     continue;
                 }

@@ -1,12 +1,14 @@
 use std::{
-    collections::BTreeSet,
+    collections::BTreeMap,
     fs::create_dir_all,
     io::{self, Cursor},
     path::Path,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use bitcode::{Decode, Encode};
+use compio::runtime::spawn;
 use crossfire::{
     AsyncRx, MAsyncTx,
     mpsc::{Array, bounded_async},
@@ -25,7 +27,7 @@ use tracing::{debug, warn};
 use crate::{
     metrics,
     raft::{
-        CommittedWrite,
+        APPLY_TIMEOUT, CommittedWrite,
         codec::{WireLogId, WireStoredMembership},
         error::{StoreError, storage_io_err},
         persistent_log_store::{DB_DIR, shard_dir},
@@ -33,6 +35,7 @@ use crate::{
             RaftEntry, RaftLogId, RaftSnapshot, RaftSnapshotMeta, RaftStoredMembership,
             ReducerCallResponse, TypeConfig,
         },
+        wait_watermark,
     },
     router::{self, ShardConfigCommand, ShardId, is_shard_config_entry},
     transport::watch,
@@ -114,8 +117,9 @@ struct StateMachineInner {
     last_membership: RaftStoredMembership,
     shard_routes: HashMap<String, ShardId>,
     active_shards: Vec<ShardId>,
-    /// 已应用但因前置写条目尚未投递完成而暂缓推进 `delivered` 水位的非写日志索引集合。
-    pending_non_writes: BTreeSet<u64>,
+    /// 已应用（或启动重放已入队）但尚未完成上游投递的客户端写日志索引及其入队时间。
+    /// 连续已投递水位由 `in_flight_writes.first_key_value().map_or(last_applied, |(&idx, _)| idx - 1)` 唯一确定，禁止跨空洞跳变。
+    in_flight_writes: BTreeMap<u64, Instant>,
     /// 缓存最近一次快照；当状态推进时自动失效，避免返回陈旧快照。
     cached_snapshot: Option<RaftSnapshot>,
 }
@@ -154,6 +158,17 @@ impl StateMachineInner {
             active_shards: self.active_shards.clone(),
         }
     }
+
+    /// 计算当前连续已投递水位上界（受限于最早未完成写条目 `first_pending - 1`，禁止跨空洞跳变）。
+    #[inline]
+    fn contiguous_delivered(&self, fallback: u64) -> u64 {
+        match self.in_flight_writes.first_key_value() {
+            Some((&first_pending, _)) => first_pending.saturating_sub(1),
+            None => self
+                .last_applied
+                .map_or(fallback, |id| id.index.max(fallback)),
+        }
+    }
 }
 
 impl StateMachineStore {
@@ -174,10 +189,10 @@ impl StateMachineStore {
             None => SnapshotData::default(),
         };
         let delivered = match state_ks.get(META_DELIVERED)? {
-            Some(value) => <[u8; 8]>::try_from(value.as_ref()).map_or_else(
-                |_| bitcode::decode::<u64>(&value).unwrap_or(0),
-                u64::from_le_bytes,
-            ),
+            Some(value) => match <[u8; 8]>::try_from(value.as_ref()) {
+                Ok(bytes) => u64::from_le_bytes(bytes),
+                Err(_) => bitcode::decode::<u64>(&value)?,
+            },
             None => 0,
         };
 
@@ -197,7 +212,7 @@ impl StateMachineStore {
                     last_membership,
                     shard_routes: meta.shard_routes,
                     active_shards: meta.active_shards,
-                    pending_non_writes: BTreeSet::new(),
+                    in_flight_writes: BTreeMap::new(),
                     cached_snapshot: None,
                 }),
                 forwarder: Mutex::new(None),
@@ -214,20 +229,21 @@ impl StateMachineStore {
         let Some(purged) = last_purged else {
             return Ok(());
         };
-        let needs_align = {
+        let delivered_target = {
             let mut inner = self.shared.inner.lock();
             if inner.last_applied.map_or(0, |id| id.index) < purged.index {
                 inner.last_applied = Some(purged);
+                inner.in_flight_writes.retain(|&idx, _| idx > purged.index);
                 inner.cached_snapshot = None;
-                true
+                Some(inner.contiguous_delivered(purged.index))
             } else {
-                false
+                None
             }
         };
-        if needs_align {
+        if let Some(target) = delivered_target {
             self.persist()?;
             self.shared.applied.send_replace(purged.index);
-            self.mark_delivered(purged.index);
+            self.commit_delivered_watermark(target);
         }
         Ok(())
     }
@@ -262,35 +278,84 @@ impl StateMachineStore {
         self.shared.delivered.subscribe()
     }
 
-    /// 推进并持久化 `last_delivered` 水位（自动跨越后续连续已应用的非写条目，栈上 8 字节小端序直写，零堆分配，修复 P0-2）。
-    pub fn mark_delivered(&self, index: u64) {
-        let mut target = index;
-        {
-            let mut inner = self.shared.inner.lock();
-            if !inner.pending_non_writes.is_empty() {
-                let cur = (*self.shared.delivered.borrow()).max(index);
-                inner.pending_non_writes.retain(|&idx| idx > cur);
-                target = cur;
-                while inner.pending_non_writes.remove(&(target + 1)) {
-                    target += 1;
-                }
+    /// 登记一条启动重放期间在途的写日志索引（在写投递完成前阻止后续非写条目跨洞推进 `delivered` 水位，修复 P0-1）。
+    pub fn register_in_flight_write(&self, index: u64) {
+        self.shared
+            .inner
+            .lock()
+            .in_flight_writes
+            .insert(index, Instant::now());
+    }
+
+    /// 提取超过 `max_age` 仍未完成投递的已应用写日志索引，并刷新其时间戳以防重复触发（供周期性自愈补投使用，修复 R2）。
+    pub fn take_stalled_writes(&self, max_age: Duration) -> Vec<u64> {
+        let now = Instant::now();
+        let mut inner = self.shared.inner.lock();
+        let applied = inner.last_applied.map_or(0, |id| id.index);
+        let mut stalled = Vec::new();
+        for (&idx, ts) in &mut inner.in_flight_writes {
+            if idx > applied {
+                break;
+            }
+            if now.duration_since(*ts) >= max_age {
+                *ts = now;
+                stalled.push(idx);
             }
         }
-        let mut updated = false;
+        stalled
+    }
+
+    /// 按当前最早未完成写条目推进连续 `last_delivered` 水位（不跨空洞）。
+    pub fn advance_delivered(&self) {
+        let target = self.shared.inner.lock().contiguous_delivered(0);
+        self.commit_delivered_watermark(target);
+    }
+
+    /// 标记指定写条目已投递并推进连续 `last_delivered` 水位（禁止跨未投递空洞跳变，自动跨越后续已应用非写条目，修复 P0-1/P0-2）。
+    pub fn mark_delivered(&self, index: u64) {
+        let target = {
+            let mut inner = self.shared.inner.lock();
+            inner.in_flight_writes.remove(&index);
+            inner.contiguous_delivered(index)
+        };
+        self.commit_delivered_watermark(target);
+    }
+
+    /// 单调递增持久化并发布 `last_delivered` 水位（先写入共享 `fjall` 日志再更新 `watch` 通道，保证 `purge` 读取水位时元数据已在同库日志中，修复 R1b）。
+    fn commit_delivered_watermark(&self, target: u64) {
+        if target <= *self.shared.delivered.borrow() {
+            return;
+        }
+        let _ = self
+            .shared
+            .state_ks
+            .insert(META_DELIVERED, target.to_le_bytes());
         self.shared.delivered.send_if_modified(|cur| {
             if target > *cur {
                 *cur = target;
-                updated = true;
                 true
             } else {
                 false
             }
         });
-        if updated {
-            let _ = self
-                .shared
-                .state_ks
-                .insert(META_DELIVERED, target.to_le_bytes());
+    }
+
+    /// 当源节点客户端断连或直投失败时，等待该日志条目在本节点应用后将其（置 `origin_node_id = 0`）交还转发器兜底投递（修复 P0-2/R6）。
+    pub fn requeue_write(&self, mut write: CommittedWrite) {
+        write.origin_node_id = 0;
+        let forwarder = self.shared.forwarder.lock().clone();
+        if let Some(tx) = forwarder {
+            let idx = write.log_index;
+            let applied_rx = (self.last_applied_index() < idx).then(|| self.applied_rx());
+            spawn(async move {
+                if let Some(rx) = applied_rx
+                    && !wait_watermark(rx, idx, APPLY_TIMEOUT).await
+                {
+                    return;
+                }
+                let _ = tx.try_send(write);
+            })
+            .detach();
         }
     }
 
@@ -337,7 +402,7 @@ impl StateMachineStore {
         let shard_id = self.shared.shard_id;
         let mut pending_commands = Vec::new();
         let mut pending_writes = Vec::new();
-        let mut non_write_indices = Vec::new();
+        let mut has_non_write = false;
         let mut last_log_id = None;
         let mut last_membership = None;
         let mut app_entries = 0u64;
@@ -353,7 +418,7 @@ impl StateMachineStore {
             match entry.payload {
                 EntryPayload::Membership(membership) => {
                     last_membership = Some(RaftStoredMembership::new(Some(log_id), membership));
-                    non_write_indices.push(log_id.index);
+                    has_non_write = true;
                 }
                 EntryPayload::Normal(request) => {
                     app_entries += 1;
@@ -369,7 +434,7 @@ impl StateMachineStore {
                                 );
                             }
                         }
-                        non_write_indices.push(log_id.index);
+                        has_non_write = true;
                     } else {
                         pending_writes.push(CommittedWrite {
                             log_index: log_id.index,
@@ -380,13 +445,13 @@ impl StateMachineStore {
                     }
                 }
                 EntryPayload::Blank => {
-                    non_write_indices.push(log_id.index);
+                    has_non_write = true;
                 }
             }
         }
 
-        // 单次加锁合并更新整批日志的 last_applied、last_membership、配置命令并直接生成快照数据，避免逐条加锁与二次加锁
-        let snapshot_data = {
+        // 单次加锁合并更新整批日志的 last_applied、last_membership、配置命令、在途写集合与连续 delivered 水位上界
+        let (snapshot_data, delivered_target) = {
             let mut inner = self.shared.inner.lock();
             if let Some(log_id) = last_log_id {
                 inner.last_applied = Some(log_id);
@@ -398,8 +463,16 @@ impl StateMachineStore {
             for command in &pending_commands {
                 inner.apply_command(command);
             }
-            inner.pending_non_writes.extend(&non_write_indices);
-            inner.snapshot_data()
+            let target = if forwarder.is_some() {
+                let now = Instant::now();
+                for write in &pending_writes {
+                    inner.in_flight_writes.insert(write.log_index, now);
+                }
+                has_non_write.then(|| inner.contiguous_delivered(0))
+            } else {
+                last_log_id.map(|id| id.index)
+            };
+            (inner.snapshot_data(), target)
         };
 
         if app_entries > 0 {
@@ -419,10 +492,11 @@ impl StateMachineStore {
             }
         }
 
+        if let Some(target) = delivered_target {
+            self.commit_delivered_watermark(target);
+        }
+
         if let Some(tx) = &forwarder {
-            if !non_write_indices.is_empty() {
-                self.mark_delivered(self.last_delivered_index());
-            }
             for write in pending_writes {
                 debug!(
                     log_index = write.log_index,
@@ -430,11 +504,9 @@ impl StateMachineStore {
                     db_path = %write.db_path,
                     "Forwarding committed reducer call to SpacetimeDB"
                 );
-                let _ = tx.send(write).await;
+                // 使用非阻塞 try_send 防止下游 SpacetimeDB 故障阻塞 Raft apply（满载溢出的写已记入 in_flight_writes 与 fjall 日志，由周期性 reclaimer 补投，修复 R6）
+                let _ = tx.try_send(write);
             }
-        } else if let Some(log_id) = last_log_id {
-            // 未挂载转发器时（如纯状态机单测），直接推进 delivered 水位至本批末尾
-            self.mark_delivered(log_id.index);
         }
 
         if let Some(log_id) = last_log_id {
@@ -499,17 +571,25 @@ impl RaftStateMachine<C> for StateMachineStore {
             .as_ref()
             .map(|_| (data.active_shards.clone(), data.shard_routes.clone()));
 
-        {
+        let delivered_target = {
             let mut inner = self.shared.inner.lock();
             inner.last_applied = meta.last_log_id;
             inner.last_membership = meta.last_membership.clone();
             inner.shard_routes = data.shard_routes;
             inner.active_shards = data.active_shards;
+            let target = if let Some(log_id) = meta.last_log_id {
+                inner.in_flight_writes.retain(|&idx, _| idx > log_id.index);
+                Some(inner.contiguous_delivered(log_id.index))
+            } else {
+                inner.in_flight_writes.clear();
+                None
+            };
             inner.cached_snapshot = Some(Snapshot {
                 meta: meta.clone(),
                 snapshot: Cursor::new(bytes),
             });
-        }
+            target
+        };
 
         if let (Some(tx), Some((active_shards, shard_routes))) = (shard_config_tx, replay) {
             for shard_id in active_shards {
@@ -526,9 +606,9 @@ impl RaftStateMachine<C> for StateMachineStore {
         }
 
         self.persist().map_err(storage_io_err)?;
-        if let Some(log_id) = meta.last_log_id {
+        if let (Some(log_id), Some(target)) = (meta.last_log_id, delivered_target) {
             self.shared.applied.send_replace(log_id.index);
-            self.mark_delivered(log_id.index);
+            self.commit_delivered_watermark(target);
         }
 
         Ok(())

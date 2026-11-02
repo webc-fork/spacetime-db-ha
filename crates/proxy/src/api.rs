@@ -12,9 +12,9 @@ use compio::{
     net::TcpListener,
     runtime::spawn,
 };
-use futures::{FutureExt, future::try_join_all, select};
+use futures::{FutureExt, future::join_all, select};
 use gxhash::HashMap;
-use openraft::{BasicNode, ReadPolicy, ServerState, async_runtime::watch::WatchReceiver};
+use openraft::{BasicNode, ServerState, async_runtime::watch::WatchReceiver};
 use zenoh::{Session, query::Query};
 
 use crate::{
@@ -475,20 +475,21 @@ async fn write_to_shard(
     })
 }
 
-/// 批量提交转发来的多条写请求（同一事件循环 tick 内并发入队 `RaftCore`，合并为单次落盘与复制批次）。
+/// 批量提交转发来的多条写请求（同一事件循环 tick 内并发入队 `RaftCore`，逐条返回结果避免单条失败导致整批重提，修复 P0-5）。
 async fn write_batch_to_shard(
     pool: &RaftPool,
     shard_id: ShardId,
     reqs: Vec<ReducerCallRequest>,
-) -> Result<Vec<WriteAck>, String> {
+) -> Result<Vec<Result<WriteAck, String>>, String> {
     let raft = get_shard_raft(pool, shard_id)?;
-    let resps = try_join_all(reqs.into_iter().map(|req| raft.client_write(req)))
-        .await
-        .map_err(err_str)?;
+    let resps = join_all(reqs.into_iter().map(|req| raft.client_write(req))).await;
     Ok(resps
         .into_iter()
-        .map(|resp| WriteAck {
-            log_id: resp.log_id,
+        .map(|res| {
+            res.map(|resp| WriteAck {
+                log_id: resp.log_id,
+            })
+            .map_err(err_str)
         })
         .collect())
 }
@@ -538,12 +539,7 @@ pub async fn handle_cluster_health(pool: &RaftPool) -> Result<String, String> {
     let Some(leader_id) = current_leader else {
         return Err("no leader elected".to_owned());
     };
-    if leader_id == pool.node_config.node_id
-        && raft
-            .ensure_linearizable(ReadPolicy::ReadIndex)
-            .await
-            .is_err()
-    {
+    if leader_id == pool.node_config.node_id && !pool.is_leader(DEFAULT_SHARD).await {
         return Err("leader lost quorum".to_owned());
     }
     Ok("healthy".to_owned())

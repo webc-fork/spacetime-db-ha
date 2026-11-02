@@ -9,6 +9,7 @@ use openraft::{
 };
 use spacetime_db_ha::raft::{
     persistent_log_store::PersistentLogStore,
+    state_machine::StateMachineStore,
     types::{LeaderId, RaftEntry, RaftLogId},
 };
 use tempfile::TempDir;
@@ -140,4 +141,39 @@ async fn legacy_database_is_migrated_into_shard_dir() {
 
     assert!(!legacy.exists());
     assert!(dir.path().join("shard-0/fjall").exists());
+}
+
+#[compio::test]
+async fn purge_clamps_both_deleted_entries_and_last_purged_meta_to_delivered() {
+    let dir = TempDir::new().unwrap();
+    let mut store = PersistentLogStore::new(dir.path(), 0).unwrap();
+    let sm = StateMachineStore::open_with_db(store.db(), 0).unwrap();
+    store.set_delivered_rx(sm.delivered_rx());
+
+    store
+        .append_entries(vec![
+            blank_entry(1, 1),
+            blank_entry(2, 2),
+            blank_entry(2, 3),
+        ])
+        .unwrap();
+
+    // 推进 delivered = 1
+    sm.mark_delivered(1);
+
+    // delivered = 1 时请求 purge(2, 3)：物理日志与元数据都必须夹紧到 (1, 1)，保留 2..=3
+    store.purge(log_id(2, 3)).await.unwrap();
+    let remaining = store.try_get_log_entries(1..4).await.unwrap();
+    assert_eq!(indices(&remaining), vec![2, 3]);
+    let state = store.get_log_state().await.unwrap();
+    assert_eq!(state.last_purged_log_id, Some(log_id(1, 1)));
+    assert_eq!(state.last_log_id, Some(log_id(2, 3)));
+
+    // 推进 delivered = 3 后再次 purge(2, 3)，清理至 3
+    sm.mark_delivered(3);
+    store.purge(log_id(2, 3)).await.unwrap();
+    let remaining_after = store.try_get_log_entries(1..4).await.unwrap();
+    assert!(remaining_after.is_empty());
+    let state_after = store.get_log_state().await.unwrap();
+    assert_eq!(state_after.last_purged_log_id, Some(log_id(2, 3)));
 }

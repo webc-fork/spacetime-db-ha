@@ -9,16 +9,13 @@ use bitcode::{Decode, Encode};
 use bytes::Bytes;
 use compio::runtime::spawn;
 use futures::{FutureExt, select};
+use openraft_zenoh::impl_bitcode_via;
 use tracing::{debug, info, warn};
 use zenoh::{Session, bytes::ZBytes, pubsub::Subscriber, sample::Sample};
 
 use crate::{
     metrics,
-    raft::{
-        RaftPool,
-        codec::{WireBytes, impl_bitcode_via},
-        forwarder::next_stream_id,
-    },
+    raft::{CommittedWrite, RaftPool, codec::WireBytes, forwarder::next_stream_id},
     router::{DEFAULT_SHARD, ShardId, extract_module_name},
     transport::{
         CrossfireChannel, CrossfireHandler, KEY_STDB_CONNECT, STDB_C2S_PREFIX, STDB_S2C_PREFIX,
@@ -42,6 +39,8 @@ pub const CLOSE_CODE_AWAY: u16 = 1001;
 
 /// 客户端流单次 RPC 超时。
 const STREAM_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+/// 客户端会话断开时通知上游关闭逻辑流的超时上限（修复 P1-10）。
+const UPSTREAM_CLOSE_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// 连接关闭帧（由 `bitcode` 序列化后通过 Zenoh 传输）。
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -365,6 +364,7 @@ pub async fn spawn_client_session(
         let _guard = ConnectionGuard::new();
         let pool_for_in = Rc::clone(&pool);
         let path_for_in = request_path;
+        let upstream_for_close = upstream_tx.clone();
 
         let mut inbound = spawn(async move {
             while let Ok(query) = c2s_queryable.recv().await {
@@ -430,10 +430,49 @@ pub async fn spawn_client_session(
         // compio::runtime::JoinHandle 在 Drop 时会自动取消未完成的任务
         drop(inbound);
         drop(outbound);
+        // 通知上游 SpacetimeDB 释放该 conn_id 的 c2s Queryable，防止连接泄漏（修复 P1-10）
+        let _ = upstream_for_close
+            .send_with_timeout(&Message::Close(None), UPSTREAM_CLOSE_TIMEOUT)
+            .await;
     })
     .detach();
 
     Ok(StdbConnectResponse { conn_id })
+}
+
+/// 源节点已提交写的投递守卫：仅借用 `&str` 与 `&Bytes`（成功热路径零堆分配、零引用计数克隆，修复 R9-8）；
+/// 若客户端在直投完成前断开连接（任务取消）或上游发送失败，在析构时才构造 [`CommittedWrite`] 交还转发器兜底投递（修复 P0-2）。
+struct OriginDeliveryGuard<'a> {
+    pool: &'a RaftPool,
+    shard_id: ShardId,
+    log_index: u64,
+    db_path: &'a str,
+    raw_message: &'a Bytes,
+    delivered: bool,
+}
+
+impl OriginDeliveryGuard<'_> {
+    #[inline]
+    fn complete(&mut self) {
+        self.delivered = true;
+        self.pool.mark_delivered(self.shard_id, self.log_index);
+    }
+}
+
+impl Drop for OriginDeliveryGuard<'_> {
+    fn drop(&mut self) {
+        if !self.delivered {
+            self.pool.requeue_write(
+                self.shard_id,
+                CommittedWrite {
+                    log_index: self.log_index,
+                    origin_node_id: 0,
+                    db_path: self.db_path.to_owned(),
+                    raw_message: self.raw_message.clone(),
+                },
+            );
+        }
+    }
 }
 
 /// 单条客户端消息处理：写走 Raft 并按全局日志顺序投递，读经因果栅栏后直投。
@@ -446,7 +485,7 @@ async fn handle_client_message(
 ) -> Result<()> {
     match classify_message(&msg) {
         MessageKind::Write => {
-            if let Message::Binary(data) = &msg {
+            if let Message::Binary(data) = msg {
                 debug!(
                     tag = data[0],
                     len = data.len(),
@@ -454,16 +493,24 @@ async fn handle_client_message(
                     "Write -> Raft consensus"
                 );
                 let log_id = pool.propose_write(shard_id, data.clone(), db_path).await?;
+                let mut delivery_guard = OriginDeliveryGuard {
+                    pool,
+                    shard_id,
+                    log_index: log_id.index,
+                    db_path,
+                    raw_message: &data,
+                    delivered: false,
+                };
                 pool.wait_applied(shard_id, log_id.index).await?;
 
                 // 修复 P0-1：等待前置日志索引投递完毕，保证同节点跨连接写的上游投递顺序严格等于 Raft 日志顺序
                 pool.wait_delivered(shard_id, log_id.index.saturating_sub(1))
                     .await;
 
-                let send_res = upstream.send(msg).await;
-                // 修复 P0-2：投递完成后推进并持久化 delivered 水位
+                let send_res = upstream.send(Message::Binary(data.clone())).await;
+                // 修复 P0-2：投递完成后推进并持久化连续 delivered 水位；若失败则由 delivery_guard 析构交还转发器补投
                 if send_res.is_ok() {
-                    pool.mark_delivered(shard_id, log_id.index);
+                    delivery_guard.complete();
                 }
                 return send_res;
             }

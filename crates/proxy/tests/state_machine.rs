@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::Cursor,
+    time::Duration,
 };
 
 use bytes::Bytes;
@@ -12,6 +13,7 @@ use openraft::{
 };
 use spacetime_db_ha::{
     raft::{
+        CommittedWrite,
         state_machine::{
             CONFIG_CHANNEL_CAPACITY, ConfigReceiver, FORWARDER_CHANNEL_CAPACITY, StateMachineStore,
             WriteReceiver, config_channel, write_channel,
@@ -87,17 +89,29 @@ async fn committed_writes_are_forwarded_with_target_database() {
     let mut h = harness();
 
     let results =
-        h.sm.apply_entries(vec![write_entry(1, 1, 7, b"\x03payload")])
-            .await
-            .unwrap();
+        h.sm.apply_entries(vec![
+            write_entry(1, 1, 7, b"\x03payload"),
+            RaftEntry {
+                log_id: log_id(1, 2),
+                payload: EntryPayload::Blank,
+            },
+        ])
+        .await
+        .unwrap();
 
-    assert_eq!(results.len(), 1);
+    assert_eq!(results.len(), 2);
     let write = h.writes.recv().await.unwrap();
     assert_eq!(write.log_index, 1);
     assert_eq!(write.origin_node_id, 7);
     assert_eq!(write.db_path, DB_PATH);
     assert_eq!(&write.raw_message[..], b"\x03payload");
     assert!(h.configs.try_recv().is_err(), "普通写不应触发分片配置");
+
+    // 前置写 (index=1) 尚未投递完成时，后续非写条目 (index=2) 暂缓推进 delivered 水位
+    assert_eq!(h.sm.last_delivered_index(), 0);
+    // 前置写投递完成后，delivered 水位自动跨越后续已应用的 Blank 条目推进至 2
+    h.sm.mark_delivered(1);
+    assert_eq!(h.sm.last_delivered_index(), 2);
 }
 
 #[compio::test]
@@ -272,6 +286,21 @@ async fn snapshot_roundtrip_restores_state_and_replays_config() {
     let snapshot = source.sm.build_snapshot().await.unwrap();
 
     let mut restored = harness();
+    // 模拟快照安装前存在未推进的非写条目（前置写 1 未完成，Blank 2 挂起），安装快照到 3 后必须清理并推进 delivered 至 3
+    restored
+        .sm
+        .apply_entries(vec![
+            write_entry(1, 1, 1, b"\x03old"),
+            RaftEntry {
+                log_id: log_id(1, 2),
+                payload: EntryPayload::Blank,
+            },
+        ])
+        .await
+        .unwrap();
+    let _ = restored.writes.recv().await.unwrap();
+    assert_eq!(restored.sm.last_delivered_index(), 0);
+
     let bytes = snapshot.snapshot.into_inner();
     restored
         .sm
@@ -283,6 +312,7 @@ async fn snapshot_roundtrip_restores_state_and_replays_config() {
     let (restored_applied, restored_membership) = restored.sm.applied_state().await.unwrap();
     assert_eq!(restored_applied, source_applied);
     assert_eq!(restored_membership, source_membership);
+    assert_eq!(restored.sm.last_delivered_index(), 3);
 
     assert_eq!(
         restored.configs.recv().await.unwrap(),
@@ -311,4 +341,91 @@ async fn built_snapshot_is_cached_and_repeatable() {
     let cached = h.sm.get_current_snapshot().await.unwrap().unwrap();
     assert_eq!(cached.meta, built.meta);
     assert_eq!(cached.snapshot.get_ref(), built.snapshot.get_ref());
+}
+
+#[compio::test]
+async fn out_of_order_delivery_never_skips_holes() {
+    // 修复 P0-2 验证：乱序投递（先完成写 2、后完成写 1）时，连续水位绝不跨越未完成的写 1
+    let mut h = harness();
+
+    h.sm.apply_entries(vec![
+        write_entry(1, 1, 1, b"\x03w1"),
+        write_entry(1, 2, 1, b"\x03w2"),
+        RaftEntry {
+            log_id: log_id(1, 3),
+            payload: EntryPayload::Blank,
+        },
+    ])
+    .await
+    .unwrap();
+
+    assert_eq!(h.sm.last_delivered_index(), 0);
+
+    // 写 2 先投递完成：由于写 1 仍在途，连续水位必须停留在 0
+    h.sm.mark_delivered(2);
+    assert_eq!(h.sm.last_delivered_index(), 0);
+
+    // 写 1 投递完成：连续水位一次性跨越写 1、已完成的写 2 以及末尾的 Blank 3，推进至 3
+    h.sm.mark_delivered(1);
+    assert_eq!(h.sm.last_delivered_index(), 3);
+}
+
+#[compio::test]
+async fn startup_replay_with_trailing_blank_never_jumps_watermark() {
+    // 修复 P0-1 验证：重放区间含 [未投递写 1, Blank 2] 时，advance_delivered 不会跨越未投递写 1
+    let mut h = harness();
+
+    h.sm.apply_entries(vec![
+        write_entry(1, 1, 1, b"\x03w1"),
+        RaftEntry {
+            log_id: log_id(1, 2),
+            payload: EntryPayload::Blank,
+        },
+    ])
+    .await
+    .unwrap();
+
+    // 模拟重启重放登记在途写 1 并调用 advance_delivered
+    h.sm.register_in_flight_write(1);
+    h.sm.advance_delivered();
+    assert_eq!(h.sm.last_delivered_index(), 0);
+
+    // 待转发器完成写 1 投递后，水位推进至 2
+    h.sm.mark_delivered(1);
+    assert_eq!(h.sm.last_delivered_index(), 2);
+}
+
+#[compio::test]
+async fn stalled_in_flight_writes_are_detected_and_requeued() {
+    let mut h = harness();
+
+    h.sm.apply_entries(vec![
+        write_entry(1, 1, 2, b"\x03stalled"),
+        write_entry(1, 2, 2, b"\x03done"),
+    ])
+    .await
+    .unwrap();
+    let _ = h.writes.recv().await.unwrap();
+    let _ = h.writes.recv().await.unwrap();
+
+    // 写 2 完成，但写 1 滞留在途
+    h.sm.mark_delivered(2);
+    assert_eq!(h.sm.last_delivered_index(), 0);
+
+    // 阈值为 0 时立即识别出滞留的写 1
+    let stalled = h.sm.take_stalled_writes(Duration::ZERO);
+    assert_eq!(stalled, vec![1]);
+
+    // 模拟从日志重读并补投写 1
+    h.sm.requeue_write(CommittedWrite {
+        log_index: 1,
+        origin_node_id: 0,
+        db_path: DB_PATH.to_owned(),
+        raw_message: Bytes::from_static(b"\x03stalled"),
+    });
+    let re_sent = h.writes.recv().await.unwrap();
+    assert_eq!(re_sent.log_index, 1);
+
+    h.sm.mark_delivered(1);
+    assert_eq!(h.sm.last_delivered_index(), 2);
 }

@@ -9,7 +9,7 @@ use std::{borrow::Cow, marker::PhantomData, ops::Deref, result, sync::Arc, time:
 
 use anyhow::{Context, Result, anyhow, bail};
 use bitcode::{DecodeOwned, Encode};
-use compio::time::sleep;
+use compio::{runtime::spawn, time::sleep};
 use crossfire::{
     MAsyncRx,
     mpmc::{Array, bounded_blocking_async},
@@ -18,7 +18,7 @@ use gxhash::{HashMap, HashMapExt};
 use itoa::Buffer as ItoaBuffer;
 use parking_lot::Mutex;
 use zenoh::{
-    Session, Wait,
+    Session,
     bytes::ZBytes,
     config::Config,
     handlers::{Callback, IntoHandler},
@@ -321,9 +321,13 @@ pub async fn open_client_session(target_addr: &str) -> Result<Session> {
         .map_err(|e| anyhow!("Failed to connect Zenoh client session to {endpoint_json}: {e}"))
 }
 
-/// 在非 Tokio 运行时（如 `compio`）上安全关闭 Zenoh 会话（委托给 Zenoh 内部 `ZRuntime::Net`）。
+/// 在 `compio` 异步上下文中非阻塞关闭 Zenoh 会话（通过 `spawn` 异步驱动 `session.close().await`，不阻塞单线程 reactor，修复 R8）。
 pub fn close_session(session: &Session) {
-    let _ = session.close().wait();
+    let s = session.clone();
+    spawn(async move {
+        let _ = s.close().await;
+    })
+    .detach();
 }
 
 /// 建立短连接客户端会话，发送单次 `bitcode` RPC 请求后安全关闭会话（供 CLI 等单次命令调用）。
@@ -479,7 +483,7 @@ impl ZenohClientPool {
         }
     }
 
-    /// 向目标地址发送 `bitcode` RPC 请求；若缓存连接断开则自动重连一次。
+    /// 向目标地址发送幂等 `bitcode` RPC 请求；若缓存连接断开则自动重连一次。
     pub async fn rpc<Req, Resp>(&self, target_addr: &str, key_expr: &str, req: &Req) -> Result<Resp>
     where
         Req: Encode + ?Sized,
@@ -495,7 +499,27 @@ impl ZenohClientPool {
         .await
     }
 
-    /// 带超时与 QoS 优先级的 `bitcode` RPC 调用（单次编码，断线重连时直接复用同一份 `payload`）。
+    /// 向目标地址发送非幂等 `bitcode` RPC 请求（如 `/write`、`/write-batch`）：
+    /// 失败时仅驱逐失效连接，绝不重发请求负载，防止应答丢失时重复执行（修复 R3）。
+    pub async fn rpc_once<Req, Resp>(
+        &self,
+        target_addr: &str,
+        key_expr: &str,
+        req: &Req,
+    ) -> Result<Resp>
+    where
+        Req: Encode + ?Sized,
+        Resp: DecodeOwned,
+    {
+        let session = self.get_or_connect(target_addr).await?;
+        let res = rpc_once(&session, key_expr, req, DEFAULT_RPC_TIMEOUT).await;
+        if res.is_err() {
+            self.evict(target_addr);
+        }
+        res
+    }
+
+    /// 带超时与 QoS 优先级的幂等 `bitcode` RPC 调用（单次编码，断线重连时直接复用同一份 `payload`）。
     pub async fn rpc_with_qos<Req, Resp>(
         &self,
         target_addr: &str,

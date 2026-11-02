@@ -8,7 +8,7 @@ use std::{
 };
 
 use bitcode::{DecodeOwned, Encode};
-use fjall::{Database, Keyspace, KeyspaceCreateOptions};
+use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 use openraft::{
     LogState, OptionalSend, RaftLogReader,
     storage::{IOFlushed, RaftLogStorage},
@@ -22,7 +22,7 @@ use crate::{
         error::{StoreError, storage_io_err},
         types::{RaftEntry, RaftLogId, RaftVote, TypeConfig},
     },
-    transport::prefix_u64_key,
+    transport::{prefix_u64_key, watch},
 };
 
 type C = TypeConfig;
@@ -39,6 +39,8 @@ const META_LAST_PURGED: &str = "last_purged";
 /// 每个分片统一使用单个 fjall 数据库目录（日志与状态机共用同一库，修复 P2-10）。
 pub(crate) const DB_DIR: &str = "fjall";
 const SHARD_DIR_PREFIX: &str = "shard-";
+/// Raft 日志与元数据提交必须 `fdatasync` 刷盘后才向共识层确认（修复 P0-3）。
+const RAFT_DURABILITY: Option<PersistMode> = Some(PersistMode::SyncData);
 
 /// 将 `RangeBounds<u64>` 转换为大端序 8 字节数组区间，以保证字典序等于数值序。
 fn to_be_bounds<RB: RangeBounds<u64>>(range: &RB) -> (Bound<[u8; 8]>, Bound<[u8; 8]>) {
@@ -64,6 +66,8 @@ pub struct PersistentLogStore {
     log_ks: Keyspace,
     meta_ks: Keyspace,
     cache: Arc<Mutex<LogStateCache>>,
+    /// 可选关联的状态机 `last_delivered` 水位接收端；设置后 `purge` 仅物理删除 `<= last_delivered` 的日志，保留未投递条目供崩溃重放（修复 P1-9）。
+    delivered_rx: Option<watch::Receiver<u64>>,
 }
 
 impl PersistentLogStore {
@@ -85,6 +89,7 @@ impl PersistentLogStore {
             log_ks,
             meta_ks,
             cache: Arc::new(Mutex::new(LogStateCache::default())),
+            delivered_rx: None,
         };
         let last_purged = store
             .read_meta::<WireLogId>(META_LAST_PURGED)?
@@ -102,6 +107,11 @@ impl PersistentLogStore {
         Ok(store)
     }
 
+    /// 绑定同分片状态机的 `last_delivered` 水位接收端，防止 `purge` 提前清理尚未完成上游投递的日志条目（修复 P1-9）。
+    pub fn set_delivered_rx(&mut self, rx: watch::Receiver<u64>) {
+        self.delivered_rx = Some(rx);
+    }
+
     /// 返回底层 `fjall::Database` 引用，供同分片状态机共享同一数据库实例（修复 P2-10）。
     pub fn db(&self) -> &Database {
         &self.db
@@ -110,6 +120,14 @@ impl PersistentLogStore {
     /// 读取当前记录的 `last_purged` 水位（O(1) 内存缓存读取）。
     pub fn last_purged_log_id(&self) -> Result<Option<RaftLogId>, StoreError> {
         Ok(self.cache.lock().last_purged)
+    }
+
+    /// 按单条索引读取日志条目（供 `purge` 水位夹紧与停滞写补投共用）。
+    pub fn get_entry(&self, index: u64) -> Result<Option<RaftEntry>, StoreError> {
+        let Some(value) = self.log_ks.get(index.to_be_bytes())? else {
+            return Ok(None);
+        };
+        Ok(Some(decode_entry(&value)?))
     }
 
     /// 按闭区间读取日志条目，用于启动时重放 `(last_delivered, last_applied]`（修复 P0-2）。
@@ -130,8 +148,7 @@ impl PersistentLogStore {
             .range(to_be_bounds(&range))
             .map(|guard| {
                 let value = guard.value()?;
-                let wire: WireEntry = bitcode::decode(&value)?;
-                Ok(RaftEntry::from(wire))
+                decode_entry(&value)
             })
             .collect()
     }
@@ -141,7 +158,7 @@ impl PersistentLogStore {
         &self,
         entries: impl IntoIterator<Item = RaftEntry>,
     ) -> Result<(), StoreError> {
-        let mut batch = self.db.batch();
+        let mut batch = self.db.batch().durability(RAFT_DURABILITY);
         let mut last_log_id = None;
         for entry in entries {
             let log_id = entry.log_id;
@@ -165,10 +182,11 @@ impl PersistentLogStore {
         Ok(Some(bitcode::decode(&value)?))
     }
 
-    /// 写元数据。
+    /// 写元数据并同步刷盘（确保 `save_vote` 在掉电后仍满足 Raft 安全性，修复 P0-3）。
     fn write_meta<T: Encode>(&self, key: &str, value: &T) -> Result<(), StoreError> {
         let bytes = bitcode::encode(value);
         self.meta_ks.insert(key, bytes)?;
+        self.db.persist(PersistMode::SyncData)?;
         Ok(())
     }
 
@@ -178,9 +196,15 @@ impl PersistentLogStore {
             return Ok(None);
         };
         let value = guard.value()?;
-        let wire: WireEntry = bitcode::decode(&value)?;
-        Ok(Some(RaftEntry::from(wire)))
+        Ok(Some(decode_entry(&value)?))
     }
+}
+
+/// 反序列化单条 `bitcode` 日志条目。
+#[inline]
+fn decode_entry(bytes: &[u8]) -> Result<RaftEntry, StoreError> {
+    let wire: WireEntry = bitcode::decode(bytes)?;
+    Ok(RaftEntry::from(wire))
 }
 
 /// 旧版把数据库放在数据目录根部；分片 0 首次启动时迁移到 `shard-0/`。
@@ -248,36 +272,52 @@ impl RaftLogStorage<C> for PersistentLogStore {
 
     async fn truncate_after(&mut self, last_log_id: Option<RaftLogId>) -> Result<(), io::Error> {
         let start_index = last_log_id.map_or(0, |id| id.index + 1);
-        let mut batch = self.db.batch();
+        let mut batch = self.db.batch().durability(RAFT_DURABILITY);
         for guard in self.log_ks.range(start_index.to_be_bytes()..) {
             let key = guard.key().map_err(storage_io_err)?;
             batch.remove(&self.log_ks, key);
         }
         batch.commit().map_err(storage_io_err)?;
         let mut cache = self.cache.lock();
-        cache.last_log_id = last_log_id.or(cache.last_purged);
+        cache.last_log_id = last_log_id.max(cache.last_purged);
         Ok(())
     }
 
     async fn purge(&mut self, log_id: RaftLogId) -> Result<(), io::Error> {
-        let mut batch = self.db.batch();
-        for guard in self.log_ks.range(..=log_id.index.to_be_bytes()) {
+        let safe_index = match &mut self.delivered_rx {
+            Some(rx) => log_id.index.min(*rx.borrow_and_update()),
+            None => log_id.index,
+        };
+        let cur_purged = self.cache.lock().last_purged.map_or(0, |id| id.index);
+        if safe_index == 0 || safe_index <= cur_purged {
+            return Ok(());
+        }
+
+        let purged = if safe_index == log_id.index {
+            log_id
+        } else {
+            self.get_entry(safe_index).map_err(storage_io_err)?.map_or(
+                RaftLogId {
+                    leader_id: log_id.leader_id,
+                    index: safe_index,
+                },
+                |entry| entry.log_id,
+            )
+        };
+
+        let mut batch = self.db.batch().durability(RAFT_DURABILITY);
+        for guard in self.log_ks.range(..=safe_index.to_be_bytes()) {
             let key = guard.key().map_err(storage_io_err)?;
             batch.remove(&self.log_ks, key);
         }
 
-        // last_purged 与日志删除放在同一个跨 Keyspace WriteBatch 中原子提交，保证崩溃后二者一致
-        let bytes = bitcode::encode(&WireLogId::from(log_id));
+        // last_purged 与日志删除放在同一个跨 Keyspace WriteBatch 中以 SyncData 原子刷盘（含同库已写入的 META_DELIVERED，修复 R1）
+        let bytes = bitcode::encode(&WireLogId::from(purged));
         batch.insert(&self.meta_ks, META_LAST_PURGED, bytes);
         batch.commit().map_err(storage_io_err)?;
         let mut cache = self.cache.lock();
-        cache.last_purged = Some(log_id);
-        if cache
-            .last_log_id
-            .is_none_or(|last| last.index <= log_id.index)
-        {
-            cache.last_log_id = Some(log_id);
-        }
+        cache.last_purged = Some(purged);
+        cache.last_log_id = cache.last_log_id.max(Some(purged));
         Ok(())
     }
 }
