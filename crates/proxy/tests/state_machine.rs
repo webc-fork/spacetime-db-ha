@@ -300,6 +300,7 @@ async fn snapshot_roundtrip_restores_state_and_replays_config() {
         .unwrap();
     let _ = restored.writes.recv().await.unwrap();
     assert_eq!(restored.sm.last_delivered_index(), 0);
+    assert!(!restored.sm.is_db_stale());
 
     let bytes = snapshot.snapshot.into_inner();
     restored
@@ -313,6 +314,7 @@ async fn snapshot_roundtrip_restores_state_and_replays_config() {
     assert_eq!(restored_applied, source_applied);
     assert_eq!(restored_membership, source_membership);
     assert_eq!(restored.sm.last_delivered_index(), 3);
+    assert!(restored.sm.is_db_stale());
 
     assert_eq!(
         restored.configs.recv().await.unwrap(),

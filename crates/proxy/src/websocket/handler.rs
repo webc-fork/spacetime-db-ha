@@ -8,6 +8,7 @@ use anyhow::{Context, Result, anyhow};
 use bitcode::{Decode, Encode};
 use bytes::Bytes;
 use compio::runtime::spawn;
+use crossfire::mpsc::bounded_async;
 use futures::{FutureExt, select};
 use openraft_zenoh::impl_bitcode_via;
 use tracing::{debug, info, warn};
@@ -20,7 +21,7 @@ use crate::{
     transport::{
         CrossfireChannel, CrossfireHandler, KEY_STDB_CONNECT, STDB_C2S_PREFIX, STDB_S2C_PREFIX,
         ZenohClientPool, close_session, decode_query_payload, open_client_session, prefix_u64_key,
-        reply_bitcode, rpc_once, watch::Receiver,
+        reply_bitcode, rpc_once, rpc_with_retry, watch::Receiver,
     },
     websocket::ConnectionGuard,
 };
@@ -41,6 +42,8 @@ pub const CLOSE_CODE_AWAY: u16 = 1001;
 const STREAM_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 /// 客户端会话断开时通知上游关闭逻辑流的超时上限（修复 P1-10）。
 const UPSTREAM_CLOSE_TIMEOUT: Duration = Duration::from_millis(100);
+/// 单连接客户端入站工作队列容量（解耦 Zenoh Queryable 接收与长耗时共识等待，修复 Point-6）。
+const INBOUND_WORK_CAPACITY: usize = 1024;
 
 /// 连接关闭帧（由 `bitcode` 序列化后通过 Zenoh 传输）。
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -226,7 +229,7 @@ impl ZenohStdbStream {
             db_path: db_path.to_owned(),
         };
         let resp: StdbConnectResponse =
-            match rpc_once(&session, KEY_STDB_CONNECT, &req, timeout).await {
+            match rpc_with_retry(&session, KEY_STDB_CONNECT, &req, timeout).await {
                 Ok(r) => r,
                 Err(e) => {
                     if owns_session {
@@ -235,6 +238,8 @@ impl ZenohStdbStream {
                     return Err(e);
                 }
             };
+        // 建连握手成功后，对端 c2s Queryable 可能仍在异步传播，首次发送若遇空回复通道由 rpc_with_retry 保护；
+        // 但客户端写/读消息本身通过 c2s_key 发送，c2s_queryable 在服务端返回 StdbConnectResponse 前已完成 declare_queryable。
 
         Ok(Self {
             sender: ZenohStdbSender {
@@ -366,7 +371,8 @@ pub async fn spawn_client_session(
         let path_for_in = request_path;
         let upstream_for_close = upstream_tx.clone();
 
-        let mut inbound = spawn(async move {
+        let (work_tx, work_rx) = bounded_async(INBOUND_WORK_CAPACITY);
+        let inbound_reader = spawn(async move {
             while let Ok(query) = c2s_queryable.recv().await {
                 let msg: Message = match decode_query_payload(&query) {
                     Ok(m) => m,
@@ -375,7 +381,14 @@ pub async fn spawn_client_session(
                         continue;
                     }
                 };
+                if work_tx.send((query, msg)).await.is_err() {
+                    return;
+                }
+            }
+        });
 
+        let mut inbound = spawn(async move {
+            while let Ok((query, msg)) = work_rx.recv().await {
                 if matches!(msg, Message::Close(_)) {
                     let _ = upstream_tx.send(msg).await;
                     reply_bitcode(&query, Ok(())).await;
@@ -428,6 +441,7 @@ pub async fn spawn_client_session(
         }
 
         // compio::runtime::JoinHandle 在 Drop 时会自动取消未完成的任务
+        drop(inbound_reader);
         drop(inbound);
         drop(outbound);
         // 通知上游 SpacetimeDB 释放该 conn_id 的 c2s Queryable，防止连接泄漏（修复 P1-10）
@@ -485,7 +499,7 @@ async fn handle_client_message(
 ) -> Result<()> {
     match classify_message(&msg) {
         MessageKind::Write => {
-            if let Message::Binary(data) = msg {
+            if let Message::Binary(ref data) = msg {
                 debug!(
                     tag = data[0],
                     len = data.len(),
@@ -498,16 +512,16 @@ async fn handle_client_message(
                     shard_id,
                     log_index: log_id.index,
                     db_path,
-                    raw_message: &data,
+                    raw_message: data,
                     delivered: false,
                 };
                 pool.wait_applied(shard_id, log_id.index).await?;
 
-                // 修复 P0-1：等待前置日志索引投递完毕，保证同节点跨连接写的上游投递顺序严格等于 Raft 日志顺序
+                // 修复 P0-1/Point-2：等待前置日志索引投递完毕，保证同节点跨连接写的上游投递顺序严格等于 Raft 日志顺序；超时返回错误严禁乱序放行
                 pool.wait_delivered(shard_id, log_id.index.saturating_sub(1))
-                    .await;
+                    .await?;
 
-                let send_res = upstream.send(Message::Binary(data.clone())).await;
+                let send_res = upstream.send_with_timeout(&msg, STREAM_RPC_TIMEOUT).await;
                 // 修复 P0-2：投递完成后推进并持久化连续 delivered 水位；若失败则由 delivery_guard 析构交还转发器补投
                 if send_res.is_ok() {
                     delivery_guard.complete();

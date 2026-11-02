@@ -5,11 +5,13 @@
 //! 2. 支持 Zenoh 8 级 QoS 优先级（`Priority::RealTime` 心跳/选举插队、`Priority::InteractiveHigh` 日志复制、`Priority::Data` 快照传输）；
 //! 3. 基于 `crossfire` 有界通道实现 `IntoHandler`，全链路无 `tokio`、无 `flume`。
 
-use std::{borrow::Cow, marker::PhantomData, ops::Deref, result, sync::Arc, time::Duration};
+use std::{
+    borrow::Cow, marker::PhantomData, ops::Deref, result, sync::Arc, thread, time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bitcode::{DecodeOwned, Encode};
-use compio::{runtime::spawn, time::sleep};
+use compio::time::sleep;
 use crossfire::{
     MAsyncRx,
     mpmc::{Array, bounded_blocking_async},
@@ -18,7 +20,7 @@ use gxhash::{HashMap, HashMapExt};
 use itoa::Buffer as ItoaBuffer;
 use parking_lot::Mutex;
 use zenoh::{
-    Session,
+    Session, Wait,
     bytes::ZBytes,
     config::Config,
     handlers::{Callback, IntoHandler},
@@ -321,13 +323,14 @@ pub async fn open_client_session(target_addr: &str) -> Result<Session> {
         .map_err(|e| anyhow!("Failed to connect Zenoh client session to {endpoint_json}: {e}"))
 }
 
-/// 在 `compio` 异步上下文中非阻塞关闭 Zenoh 会话（通过 `spawn` 异步驱动 `session.close().await`，不阻塞单线程 reactor，修复 R8）。
+/// 非阻塞关闭 Zenoh 会话：
+/// 注意 `zenoh::Session::close()` 的 `IntoFuture` 内部直接调用 `tokio::time::timeout`，在 `compio` 执行器上直接 `.await` 会因缺少 Tokio reactor 而 panic；
+/// 因此必须在后台线程通过 `Wait::wait()` 切入 Zenoh 内部 `ZRuntime` 完成关闭，既不阻塞 `compio` 事件循环，也不依赖调用方具备 Tokio 上下文。
 pub fn close_session(session: &Session) {
     let s = session.clone();
-    spawn(async move {
-        let _ = s.close().await;
-    })
-    .detach();
+    drop(thread::spawn(move || {
+        let _ = s.close().wait();
+    }));
 }
 
 /// 建立短连接客户端会话，发送单次 `bitcode` RPC 请求后安全关闭会话（供 CLI 等单次命令调用）。
@@ -342,7 +345,7 @@ where
     Resp: DecodeOwned,
 {
     let session = open_client_session(target_addr).await?;
-    let res = rpc_once(&session, key_expr, req, timeout).await;
+    let res = rpc_with_retry(&session, key_expr, req, timeout).await;
     close_session(&session);
     res
 }
@@ -368,7 +371,7 @@ pub fn decode_req<T: DecodeOwned>(query: &Query) -> result::Result<T, String> {
     decode_query_payload(query).map_err(|e| e.to_string())
 }
 
-/// 在已连接的客户端会话上发起单次 `bitcode` 编码的 Zenoh 查询（默认 `Priority::InteractiveHigh`，严禁重发，修复 R3）。
+/// 在已连接的客户端会话上发起单次 `bitcode` 编码的 Zenoh 查询（默认 `Priority::InteractiveHigh`，严格单发 `attempts = 1`，修复 R3/Point-1）。
 pub async fn rpc_once<Req, Resp>(
     session: &Session,
     key_expr: &str,
@@ -387,6 +390,29 @@ where
         timeout,
         Priority::InteractiveHigh,
         1,
+    )
+    .await
+}
+
+/// 在刚建立的客户端会话上发起幂等握手/查询（若对端 Queryable 尚未完成路由同步则自动退避重试最多 5 次）。
+pub async fn rpc_with_retry<Req, Resp>(
+    session: &Session,
+    key_expr: &str,
+    req: &Req,
+    timeout: Duration,
+) -> Result<Resp>
+where
+    Req: Encode + ?Sized,
+    Resp: DecodeOwned,
+{
+    let payload = bitcode::encode(req);
+    rpc_payload_with_retry(
+        session,
+        key_expr,
+        &payload,
+        timeout,
+        Priority::InteractiveHigh,
+        5,
     )
     .await
 }

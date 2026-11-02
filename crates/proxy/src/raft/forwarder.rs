@@ -34,6 +34,9 @@ const CONNECT_RPC_TIMEOUT: Duration = Duration::from_secs(3);
 /// 上游单条消息发送超时。
 const SEND_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// 单库上游空闲回收超时：长时间无写时自动关闭上游流并退出任务，防止多租户 `db_path` 无限常驻（修复 Point-9.1）。
+const IDLE_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// 单库上游投递有界队列容量（修复 P2-12：有界背压）。
 pub const UPSTREAM_QUEUE_CAPACITY: usize = 1024;
 
@@ -111,24 +114,25 @@ pub async fn run_with_pool(
                     continue;
                 }
 
-                // 优先按引用查表，避免已建立上游队列时在热路径上每次克隆 db_path
-                let sender = if let Some(tx) = upstreams.get(&write.db_path) {
-                    tx
-                } else {
-                    let tx = connect_pooled(
-                        stdb_url.clone(),
-                        write.db_path.clone(),
-                        zenoh_pool.clone(),
-                        state_machine.clone(),
-                        shutdown_rx.clone(),
-                    );
-                    upstreams.entry(write.db_path).or_insert(tx)
-                };
-
                 let item = (write.log_index, Message::Binary(write.raw_message));
-                if sender.send(item).await.is_err() {
+                let item = match upstreams.get(&write.db_path) {
+                    Some(tx) => match tx.send(item).await {
+                        Ok(()) => continue,
+                        Err(e) => e.0,
+                    },
+                    None => item,
+                };
+                let tx = connect_pooled(
+                    stdb_url.clone(),
+                    write.db_path.clone(),
+                    zenoh_pool.clone(),
+                    state_machine.clone(),
+                    shutdown_rx.clone(),
+                );
+                if tx.send(item).await.is_err() {
                     return;
                 }
+                upstreams.insert(write.db_path, tx);
             }
             _ = shutdown_rx.changed().fuse() => {
                 info!("Forwarder shutting down");
@@ -204,6 +208,7 @@ async fn upstream_task(
             } else {
                 select! {
                     item = rx.recv().fuse() => item.ok(),
+                    _ = sleep(IDLE_UPSTREAM_TIMEOUT).fuse() => None,
                     incoming = recv_s2c_message(&s2c_sub).fuse() => {
                         match incoming {
                             Ok(Some(Message::Close(_)) | None) | Err(_) => break,

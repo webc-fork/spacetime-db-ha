@@ -439,6 +439,9 @@ impl RaftPool {
         self.router.write().remove_routes_for_shard(shard_id);
         let removed = self.shards.write().remove(&shard_id);
         if let Some(shard) = removed {
+            if shard.state_machine.is_db_stale() {
+                metrics::DB_STALE_SHARDS.dec();
+            }
             let _ = shard.forwarder_shutdown.send(true);
             let _ = shard.raft.shutdown().await;
             // 先释放 ShardState 持有的 fjall 数据库与 Keyspace 句柄，再清理磁盘目录（修复 P1-7）

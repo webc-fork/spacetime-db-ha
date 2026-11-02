@@ -525,8 +525,11 @@ pub fn handle_cluster_leader(pool: &RaftPool) -> Result<LeaderInfo, String> {
     })
 }
 
-/// 健康检查（修复 P3-16：若本节点自称 leader，必须通过线性化多数派校验，防止少数派分区误报健康）。
+/// 健康检查（修复 P3-16/Point-3：若本节点自称 leader 必须通过线性化多数派校验；若存在快照跨越未投递日志的 stale 分片则返回 unhealthy）。
 pub async fn handle_cluster_health(pool: &RaftPool) -> Result<String, String> {
+    if pool.has_stale_shard() {
+        return Err("local SpacetimeDB is behind installed snapshot".to_owned());
+    }
     let raft = get_default_raft(pool)?;
     let (state, current_leader) = {
         let metrics_rx = raft.metrics();
