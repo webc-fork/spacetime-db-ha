@@ -22,7 +22,7 @@ use openraft::{
     storage::{EntryResponder, RaftStateMachine},
 };
 use parking_lot::Mutex;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::{
     metrics,
@@ -120,6 +120,8 @@ struct StateMachineInner {
     /// 已应用（或启动重放已入队）但尚未完成上游投递的客户端写日志索引及其入队时间。
     /// 连续已投递水位由 `in_flight_writes.first_key_value().map_or(last_applied, |(&idx, _)| idx - 1)` 唯一确定，禁止跨空洞跳变。
     in_flight_writes: BTreeMap<u64, Instant>,
+    /// 标记本地 SpacetimeDB 是否因安装了跨越未投递日志区间的快照而落后于集群状态（修复 R4/Point-3）。
+    db_stale: bool,
     /// 缓存最近一次快照；当状态推进时自动失效，避免返回陈旧快照。
     cached_snapshot: Option<RaftSnapshot>,
 }
@@ -159,14 +161,12 @@ impl StateMachineInner {
         }
     }
 
-    /// 计算当前连续已投递水位上界（受限于最早未完成写条目 `first_pending - 1`，禁止跨空洞跳变）。
+    /// 计算当前连续已投递水位上界（受限于最早未完成写条目 `first_pending - 1` 与 `last_applied`，禁止跨空洞或超前跳变）。
     #[inline]
     fn contiguous_delivered(&self, fallback: u64) -> u64 {
         match self.in_flight_writes.first_key_value() {
             Some((&first_pending, _)) => first_pending.saturating_sub(1),
-            None => self
-                .last_applied
-                .map_or(fallback, |id| id.index.max(fallback)),
+            None => self.last_applied.map_or(fallback, |id| id.index),
         }
     }
 }
@@ -213,6 +213,7 @@ impl StateMachineStore {
                     shard_routes: meta.shard_routes,
                     active_shards: meta.active_shards,
                     in_flight_writes: BTreeMap::new(),
+                    db_stale: false,
                     cached_snapshot: None,
                 }),
                 forwarder: Mutex::new(None),
@@ -278,6 +279,11 @@ impl StateMachineStore {
         self.shared.delivered.subscribe()
     }
 
+    /// 本地 SpacetimeDB 是否因快照跳过未投递日志而处于需重建状态。
+    pub fn is_db_stale(&self) -> bool {
+        self.shared.inner.lock().db_stale
+    }
+
     /// 登记一条启动重放期间在途的写日志索引（在写投递完成前阻止后续非写条目跨洞推进 `delivered` 水位，修复 P0-1）。
     pub fn register_in_flight_write(&self, index: u64) {
         self.shared
@@ -321,17 +327,23 @@ impl StateMachineStore {
         self.commit_delivered_watermark(target);
     }
 
-    /// 单调递增持久化并发布 `last_delivered` 水位（先写入共享 `fjall` 日志再更新 `watch` 通道，保证 `purge` 读取水位时元数据已在同库日志中，修复 R1b）。
+    /// 单调递增持久化并发布 `last_delivered` 水位（在 `send_if_modified` 锁内先写入共享 `fjall` 日志再推进水位；写盘失败则中止推进，修复 R1b/Point-7）。
     fn commit_delivered_watermark(&self, target: u64) {
-        if target <= *self.shared.delivered.borrow() {
-            return;
-        }
-        let _ = self
-            .shared
-            .state_ks
-            .insert(META_DELIVERED, target.to_le_bytes());
         self.shared.delivered.send_if_modified(|cur| {
             if target > *cur {
+                if let Err(e) = self
+                    .shared
+                    .state_ks
+                    .insert(META_DELIVERED, target.to_le_bytes())
+                {
+                    error!(
+                        shard_id = self.shared.shard_id,
+                        target,
+                        error = %e,
+                        "Failed to persist delivered watermark"
+                    );
+                    return false;
+                }
                 *cur = target;
                 true
             } else {
@@ -345,6 +357,7 @@ impl StateMachineStore {
         write.origin_node_id = 0;
         let forwarder = self.shared.forwarder.lock().clone();
         if let Some(tx) = forwarder {
+            let shard_id = self.shared.shard_id;
             let idx = write.log_index;
             let applied_rx = (self.last_applied_index() < idx).then(|| self.applied_rx());
             spawn(async move {
@@ -353,7 +366,14 @@ impl StateMachineStore {
                 {
                     return;
                 }
-                let _ = tx.try_send(write);
+                if tx.try_send(write).is_err() {
+                    metrics::DELIVERY_BACKPRESSURE.inc();
+                    warn!(
+                        shard_id,
+                        log_index = idx,
+                        "Forwarder channel full during requeue; write will be reclaimed from log"
+                    );
+                }
             })
             .detach();
         }
@@ -498,14 +518,22 @@ impl StateMachineStore {
 
         if let Some(tx) = &forwarder {
             for write in pending_writes {
+                let log_index = write.log_index;
                 debug!(
-                    log_index = write.log_index,
+                    log_index,
                     msg_len = write.raw_message.len(),
                     db_path = %write.db_path,
                     "Forwarding committed reducer call to SpacetimeDB"
                 );
                 // 使用非阻塞 try_send 防止下游 SpacetimeDB 故障阻塞 Raft apply（满载溢出的写已记入 in_flight_writes 与 fjall 日志，由周期性 reclaimer 补投，修复 R6）
-                let _ = tx.try_send(write);
+                if tx.try_send(write).is_err() {
+                    metrics::DELIVERY_BACKPRESSURE.inc();
+                    warn!(
+                        shard_id = self.shared.shard_id,
+                        log_index,
+                        "Forwarder channel full during apply; write will be reclaimed from log"
+                    );
+                }
             }
         }
 

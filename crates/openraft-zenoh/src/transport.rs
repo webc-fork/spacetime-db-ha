@@ -368,7 +368,7 @@ pub fn decode_req<T: DecodeOwned>(query: &Query) -> result::Result<T, String> {
     decode_query_payload(query).map_err(|e| e.to_string())
 }
 
-/// 在已连接的客户端会话上发起一次 `bitcode` 编码的 Zenoh 查询（默认 `Priority::InteractiveHigh`）。
+/// 在已连接的客户端会话上发起单次 `bitcode` 编码的 Zenoh 查询（默认 `Priority::InteractiveHigh`，严禁重发，修复 R3）。
 pub async fn rpc_once<Req, Resp>(
     session: &Session,
     key_expr: &str,
@@ -380,12 +380,13 @@ where
     Resp: DecodeOwned,
 {
     let payload = bitcode::encode(req);
-    rpc_payload_once_with_qos(
+    rpc_payload_with_retry(
         session,
         key_expr,
         &payload,
         timeout,
         Priority::InteractiveHigh,
+        1,
     )
     .await
 }
@@ -393,15 +394,16 @@ where
 /// 使用已编码的 `bitcode` 字节切片在客户端会话上发起查询：
 /// - 显式设置 `ConsolidationMode::None` 与 `QueryTarget::BestMatching`，消除结果合并等待延迟；
 /// - 显式设置 `Priority` 与 `CongestionControl::Block`，保证心跳/投票高优插队且大数据块不丢包；
-/// - 若远端 Queryable 尚未完成声明导致回复通道立即关闭，自动退避重试。
-async fn rpc_payload_once_with_qos<Resp: DecodeOwned>(
+/// - `attempts = 1` 时严格单次发送（用于非幂等写）；`attempts > 1` 时允许在远端 Queryable 尚未就绪时退避重试（用于幂等 RPC）。
+async fn rpc_payload_with_retry<Resp: DecodeOwned>(
     session: &Session,
     key_expr: &str,
     payload: &[u8],
     timeout: Duration,
     priority: Priority,
+    attempts: usize,
 ) -> Result<Resp> {
-    for attempt in 0..5 {
+    for attempt in 0..attempts.max(1) {
         if attempt > 0 {
             sleep(RETRY_BACKOFF).await;
         }
@@ -534,7 +536,7 @@ impl ZenohClientPool {
     {
         let payload = bitcode::encode(req);
         let session = self.get_or_connect(target_addr).await?;
-        match rpc_payload_once_with_qos(&session, key_expr, &payload, timeout, priority).await {
+        match rpc_payload_with_retry(&session, key_expr, &payload, timeout, priority, 5).await {
             Ok(resp) => Ok(resp),
             Err(first_err) => {
                 // 若因远端刚注册 queryable 或连接中断导致无响应，短暂等待后重试一次
@@ -544,7 +546,7 @@ impl ZenohClientPool {
                     Ok(s) => s,
                     Err(_) => bail!("{first_err}"),
                 };
-                rpc_payload_once_with_qos(&session, key_expr, &payload, timeout, priority).await
+                rpc_payload_with_retry(&session, key_expr, &payload, timeout, priority, 5).await
             }
         }
     }

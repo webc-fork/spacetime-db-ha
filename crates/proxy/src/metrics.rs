@@ -37,7 +37,7 @@ const LATENCY_BUCKETS_NANOS: [u64; BUCKET_COUNT] = ms_array_to_nanos(LATENCY_BUC
 /// 编译期预编译的指标 JSON 导出模板（由 `askama` 在编译期展开为定长缓冲预分配与静态切片直写）。
 #[derive(Template)]
 #[template(
-    source = r#"{"spacetime_db_ha_raft_term":{{ raft_term }},"spacetime_db_ha_raft_is_leader":{{ raft_is_leader }},"spacetime_db_ha_shards_active":{{ shards_active }},"spacetime_db_ha_delivery_lag_entries":{{ delivery_lag }},"spacetime_db_ha_connections_active":{{ connections_active }},"spacetime_db_ha_writes_total":{{ writes_total }},"spacetime_db_ha_reads_total":{{ reads_total }},"spacetime_db_ha_write_latency_seconds":{"buckets":{"0.001":{{ buckets[0] }},"0.005":{{ buckets[1] }},"0.01":{{ buckets[2] }},"0.025":{{ buckets[3] }},"0.05":{{ buckets[4] }},"0.1":{{ buckets[5] }},"0.25":{{ buckets[6] }},"0.5":{{ buckets[7] }},"1.0":{{ buckets[8] }},"+Inf":{{ count }}},"sum":{{ sum_secs }},"count":{{ count }}},"spacetime_db_ha_entries_applied_total":{{ entries_applied }}}"#,
+    source = r#"{"spacetime_db_ha_raft_term":{{ raft_term }},"spacetime_db_ha_raft_is_leader":{{ raft_is_leader }},"spacetime_db_ha_shards_active":{{ shards_active }},"spacetime_db_ha_delivery_lag_entries":{{ delivery_lag }},"spacetime_db_ha_db_stale_shards":{{ db_stale_shards }},"spacetime_db_ha_delivery_backpressure_total":{{ delivery_backpressure }},"spacetime_db_ha_connections_active":{{ connections_active }},"spacetime_db_ha_writes_total":{{ writes_total }},"spacetime_db_ha_reads_total":{{ reads_total }},"spacetime_db_ha_write_latency_seconds":{"buckets":{"0.001":{{ buckets[0] }},"0.005":{{ buckets[1] }},"0.01":{{ buckets[2] }},"0.025":{{ buckets[3] }},"0.05":{{ buckets[4] }},"0.1":{{ buckets[5] }},"0.25":{{ buckets[6] }},"0.5":{{ buckets[7] }},"1.0":{{ buckets[8] }},"+Inf":{{ count }}},"sum":{{ sum_secs }},"count":{{ count }}},"spacetime_db_ha_entries_applied_total":{{ entries_applied }}}"#,
     ext = "txt"
 )]
 struct MetricsJsonTemplate<'a> {
@@ -45,6 +45,8 @@ struct MetricsJsonTemplate<'a> {
     raft_is_leader: i64,
     shards_active: i64,
     delivery_lag: i64,
+    db_stale_shards: i64,
+    delivery_backpressure: u64,
     connections_active: i64,
     writes_total: u64,
     reads_total: u64,
@@ -181,6 +183,8 @@ pub static RAFT_TERM: IntGauge = IntGauge::new();
 pub static RAFT_IS_LEADER: IntGauge = IntGauge::new();
 pub static SHARDS_ACTIVE: IntGauge = IntGauge::new();
 pub static DELIVERY_LAG: IntGauge = IntGauge::new();
+pub static DB_STALE_SHARDS: IntGauge = IntGauge::new();
+pub static DELIVERY_BACKPRESSURE: IntCounter = IntCounter::new();
 pub static CONNECTIONS_ACTIVE: IntGauge = IntGauge::new();
 pub static WRITES_TOTAL: IntCounter = IntCounter::new();
 pub static READS_TOTAL: IntCounter = IntCounter::new();
@@ -204,6 +208,8 @@ pub fn encode_metrics() -> String {
         raft_is_leader: RAFT_IS_LEADER.get(),
         shards_active: SHARDS_ACTIVE.get(),
         delivery_lag: DELIVERY_LAG.get(),
+        db_stale_shards: DB_STALE_SHARDS.get(),
+        delivery_backpressure: DELIVERY_BACKPRESSURE.get(),
         connections_active: CONNECTIONS_ACTIVE.get(),
         writes_total: WRITES_TOTAL.get(),
         reads_total: READS_TOTAL.get(),
